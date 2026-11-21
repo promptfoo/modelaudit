@@ -1,0 +1,1 @@
+Standalone archive scans now report dangerous JAX callbacks visible in large JSON files when the MXNet format probe is inconclusive. The scan still reports incomplete coverage beyond the inspection limit. ZIP, TAR and TorchServe MAR scans count these member bytes once.

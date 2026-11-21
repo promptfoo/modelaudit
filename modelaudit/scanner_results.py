@@ -742,7 +742,9 @@ class ScanResult:
         for _, _, _, path_segments, record in sorted(sortable_records):
             self._add_member_file_hash_record([*prefix, *path_segments], record)
 
-    def merge_member_result(self, other: "ScanResult", member_path: str, *member_path_segments: str) -> None:
+    def merge_member_result(
+        self, other: "ScanResult", member_path: str, *member_path_segments: str, extracted_size: int = 0
+    ) -> None:
         """Merge an archive-member scan without letting member hashes become parent hashes."""
         path_segments = [member_path, *member_path_segments]
         parent_identity = {
@@ -759,6 +761,10 @@ class ScanResult:
         finally:
             if other_member_hashes is not missing:
                 other.metadata[MEMBER_FILE_HASHES_METADATA_KEY] = other_member_hashes
+
+        # A member without a primary scanner may still have counted bytes in a supplemental scan.
+        if other.scanner_name == "unknown":
+            self.bytes_scanned += max(0, extracted_size - other.bytes_scanned)
 
         for key in _PARENT_INTEGRITY_METADATA_KEYS:
             if key in parent_identity:

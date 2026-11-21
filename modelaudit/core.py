@@ -68,6 +68,8 @@ from modelaudit.scanner_selection import (
 from modelaudit.scanners import _registry
 from modelaudit.scanners.archive_dispatch import (
     NESTED_SCAN_CALLBACK_CONFIG_KEY,
+    _make_incomplete_llamafile_routing_result,
+    _make_incomplete_mxnet_symbol_routing_result,
     _make_incomplete_nemo_routing_result,
     _make_incomplete_onnx_routing_result,
     _make_incomplete_pickle_routing_result,
@@ -75,6 +77,7 @@ from modelaudit.scanners.archive_dispatch import (
     _make_incomplete_sentencepiece_model_proto_result,
     _make_incomplete_tensorflow_protobuf_routing_result,
     _make_incomplete_tokenizer_json_routing_result,
+    _make_incomplete_xgboost_ubjson_routing_result,
     _make_incomplete_xml_model_result,
     _make_unavailable_recognized_format_result,
     _select_zip_scanner_id,
@@ -85,6 +88,8 @@ from modelaudit.scanners.archive_dispatch import (
     merge_inconclusive_flax_msgpack_outcome,
     merge_safetensors_overlap_analysis,
     prefer_selected_sentencepiece_zip,
+    record_skipped_json_owner,
+    resolve_json_overlap,
 )
 from modelaudit.scanners.base import (
     DEFAULT_MAX_FILE_READ_SIZE,
@@ -92,12 +97,9 @@ from modelaudit.scanners.base import (
     FORMAT_VALIDATION_CONFIG_KEY,
     BaseScanner,
 )
-from modelaudit.scanners.mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
 from modelaudit.scanners.safetensors_scanner import MAX_HEADER_BYTES as SAFETENSORS_MAX_HEADER_BYTES
 from modelaudit.scanners.xgboost_scanner import (
     XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY,
-    XGBoostScanner,
-    configure_content_routed_json_scan,
 )
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import (
@@ -111,10 +113,8 @@ from modelaudit.utils import (
 from modelaudit.utils._path_hardening import _file_stat_matches
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
-    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
-    MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
     ONNX_ROUTING_INCONCLUSIVE_FORMAT,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
@@ -134,7 +134,6 @@ from modelaudit.utils.file.detection import (
     detect_file_format_from_magic,
     detect_flax_msgpack_overlap_routes,
     detect_format_from_extension,
-    detect_mxnet_symbol_content_route,
     detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
     gzip_tar_trailing_data_status,
@@ -404,8 +403,6 @@ _ALTERNATE_VALIDATED_FORMAT_ALLOWED_INCONCLUSIVE_REASONS = {
 }
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 _FORMAT_DETECTION_READ_FAILED_REASON = "format_detection_read_failed"
-_LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
-_MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _DVC_SCAN_BUDGET_EXHAUSTED_REASON = "dvc_scan_budget_exhausted"
 _DVC_DIRECTORY_WALK_FAILED_REASON = "dvc_directory_walk_failed"
 _DVC_DIRECTORY_SYMLINK_UNSCANNED_REASON = "dvc_directory_symlink_unscanned"
@@ -550,7 +547,6 @@ def _record_directory_special_file_unscanned(
     )
 
 
-_XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON = "xgboost_ubjson_routing_incomplete"
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None, str | None]
 _FileTargetIdentityKey = tuple[Any, ...]
@@ -2546,125 +2542,6 @@ def _make_incomplete_format_detection_read_result(path: str, error: OSError) -> 
     )
     _mark_inconclusive_scan_outcome(result, _FORMAT_DETECTION_READ_FAILED_REASON)
     _mark_operational_scan_error(result, _FORMAT_DETECTION_READ_FAILED_REASON)
-    result.finish(success=False)
-    return result
-
-
-def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any]) -> ScanResult:
-    """Fail closed when an executable Llamafile marker probe cannot complete."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
-        name="Llamafile Routing",
-        passed=False,
-        message="Llamafile routing was inconclusive because bounded marker bytes could not be read",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
-    )
-    _mark_inconclusive_scan_outcome(result, _LLAMAFILE_ROUTING_INCOMPLETE_REASON)
-    _mark_operational_scan_error(result, _LLAMAFILE_ROUTING_INCOMPLETE_REASON)
-
-    merge_executable_zip_container_findings(
-        path,
-        result,
-        config,
-        context="inconclusive executable ZIP polyglot",
-    )
-    result.finish(success=False)
-    return result
-
-
-def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, Any] | None = None) -> ScanResult:
-    """Fail closed when bounded MXNet symbol routing cannot decide."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
-        name="MXNet Symbol Routing",
-        passed=False,
-        message="MXNet symbol routing was inconclusive because the bounded JSON probe reached its limit",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
-    )
-    _mark_inconclusive_scan_outcome(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
-    _mark_operational_scan_error(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
-
-    from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
-    from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
-    from modelaudit.scanners.manifest_scanner import ManifestScanner
-    from modelaudit.scanners.mxnet_scanner import MXNetScanner
-
-    scanner_selection = policy_from_config(config)
-
-    if Path(path).suffix.lower() == ".params":
-        if scanner_selection.allows("mxnet"):
-            MXNetScanner(config=config).scan_params_file_security(path, result)
-        elif scanner_selection.active:
-            add_scanner_selection_skip_check(
-                result,
-                path,
-                "mxnet",
-                scanner_selection,
-                context="inconclusive MXNet params byte analysis",
-            )
-
-    if os.path.getsize(
-        path
-    ) <= JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES or JaxCheckpointScanner.should_analyze_inconclusive_json_overlap(
-        path
-    ):
-        if scanner_selection.allows("jax_checkpoint"):
-            core_results._merge_inconclusive_owner_result(result, JaxCheckpointScanner(config=config).scan(path))
-        elif scanner_selection.active:
-            add_scanner_selection_skip_check(
-                result,
-                path,
-                "jax_checkpoint",
-                scanner_selection,
-                context="overlapping JAX JSON analysis",
-            )
-
-    manifest_covered_templates = False
-    if ManifestScanner.can_handle(path):
-        if scanner_selection.allows("manifest"):
-            manifest_result = ManifestScanner(config=config).scan(path)
-            core_results._merge_inconclusive_owner_result(result, manifest_result)
-            manifest_covered_templates = manifest_result.metadata.get("analysis_incomplete") is not True
-        elif scanner_selection.active:
-            add_scanner_selection_skip_check(
-                result,
-                path,
-                "manifest",
-                scanner_selection,
-                context="overlapping manifest JSON analysis",
-            )
-    if not manifest_covered_templates and Jinja2TemplateScanner.can_handle(path):
-        if scanner_selection.allows("jinja2_template"):
-            core_results._merge_inconclusive_owner_result(result, Jinja2TemplateScanner(config=config).scan(path))
-        elif scanner_selection.active:
-            add_scanner_selection_skip_check(
-                result,
-                path,
-                "jinja2_template",
-                scanner_selection,
-                context="overlapping Jinja JSON analysis",
-            )
-    result.finish(success=False)
-    return result
-
-
-def _make_incomplete_xgboost_ubjson_routing_result(path: str) -> ScanResult:
-    """Fail closed when bounded extensionless UBJSON routing cannot confirm XGBoost."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
-        name="XGBoost UBJSON Routing",
-        passed=False,
-        message="Extensionless UBJSON routing was inconclusive because the bounded learner probe reached its limit",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
-    )
-    _mark_inconclusive_scan_outcome(result, _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON)
-    _mark_operational_scan_error(result, _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -6534,56 +6411,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 header_format = "tar"
             if magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
                 magic_format = "tar"
-    skipped_overlap_scanner_id: str | None = None
-    if (
-        header_format == "xgboost"
-        and scanner_selection.active
-        and scanner_selection.allows("mxnet")
-        and not scanner_selection.allows("xgboost")
-    ):
-        selected_mxnet_route = detect_mxnet_symbol_content_route(path)
-        if selected_mxnet_route == "mxnet":
-            header_format = magic_format = "mxnet"
-            config[MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY] = str(Path(path).resolve())
-            skipped_overlap_scanner_id = "xgboost"
-        elif selected_mxnet_route == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
-            header_format = magic_format = MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
-            skipped_overlap_scanner_id = "xgboost"
-    if (
-        header_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}
-        and ext != ".json"
-        and scanner_selection.active
-        and scanner_selection.allows("xgboost")
-        and not scanner_selection.allows("mxnet")
-        and (
-            XGBoostScanner._is_xgboost_json(
-                path,
-                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
-            )
-            or XGBoostScanner._is_probable_mxnet_overlap_candidate(
-                path,
-                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
-            )
-        )
-    ):
-        # Keep default bounded ownership with MXNet, but honor explicit
-        # XGBoost-only coverage when its structure is already observable.
-        header_format = magic_format = "xgboost"
-    if (
-        header_format == "xgboost"
-        and ext != ".json"
-        and (
-            XGBoostScanner._is_xgboost_json(
-                path,
-                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
-            )
-            or XGBoostScanner._is_probable_mxnet_overlap_candidate(
-                path,
-                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
-            )
-        )
-    ):
-        configure_content_routed_json_scan(config, max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES)
+    selected_format, skipped_overlap_scanner_id = resolve_json_overlap(path, header_format, config, scanner_selection)
+    if selected_format != header_format:
+        header_format = magic_format = selected_format
     if int(config.get("_archive_depth", 0)) > 0 and magic_format == "unknown":
         nested_xgboost_route = detect_xgboost_ubjson_content_route(path)
         if nested_xgboost_route is not None:
@@ -6595,87 +6425,37 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     detected_format = header_format if header_format != "unknown" else ext_format
     record_file_type_detected(path, detected_format)
 
-    # Validate file type consistency as a security check
-    if header_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
-        sr = _make_incomplete_llamafile_routing_result(path, config)
-        return with_file_size(sr)
-    nemo_routing_inconclusive = (
-        header_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT or magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT
-    )
+    # Either content probe can report a routing failure.
+    formats = (header_format, magic_format)
+    if LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT in formats:
+        return with_file_size(_make_incomplete_llamafile_routing_result(path, config))
+    nemo_routing_inconclusive = NEMO_ROUTING_INCONCLUSIVE_FORMAT in formats
     validated_hdf5_nemo_overlap = nemo_routing_inconclusive and hdf5_signature_offset is not None
     if nemo_routing_inconclusive and not validated_hdf5_nemo_overlap:
-        sr = _make_incomplete_nemo_routing_result(path)
-        return with_file_size(sr)
-    if (
-        header_format == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
-        or magic_format == TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT
-    ):
-        sr = _make_incomplete_tokenizer_json_routing_result(path)
-        return with_file_size(sr)
-    if (
-        header_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
-        or magic_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
-    ):
+        return with_file_size(_make_incomplete_nemo_routing_result(path))
+    if TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT in formats:
+        return with_file_size(_make_incomplete_tokenizer_json_routing_result(path))
+    if MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT in formats:
         sr = _make_incomplete_mxnet_symbol_routing_result(path, config)
-        if skipped_overlap_scanner_id:
-            add_scanner_selection_skip_check(
-                sr,
-                path,
-                skipped_overlap_scanner_id,
-                scanner_selection,
-                context="overlapping JSON analysis",
-                kind=SCANNER_SELECTION_PREFERRED_KIND,
-            )
+        record_skipped_json_owner(sr, path, skipped_overlap_scanner_id, scanner_selection)
         return with_file_size(sr)
-    if (
-        header_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
-        or magic_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
-    ):
-        sr = _make_incomplete_xgboost_ubjson_routing_result(path)
-        return with_file_size(sr)
-    if header_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT or magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
-        sr = _make_incomplete_onnx_routing_result(path)
-        return with_file_size(sr)
-    if (
-        header_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
-        or magic_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
-    ):
-        sr = _make_incomplete_sentencepiece_model_proto_result(path)
-        return with_file_size(sr)
-    if header_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT:
+    if XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT in formats:
+        return with_file_size(_make_incomplete_xgboost_ubjson_routing_result(path))
+    if ONNX_ROUTING_INCONCLUSIVE_FORMAT in formats:
+        return with_file_size(_make_incomplete_onnx_routing_result(path))
+    if SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT in formats:
+        return with_file_size(_make_incomplete_sentencepiece_model_proto_result(path))
+    if PICKLE_ROUTING_INCONCLUSIVE_FORMAT in formats:
         sr = _make_incomplete_pickle_routing_result(path)
-        merge_safetensors_overlap_analysis(
-            path,
-            sr,
-            config,
-            scanner_selection,
-            safetensors_overlap_scanner_ids,
-        )
+        merge_safetensors_overlap_analysis(path, sr, config, scanner_selection, safetensors_overlap_scanner_ids)
         return with_file_size(sr)
-    if (
-        header_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
-        or magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
-    ):
+    if TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT in formats:
         sr = _make_incomplete_tensorflow_protobuf_routing_result(path)
-        merge_safetensors_overlap_analysis(
-            path,
-            sr,
-            config,
-            scanner_selection,
-            safetensors_overlap_scanner_ids,
-        )
+        merge_safetensors_overlap_analysis(path, sr, config, scanner_selection, safetensors_overlap_scanner_ids)
         return with_file_size(sr)
-    if (
-        header_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT or magic_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT
-    ) and hdf5_signature_offset is None:
+    if EXECUTABLE_ZIP_POLYGLOT_FORMAT in formats and hdf5_signature_offset is None:
         sr = _scan_executable_zip_polyglot(path, config)
-        merge_safetensors_overlap_analysis(
-            path,
-            sr,
-            config,
-            scanner_selection,
-            safetensors_overlap_scanner_ids,
-        )
+        merge_safetensors_overlap_analysis(path, sr, config, scanner_selection, safetensors_overlap_scanner_ids)
         return with_file_size(sr)
 
     should_validate_gzip_tar_tail = (
@@ -7091,15 +6871,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     if validated_hdf5_nemo_overlap and scanner_selection.allows(hdf5_userblock_supplemental_scanner_id):
         result.merge(_make_incomplete_nemo_routing_result(path))
 
-    if skipped_overlap_scanner_id:
-        add_scanner_selection_skip_check(
-            result,
-            path,
-            skipped_overlap_scanner_id,
-            scanner_selection,
-            context="overlapping JSON analysis",
-            kind=SCANNER_SELECTION_PREFERRED_KIND,
-        )
+    record_skipped_json_owner(result, path, skipped_overlap_scanner_id, scanner_selection)
 
     merge_safetensors_overlap_analysis(
         path,

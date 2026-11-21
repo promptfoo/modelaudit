@@ -5350,7 +5350,6 @@ def test_scan_nested_file_mxnet_only_selection_fails_closed_for_bounded_xgboost_
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
-    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
     extracted_member = tmp_path / "polyglot.json"
     extracted_member.write_text(
         '{"version":[1,7,4],"learner":{"gradient_booster":{}},"nodes":[{"op":"Custom","name":"load",'
@@ -5405,7 +5404,6 @@ def test_scan_nested_file_does_not_cap_canonical_json_overlap_to_renamed_probe_b
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
-    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
     extracted_member = tmp_path / "polyglot.json"
     extracted_member.write_text(
         '{"version":[1,7,4],"learner":{"gradient_booster":{},"malicious_code":"os.system()",'
@@ -5666,7 +5664,6 @@ def test_scan_nested_file_keeps_oversized_renamed_overlap_on_bounded_mxnet_route
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
-    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
     monkeypatch.setattr("modelaudit.scanners.mxnet_scanner.MAX_SYMBOL_READ_BYTES", 512)
     extracted_member = tmp_path / "payload.meta"
     extracted_member.write_text(
@@ -5691,7 +5688,6 @@ def test_scan_nested_file_xgboost_only_oversized_renamed_overlap_fails_closed(
     version: str,
 ) -> None:
     monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
-    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
     extracted_member = tmp_path / "payload.meta"
     extracted_member.write_text(
         '{"version":' + version + ',"learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
@@ -5712,7 +5708,6 @@ def test_scan_nested_file_symbol_routed_params_preserves_raw_text_findings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
-    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
     monkeypatch.setattr("modelaudit.scanners.mxnet_scanner.MAX_SYMBOL_READ_BYTES", 512)
     extracted_member = tmp_path / "payload-0000.params"
     extracted_member.write_text(

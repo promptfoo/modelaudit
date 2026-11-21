@@ -10831,6 +10831,21 @@ def test_scan_file_reports_visible_renamed_jax_pattern_behind_inconclusive_mxnet
     _assert_bounded_jax_prefix_coverage(tmp_path, ("depth-capped-renamed-large.jpg"))
 
 
+def _standalone_archive_scans(model_path: Path) -> Iterator[ScanResult]:
+    # Standalone archive scanners dispatch members without core's scan_file callback.
+    from modelaudit.scanners.tar_scanner import TarScanner
+
+    archive = model_path.with_suffix(".zip")
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.write(model_path, model_path.name)
+    yield ZipScanner(config={"cache_enabled": False}).scan(str(archive))
+
+    archive = model_path.with_suffix(".tar")
+    with tarfile.open(archive, "w") as tar:
+        tar.add(model_path, model_path.name)
+    yield TarScanner(config={"cache_enabled": False}).scan(str(archive))
+
+
 def test_scan_file_reports_escaped_renamed_jax_pattern_behind_inconclusive_mxnet_depth_route(tmp_path: Path) -> None:
     model_path = tmp_path / "escaped-depth-capped-renamed-large.jpg"
     deep_value: object = "benign"
@@ -10854,6 +10869,17 @@ def test_scan_file_reports_escaped_renamed_jax_pattern_behind_inconclusive_mxnet
     assert any("Suspicious pattern in bounded JSON checkpoint prefix" in issue.message for issue in aggregate.issues)
     assert "mxnet_symbol_routing_incomplete" in aggregate.file_metadata[str(model_path)]["scan_outcome_reasons"]
 
+    for nested in _standalone_archive_scans(model_path):
+        assert nested.bytes_scanned == model_path.stat().st_size
+        assert not nested.success
+        assert "mxnet_symbol_routing_incomplete" in nested.metadata["scan_outcome_reasons"]
+        assert "jax_json_checkpoint_analysis_size_limit" in nested.metadata["scan_outcome_reasons"]
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and "Suspicious pattern in bounded JSON checkpoint prefix" in issue.message
+            for issue in nested.issues
+        )
+
 
 def test_scan_file_inconclusive_mxnet_depth_route_does_not_compose_visible_ajax_near_match(tmp_path: Path) -> None:
     model_path = tmp_path / "depth-capped-renamed-ajax-large.jpg"
@@ -10876,6 +10902,13 @@ def test_scan_file_inconclusive_mxnet_depth_route_does_not_compose_visible_ajax_
     assert result.scanner_name == "unknown"
     assert result.metadata["scan_outcome_reasons"] == ["mxnet_symbol_routing_incomplete"]
     assert not any(check.name == "JSON Checkpoint Analysis Limit" for check in result.checks)
+
+    for nested in _standalone_archive_scans(model_path):
+        assert nested.bytes_scanned == model_path.stat().st_size
+        assert not nested.success
+        assert "mxnet_symbol_routing_incomplete" in nested.metadata["scan_outcome_reasons"]
+        assert not any(check.name == "JSON Checkpoint Analysis Limit" for check in nested.checks)
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in nested.issues)
 
 
 def test_scan_file_reports_visible_pattern_in_truncated_oversized_json_string(tmp_path: Path) -> None:
@@ -12219,7 +12252,6 @@ def test_scan_file_xgboost_only_oversized_renamed_overlap_is_not_clean_or_cached
     version: str,
 ) -> None:
     monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
-    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
     model_path = tmp_path / "polyglot.meta"
     model_path.write_text(
         '{"version":' + version + ',"learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
@@ -12364,7 +12396,6 @@ def test_scan_file_keeps_oversized_renamed_overlap_on_bounded_mxnet_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
-    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
     monkeypatch.setattr(mxnet_scanner, "MAX_SYMBOL_READ_BYTES", 512)
     model_path = tmp_path / "polyglot.meta"
     model_path.write_text(
@@ -12387,7 +12418,6 @@ def test_scan_file_symbol_routed_params_preserves_raw_text_findings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
-    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
     monkeypatch.setattr(mxnet_scanner, "MAX_SYMBOL_READ_BYTES", 512)
     model_path = tmp_path / "payload-0000.params"
     model_path.write_text(
@@ -12634,7 +12664,6 @@ def test_scan_file_large_hf_tokenizer_json_does_not_run_binary_json_scanners(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
-    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
     tokenizer_path = _write_hf_tokenizer_json(
         tmp_path / "tokenizer.json",
         {"padding": "x" * 256},
@@ -13145,7 +13174,6 @@ def test_scan_file_tokenizer_model_vocab_after_structure_probe_is_eof_claimed(
 ) -> None:
     monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 256)
     monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
-    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
     tokenizer_path = _write_hf_tokenizer_json(
         tmp_path / "tokenizer.json",
         {
@@ -13578,7 +13606,6 @@ def test_scan_file_tokenizer_json_late_mxnet_after_mxnet_budget_fails_closed(
 ) -> None:
     monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
     monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 192)
-    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 192)
     tokenizer_path = _write_ordered_hf_tokenizer_json(
         tmp_path / "tokenizer.json",
         late_fields=(
@@ -14003,7 +14030,6 @@ def test_scan_file_tokenizer_json_malformed_after_structure_budget_fails_closed(
 ) -> None:
     monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
     monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 192)
-    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 192)
     tokenizer_path = _write_truncated_ordered_hf_tokenizer_json(
         tmp_path / "tokenizer.json",
         padding_size=256,

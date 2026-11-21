@@ -2074,7 +2074,7 @@ class ZipScanner(BaseScanner):
 
                         self._rewrite_nested_result_context(file_result, tmp_path, path, name)
 
-                        result.merge_member_result(file_result, name)
+                        result.merge_member_result(file_result, name, extracted_size=total_size)
 
                         asset_entry = asset_from_scan_result(
                             f"{path}:{name}",
@@ -2082,10 +2082,6 @@ class ZipScanner(BaseScanner):
                         )
                         asset_entry.setdefault("size", info.file_size)
                         contents.append(asset_entry)
-
-                        # If no scanner handled the file, count the bytes ourselves
-                        if file_result.scanner_name == "unknown":
-                            result.bytes_scanned += total_size
                     finally:
                         if tmp_path is not None:
                             with contextlib.suppress(FileNotFoundError):

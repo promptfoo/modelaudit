@@ -1,4 +1,4 @@
-"""Nested archive dispatch helpers used by recursive scanners."""
+"""Shared file routing and dispatch for recursive archive scanners."""
 
 import json
 import os
@@ -28,12 +28,12 @@ from ..scanner_selection import (
     make_scanner_selection_skip_result,
     policy_from_config,
 )
+from ..utils.file import detection
 from ..utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
-    MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
     ONNX_ROUTING_INCONCLUSIVE_FORMAT,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
@@ -1019,7 +1019,7 @@ def merge_inconclusive_flax_msgpack_outcome(
 
 
 def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any] | None) -> ScanResult:
-    """Fail closed when bounded nested Llamafile routing cannot read its marker probe."""
+    """Fail closed when bounded Llamafile routing cannot read its marker probe."""
     result = ScanResult(scanner_name="unknown")
     result.add_check(
         name="Llamafile Routing",
@@ -1040,7 +1040,7 @@ def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any] 
         path,
         result,
         config,
-        context="inconclusive nested executable ZIP polyglot",
+        context="inconclusive executable ZIP polyglot",
     )
 
     result.finish(success=False)
@@ -1069,8 +1069,48 @@ def _make_incomplete_tokenizer_json_routing_result(path: str) -> ScanResult:
     )
 
 
+def resolve_json_overlap(
+    path: str, content_format: str, config: dict[str, Any], selection: ScannerSelectionPolicy
+) -> tuple[str, str | None]:
+    """Configure the per-file MXNet/XGBoost route and identify any skipped preferred scanner."""
+    if content_format == "xgboost" and selection.allows("mxnet") and not selection.allows("xgboost"):
+        mxnet_route = detect_mxnet_symbol_content_route(path)
+        if mxnet_route is not None:
+            if mxnet_route == "mxnet":
+                config[MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY] = str(Path(path).resolve())
+            return mxnet_route, "xgboost"
+
+    prefer_xgboost = (
+        content_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}
+        and selection.allows("xgboost")
+        and not selection.allows("mxnet")
+    )
+    if content_format != "xgboost" and not prefer_xgboost:
+        return content_format, None
+
+    # A renamed model needs structural evidence and the same read limit during discovery and scanning.
+    limit = detection.MXNET_SYMBOL_SIGNATURE_READ_BYTES
+    if os.path.splitext(path)[1].lower() != ".json" and (
+        XGBoostScanner._is_xgboost_json(path, max_bytes=limit)
+        or XGBoostScanner._is_probable_mxnet_overlap_candidate(path, max_bytes=limit)
+    ):
+        configure_content_routed_json_scan(config, max_bytes=limit)
+        return "xgboost", None
+    return content_format, None
+
+
+def record_skipped_json_owner(
+    result: ScanResult, path: str, skipped: str | None, selection: ScannerSelectionPolicy
+) -> None:
+    """Report the excluded owner even if the selected route was inconclusive."""
+    if skipped:
+        add_scanner_selection_skip_check(
+            result, path, skipped, selection, context="overlapping JSON analysis", kind=SCANNER_SELECTION_PREFERRED_KIND
+        )
+
+
 def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, Any] | None = None) -> ScanResult:
-    """Fail closed when bounded nested MXNet symbol routing cannot decide."""
+    """Fail closed when bounded MXNet symbol routing cannot decide."""
     result = ScanResult(scanner_name="unknown")
     result.add_check(
         name="MXNet Symbol Routing",
@@ -1106,7 +1146,12 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
                 context="inconclusive MXNet params byte analysis",
             )
 
-    if os.path.getsize(path) <= JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+    # Oversized files can still contain actionable JAX evidence within the bounded prefix.
+    file_size = os.path.getsize(path)
+    if (
+        file_size <= JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES
+        or JaxCheckpointScanner.should_analyze_inconclusive_json_overlap(path)
+    ):
         if scanner_selection.allows("jax_checkpoint"):
             _merge_inconclusive_owner_result(result, JaxCheckpointScanner(config=config).scan(path))
         elif scanner_selection.active:
@@ -1143,12 +1188,14 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
                 scanner_selection,
                 context="overlapping Jinja JSON analysis",
             )
+    # Supplemental JSON scanners all inspect the same file.
+    result.bytes_scanned = file_size
     result.finish(success=False)
     return result
 
 
 def _make_incomplete_xgboost_ubjson_routing_result(path: str) -> ScanResult:
-    """Fail closed when bounded nested UBJSON routing cannot decide."""
+    """Fail closed when bounded UBJSON routing cannot decide."""
     return _make_incomplete_routing_result(
         path,
         name="XGBoost UBJSON Routing",
@@ -1226,12 +1273,13 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         )
         return result
 
-    raw_config = config or {}
+    # Route hints apply to this member only, never its siblings.
+    config = dict(config or {})
     try:
-        max_zip_entries = int(raw_config.get("max_zip_entries", ZipScanner.DEFAULT_MAX_ENTRIES))
+        max_zip_entries = int(config.get("max_zip_entries", ZipScanner.DEFAULT_MAX_ENTRIES))
     except (TypeError, ValueError):
         max_zip_entries = ZipScanner.DEFAULT_MAX_ENTRIES
-    max_zip_directory_size = ZipScanner.central_directory_size_limit(raw_config)
+    max_zip_directory_size = ZipScanner.central_directory_size_limit(config)
     malformed_sentencepiece_model_candidate = Path(
         path
     ).suffix.lower() == ".model" and _is_malformed_sentencepiece_model_proto_candidate_file(path)
@@ -1251,64 +1299,14 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     trusted_content_format = detect_file_format_from_magic(path)
     if is_safetensors_hdf5_overlap:
         trusted_content_format = "hdf5"
-    skipped_overlap_scanner_id: str | None = None
-    if (
-        trusted_content_format == "xgboost"
-        and scanner_selection.active
-        and scanner_selection.allows("mxnet")
-        and not scanner_selection.allows("xgboost")
-    ):
-        selected_mxnet_route = detect_mxnet_symbol_content_route(path)
-        if selected_mxnet_route == "mxnet":
-            config = dict(config or {})
-            config[MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY] = str(Path(path).resolve())
-            trusted_content_format = "mxnet"
-            skipped_overlap_scanner_id = "xgboost"
-        elif selected_mxnet_route == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
-            trusted_content_format = MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
-            skipped_overlap_scanner_id = "xgboost"
-    if (
-        trusted_content_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}
-        and os.path.splitext(path)[1].lower() != ".json"
-        and scanner_selection.active
-        and scanner_selection.allows("xgboost")
-        and not scanner_selection.allows("mxnet")
-        and (
-            XGBoostScanner._is_xgboost_json(
-                path,
-                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
-            )
-            or XGBoostScanner._is_probable_mxnet_overlap_candidate(
-                path,
-                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
-            )
-        )
-    ):
-        # Keep default bounded ownership with MXNet, but honor explicit
-        # XGBoost-only coverage when its structure is already observable.
-        trusted_content_format = "xgboost"
-    if (
-        trusted_content_format == "xgboost"
-        and os.path.splitext(path)[1].lower() != ".json"
-        and (
-            XGBoostScanner._is_xgboost_json(
-                path,
-                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
-            )
-            or XGBoostScanner._is_probable_mxnet_overlap_candidate(
-                path,
-                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
-            )
-        )
-    ):
-        config = dict(config or {})
-        configure_content_routed_json_scan(config, max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES)
+    trusted_content_format, skipped_overlap_scanner_id = resolve_json_overlap(
+        path, trusted_content_format, config, scanner_selection
+    )
     if trusted_content_format == "unknown":
         xgboost_route = detect_xgboost_ubjson_content_route(path)
         if xgboost_route is not None:
             trusted_content_format = xgboost_route
             if xgboost_route == "xgboost":
-                config = dict(config or {})
                 config[XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY] = True
     if trusted_content_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
         return with_safetensors_overlap(_make_incomplete_llamafile_routing_result(path, config))
@@ -1318,15 +1316,7 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         return with_safetensors_overlap(_make_incomplete_tokenizer_json_routing_result(path))
     if trusted_content_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
         result = _make_incomplete_mxnet_symbol_routing_result(path, config)
-        if skipped_overlap_scanner_id:
-            add_scanner_selection_skip_check(
-                result,
-                path,
-                skipped_overlap_scanner_id,
-                scanner_selection,
-                context="overlapping JSON analysis",
-                kind=SCANNER_SELECTION_PREFERRED_KIND,
-            )
+        record_skipped_json_owner(result, path, skipped_overlap_scanner_id, scanner_selection)
         return with_safetensors_overlap(result)
     if trusted_content_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
         return with_safetensors_overlap(_make_incomplete_xgboost_ubjson_routing_result(path))
@@ -1502,15 +1492,7 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
             config,
             context="nested strict content owner overlapping ambiguous Flax analysis",
         )
-    if skipped_overlap_scanner_id:
-        add_scanner_selection_skip_check(
-            result,
-            path,
-            skipped_overlap_scanner_id,
-            scanner_selection,
-            context="overlapping JSON analysis",
-            kind=SCANNER_SELECTION_PREFERRED_KIND,
-        )
+    record_skipped_json_owner(result, path, skipped_overlap_scanner_id, scanner_selection)
     if skipped_preferred_scanner_id:
         add_scanner_selection_skip_check(
             result,

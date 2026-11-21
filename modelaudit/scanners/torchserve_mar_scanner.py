@@ -5665,14 +5665,11 @@ class TorchServeMarScanner(BaseScanner):
                     archive_path=archive_path,
                     member_name=member_name,
                 )
-                result.merge_member_result(file_result, member_name)
+                result.merge_member_result(file_result, member_name, extracted_size=total_size)
 
                 asset_entry = asset_from_scan_result(f"{archive_path}:{member_name}", file_result)
                 asset_entry.setdefault("size", member_info.file_size)
                 contents.append(asset_entry)
-
-                if file_result.scanner_name == "unknown":
-                    result.bytes_scanned += total_size
 
                 if normalized_member in referenced_payloads:
                     scanned_referenced_payloads.add(normalized_member)
