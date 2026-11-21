@@ -27,6 +27,11 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from modelaudit_picklescan import api as _picklescan_api
+from modelaudit_picklescan._storage_literals import (
+    StorageLiteralMatcher,
+    base64_token_segments,
+    normalize_continuations,
+)
 
 from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS, SUSPICIOUS_STRING_PATTERNS
 from ..scanner_results import (
@@ -215,7 +220,6 @@ _BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(
     rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_=\-\s\r\n\t!\"#$%&'()*.,:;<>?@\[\]\\^`{|}~]{7,}"
 )
 _BASE64_NESTED_LITERAL_SEPARATOR_RE = re.compile(rb"[^A-Za-z0-9+/_=-]+")
-_BASE64_LITERAL_TOKEN_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/_-")
 _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[0-9A-Fa-f][0-9A-Fa-f\s\r\n\t]{15,}")
 _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES = b"X\x8c\x8d\x95"
@@ -276,48 +280,7 @@ _STORAGE_GLOBAL_REFERENCE = re.compile(
         for op, width in ((b"\x8c", 1), (b"X", 4), (b"\x8d", 8))
     )
 )
-_PICKLE_ENGINE_MAGIC_METHOD_LITERAL_PATTERN = (
-    r"(?<!\w)__(?:reduce|reduce_ex|setstate|getstate|getnewargs|getnewargs_ex|subclasses|globals|code|"
-    r"builtins|import|mro|base|bases|abs|add|aiter|and|anext|bool|bytes|call|ceil|contains|del|"
-    r"delitem|enter|eq|exit|floor|format|fspath|ge|getattribute|getattr|getitem|gt|hash|iadd|iand|"
-    r"ilshift|imatmul|imod|imul|index|invert|ior|ipow|irshift|iter|isub|itruediv|ixor|le|len|"
-    r"length_hint|lshift|lt|matmul|mod|mul|ne|neg|next|or|pos|pow|radd|rand|rlshift|rmatmul|"
-    r"rmod|rmul|ror|rpow|repr|reversed|round|rshift|rrshift|rsub|rtruediv|rxor|setitem|setattr|"
-    r"set_name|str|sub|trunc|truediv|xor|delattr)__(?!\w)"
-)
-_SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in (*SUSPICIOUS_STRING_PATTERNS, _PICKLE_ENGINE_MAGIC_METHOD_LITERAL_PATTERN)
-)
-_PYTHON_LINE_CONTINUATION_RE = re.compile(r"\\(?:\r\n?|\n)[ \t\f]*")
-_STORAGE_LITERAL_TEXT_ROUTE_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE | re.DOTALL)
-    for pattern in (
-        r"(?:compile|eval|exec)\(",
-        r"__import__\(",
-        r"import\s+[\w.]+",
-        r"from\s+[\w.]+\s+import\s*(?:\(|\*|[\w.,\s]+)",
-        r"importlib\.(?:import_module|__import__)\(",
-        r"os\.(?:system|popen|spawn[a-z]*)(?:\.__call__)?\(",
-        r"subprocess\.(?:Popen|call|check_output|run|check_call)\(",
-        r"base64\.(?:b64decode|decode)\(",
-        r"(?:pickle|cloudpickle|joblib)\.(?:_pickle_load|load|loads)\(",
-        r"copyreg\.(?:add_extension|remove_extension)\(",
-        r"getattr\s*\(\s*\w+\s*,\s*['\"](?:system|popen|spawn|exec|eval|call|run|Popen)['\"]",
-    )
-)
-_BASE64_LITERAL_TEXT_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_=\-\s\r\n\t]{7,}")
-_HEX_LITERAL_TEXT_TOKEN_RE = re.compile(rb"(?:[0-9A-Fa-f]{2}[\s\r\n\t]*){4,}")
-_MAX_STORAGE_LITERAL_TEXT_CANDIDATES = 64
-_MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES = 64 * 1024
-_STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES = 1024
-_MAX_STORAGE_LITERAL_DECODED_TEXT_WINDOWS = 16
-_MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES = ((_MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES + 2) // 3) * 4
-_STORAGE_LITERAL_BASE64_DECODE_INPUT_OVERLAP_BYTES = ((_STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES + 2) // 3) * 4
-_STORAGE_LITERAL_BASE64_DECODE_INPUT_STRIDE_BYTES = (
-    _MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES - _STORAGE_LITERAL_BASE64_DECODE_INPUT_OVERLAP_BYTES
-)
-_MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS = 64
+_LITERAL_MATCHER = StorageLiteralMatcher(SUSPICIOUS_STRING_PATTERNS)
 
 
 @dataclass(frozen=True)
@@ -3800,202 +3763,7 @@ class PyTorchZipScanner(BaseScanner):
             value,
             nested_literal_depth=nested_literal_depth,
             work_budget_remaining=work_budget_remaining,
-        ) or PyTorchZipScanner._literal_value_has_suspicious_text(value)
-
-    @staticmethod
-    def _literal_value_has_suspicious_text(value: bytes) -> bool:
-        text = value.decode("utf-8", errors="ignore")
-        if not text:
-            text = value.decode("latin-1", errors="ignore")
-        return PyTorchZipScanner._literal_text_has_storage_route_signal(
-            text
-        ) or PyTorchZipScanner._literal_value_has_encoded_suspicious_text(value)
-
-    @staticmethod
-    def _literal_text_has_storage_route_signal(text: str) -> bool:
-        candidates = PyTorchZipScanner._storage_route_text_candidates(text)
-        for candidate in candidates:
-            if any(pattern.search(candidate) for pattern in _SUSPICIOUS_LITERAL_TEXT_PATTERNS) or any(
-                pattern.search(candidate) for pattern in _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS
-            ):
-                return True
-        compacted = PyTorchZipScanner._compact_python_member_access_and_calls(candidates[-1])
-        return compacted != text and any(pattern.search(compacted) for pattern in _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS)
-
-    @staticmethod
-    def _storage_route_text_candidates(text: str) -> tuple[str, ...]:
-        chunks: list[str] = []
-        fragments: list[str] = []
-        last_end = 0
-        # Match only the original input; removals must not create new matches.
-        for match in _PYTHON_LINE_CONTINUATION_RE.finditer(text):
-            fragments.append(text[last_end : match.start()])
-            last_end = match.end()
-            if len(fragments) >= _STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES:
-                chunks.append("".join(fragments))
-                fragments.clear()
-        if last_end == 0:
-            return (text,)
-        fragments.append(text[last_end:])
-        chunks.append("".join(fragments))
-        return text, "".join(chunks)
-
-    @staticmethod
-    def _compact_python_member_access_and_calls(text: str) -> str:
-        chunks: list[str] = []
-        output: list[str] = []
-        index = 0
-        length = len(text)
-        while index < length:
-            if len(output) >= _STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES:
-                # Only the final character can still be removed by a later token.
-                chunks.append("".join(output[:-1]))
-                output = output[-1:]
-            char = text[index]
-            if char.isspace():
-                next_index = index + 1
-                while next_index < length and text[next_index].isspace():
-                    next_index += 1
-                if next_index < length and text[next_index] in ".(":
-                    index = next_index
-                    continue
-                if output and output[-1] == ".":
-                    index = next_index
-                    continue
-                output.append(" ")
-                index = next_index
-                continue
-            if char == ".":
-                if output and output[-1] == " ":
-                    output.pop()
-                output.append(".")
-                index += 1
-                while index < length and text[index].isspace():
-                    index += 1
-                continue
-            if char == "(" and output and output[-1] == " ":
-                output.pop()
-            output.append(char)
-            index += 1
-        chunks.append("".join(output))
-        return "".join(chunks)
-
-    @staticmethod
-    def _literal_value_has_encoded_suspicious_text(value: bytes) -> bool:
-        return PyTorchZipScanner._base64_literal_value_has_suspicious_text(
-            value
-        ) or PyTorchZipScanner._hex_literal_value_has_suspicious_text(value)
-
-    @staticmethod
-    def _decoded_literal_text_has_storage_route_signal(decoded: bytes) -> bool:
-        start = 0
-        window_count = 0
-        step = _MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES - _STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES
-        while start < len(decoded):
-            window_count += 1
-            if window_count > _MAX_STORAGE_LITERAL_DECODED_TEXT_WINDOWS:
-                return True
-            window = decoded[start : start + _MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES]
-            for encoding in ("utf-8", "latin-1"):
-                text = window.decode(encoding, errors="ignore")
-                if text and PyTorchZipScanner._literal_text_has_storage_route_signal(text):
-                    return True
-            if start + _MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES >= len(decoded):
-                break
-            start += step
-        return False
-
-    @staticmethod
-    def _base64_literal_value_has_suspicious_text(value: bytes) -> bool:
-        candidate_count = 0
-        for match in _BASE64_LITERAL_TEXT_TOKEN_RE.finditer(value):
-            compact = re.sub(rb"\s+", b"", match.group(0)).translate(bytes.maketrans(b"-_", b"+/"))
-            if len(compact) < 8:
-                continue
-            candidate_count += 1
-            if candidate_count > _MAX_STORAGE_LITERAL_TEXT_CANDIDATES:
-                return True
-            token_segments = PyTorchZipScanner._base64_literal_route_token_segments(compact)
-            if token_segments is None:
-                return True
-            for token_start, token_end in token_segments:
-                candidate_token = compact[token_start:token_end]
-                for shift in range(min(16, len(candidate_token))):
-                    token = candidate_token[shift:]
-                    if len(token) < 8:
-                        continue
-                    if PyTorchZipScanner._base64_token_has_storage_route_signal(token):
-                        return True
-        return False
-
-    @staticmethod
-    def _base64_literal_route_token_segments(token: bytes) -> tuple[tuple[int, int], ...] | None:
-        segments: list[tuple[int, int]] = []
-        seen: set[tuple[int, int]] = set()
-        boundaries = [0]
-
-        def add_segment(start: int, end: int) -> bool:
-            segment = (start, end)
-            if end - start < 8 or segment in seen:
-                return True
-            segments.append(segment)
-            seen.add(segment)
-            return len(segments) <= _MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS
-
-        if not add_segment(0, len(token)):
-            return None
-        for match in re.finditer(rb"=+", token):
-            suffix_start = match.end()
-            if suffix_start < len(token) and token[suffix_start] in _BASE64_LITERAL_TOKEN_BYTES:
-                if len(boundaries) >= _MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS:
-                    return None
-                for token_start in boundaries:
-                    if not add_segment(token_start, suffix_start):
-                        return None
-                boundaries.append(suffix_start)
-        for token_start in boundaries:
-            if not add_segment(token_start, len(token)):
-                return None
-        return tuple(segments)
-
-    @staticmethod
-    def _base64_token_has_storage_route_signal(token: bytes) -> bool:
-        start = 0
-        window_count = 0
-        while start < len(token):
-            window_count += 1
-            if window_count > _MAX_STORAGE_LITERAL_DECODED_TEXT_WINDOWS:
-                return True
-            window = token[start : start + _MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES]
-            window += b"=" * (-len(window) % 4)
-            try:
-                decoded = base64.b64decode(window, validate=True)
-            except (binascii.Error, ValueError):
-                return False
-            if decoded and PyTorchZipScanner._decoded_literal_text_has_storage_route_signal(decoded):
-                return True
-            if start + _MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES >= len(token):
-                break
-            start += _STORAGE_LITERAL_BASE64_DECODE_INPUT_STRIDE_BYTES
-        return False
-
-    @staticmethod
-    def _hex_literal_value_has_suspicious_text(value: bytes) -> bool:
-        candidate_count = 0
-        for match in _HEX_LITERAL_TEXT_TOKEN_RE.finditer(value):
-            compact = re.sub(rb"\s+", b"", match.group(0))
-            if len(compact) < 8:
-                continue
-            candidate_count += 1
-            if candidate_count > _MAX_STORAGE_LITERAL_TEXT_CANDIDATES:
-                return True
-            try:
-                decoded = binascii.unhexlify(compact)
-            except (binascii.Error, ValueError):
-                continue
-            if decoded and PyTorchZipScanner._decoded_literal_text_has_storage_route_signal(decoded):
-                return True
-        return False
+        ) or _LITERAL_MATCHER.matches(value)
 
     @staticmethod
     def _literal_value_has_raw_nested_security_pickle(
@@ -7764,7 +7532,7 @@ class PyTorchZipScanner(BaseScanner):
             token = _BASE64_NESTED_LITERAL_SEPARATOR_RE.sub(b"", match.group(0)).translate(
                 bytes.maketrans(b"-_", b"+/")
             )
-            token_segments = PyTorchZipScanner._base64_literal_route_token_segments(token)
+            token_segments = base64_token_segments(token)
             if token_segments is None:
                 return True
             for token_start, token_end in token_segments:
@@ -8369,10 +8137,10 @@ class PyTorchZipScanner(BaseScanner):
                 text = value.decode("utf-8")
             except UnicodeDecodeError:
                 text = value.decode("latin-1")
-        candidates = PyTorchZipScanner._storage_route_text_candidates(text)
-        return len(candidates) > 1 and PyTorchZipScanner._literal_text_has_storage_route_signal(
+        normalized = normalize_continuations(text)
+        return normalized != text and _LITERAL_MATCHER.matches_text(
             PyTorchZipScanner._strip_inert_literal_urls_from_text(
-                candidates[-1], url_work_budget_remaining=url_work_budget_remaining
+                normalized, url_work_budget_remaining=url_work_budget_remaining
             )
         )
 

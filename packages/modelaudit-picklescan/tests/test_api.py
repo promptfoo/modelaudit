@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import tracemalloc
 import uuid
 import warnings
 import zipfile
@@ -100,6 +101,7 @@ from modelaudit_picklescan import (
     ScanOptions,
     ScanStatus,
     Severity,
+    _storage_literals,
     call_graph,
     scan_bytes,
     scan_file,
@@ -6565,10 +6567,22 @@ def test_literal_text_route_bounds_spaced_call_near_match() -> None:
     text = "os . system" + (" " * 60_000) + '"'
 
     started_at = time.monotonic()
-    assert package_api._literal_text_has_storage_route_signal(text) is False
+    assert package_api._LITERAL_MATCHER.matches_text(text) is False
     elapsed = time.monotonic() - started_at
 
     assert elapsed < 1.0
+
+
+@pytest.mark.parametrize("unit", ["一\\\n", "一\t"], ids=["line-continuations", "member-spacing"])
+def test_storage_literal_text_normalization_bounds_fragment_memory(unit: str) -> None:
+    text = unit * 110_000
+    tracemalloc.start()
+    try:
+        assert not package_api._LITERAL_MATCHER.matches_text(text)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * len(text)
 
 
 def test_encoded_nested_pickle_route_normalizes_wrapped_tokens() -> None:
@@ -6589,17 +6603,17 @@ def test_encoded_nested_pickle_route_normalizes_wrapped_tokens() -> None:
 
 def test_base64_literal_route_fails_closed_after_suffix_budget() -> None:
     payload = b"cposix\nsystem\n)R."
-    token = (b"A=" * (package_api._MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS + 1)) + base64.b64encode(payload)
+    token = (b"A=" * (_storage_literals._MAX_BASE64_SEGMENTS + 1)) + base64.b64encode(payload)
 
-    assert package_api._base64_literal_route_token_segments(token) is None
+    assert _storage_literals.base64_token_segments(token) is None
     assert package_api._literal_value_has_encoded_nested_security_pickle(token) is True
-    assert package_api._base64_literal_value_has_suspicious_text(token) is True
+    assert package_api._LITERAL_MATCHER.matches(token) is True
 
 
 def test_base64_literal_route_fails_closed_after_dense_padding_boundaries() -> None:
-    token = b"".join(b"A=" for _ in range(package_api._MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS + 1)) + b"AAAA"
+    token = b"".join(b"A=" for _ in range(_storage_literals._MAX_BASE64_SEGMENTS + 1)) + b"AAAA"
 
-    assert package_api._base64_literal_route_token_segments(token) is None
+    assert _storage_literals.base64_token_segments(token) is None
 
 
 def test_encoded_nested_pickle_route_ignores_base64_marker_density_noise() -> None:
@@ -6651,10 +6665,10 @@ def test_encoded_nested_pickle_route_fails_closed_after_candidate_budget_gap() -
 
 
 def test_base64_literal_text_route_scans_middle_windows_without_size_only_signal() -> None:
-    assert package_api._base64_literal_value_has_suspicious_text(base64.b64encode(b"B" * 80_000)) is False
+    assert package_api._LITERAL_MATCHER.matches(base64.b64encode(b"B" * 80_000)) is False
     value = base64.b64encode(b"B" * 40_000 + b'os.system("id")' + b"B" * 40_000)
 
-    assert package_api._base64_literal_value_has_suspicious_text(value) is True
+    assert package_api._LITERAL_MATCHER.matches(value) is True
 
 
 @pytest.mark.parametrize(
@@ -6662,6 +6676,11 @@ def test_base64_literal_text_route_scans_middle_windows_without_size_only_signal
     [
         (b"OS . system('id')", SafetyVerdict.SUSPICIOUS, True),
         (b"__import__", SafetyVerdict.SUSPICIOUS, True),
+        (b"Code\xa0__lazy_import__('example').resolve()", SafetyVerdict.SUSPICIOUS, True),
+        (b"B" * 16 + b" " + base64.b64encode(b"__lazy_import__('example')"), SafetyVerdict.SUSPICIOUS, True),
+        (base64.b64encode(b"__lazy_import__('example').resolve()") + b"\fTitle", SafetyVerdict.SUSPICIOUS, True),
+        (base64.b64encode(b"f=(eval);f('0')"), SafetyVerdict.SUSPICIOUS, True),
+        (b"__lazy_import__(name) returns a\\\n proxy. ", SafetyVerdict.CLEAN, False),
         (b'importlib.import_module("os")', SafetyVerdict.SUSPICIOUS, True),
         (b"getattr(obj, 'system')", SafetyVerdict.MALICIOUS, False),
         (b"getattr(getattr(obj, key), arg)", SafetyVerdict.MALICIOUS, True),
@@ -6681,6 +6700,11 @@ def test_base64_literal_text_route_scans_middle_windows_without_size_only_signal
     ids=[
         "spaced-os-system",
         "dunder-import",
+        "lazy-import",
+        "base64-lazy-import",
+        "base64-lazy-import-before-separator",
+        "base64-eval-alias",
+        "lazy-import-docs",
         "importlib-import-module",
         "getattr-system",
         "nested-getattr",
@@ -9275,6 +9299,7 @@ def test_scan_bytes_preserves_call_after_inline_comment_quotes(literal: str) -> 
         (b"os.system.__call__('id')", "base64 os.system"),
         (b"((os.system))('id')", "base64 os.system"),
         (b"f: object = os.system;f('id')", "base64 os.system"),
+        (b"f = (eval); f(x)", "base64 eval("),
         (b"x=f'https://a/{eval(y)}'", "base64 eval("),
         (b"x=f\"{f'https://a/{eval(y)}'}\"", "base64 eval("),
         (b'x=f"{value:https://a/{eval(y)}}"', "base64 eval("),
@@ -9288,6 +9313,42 @@ def test_scan_bytes_flags_base64_encoded_code_string_literals(literal: bytes, pa
     report = scan_bytes(pickle.dumps({"code": encoded}), source="encoded-code-string.pkl")
 
     _assert_suspicious_string_report(report, pattern)
+
+
+@pytest.mark.parametrize(
+    ("literal", "suspicious"),
+    [
+        ("__LAZY_IMPORT__('example').resolve()", True),
+        ("(__lazy_import__)('example').resolve()", True),
+        ("((builtins . __lazy_import__))('example')", True),
+        ("(__builtins__.__lazy_import__)('example')", True),
+        ("((builtins).__lazy_import__)('example').resolve()", True),
+        ("f = ((builtins)).__lazy_import__; f('example')", True),
+        ("f = __lazy_import__; f('example').resolve()", True),
+        ("f = builtins.__lazy_import__; f('example').resolve()", True),
+        ("f = __builtins__.__lazy_import__; f('example')", True),
+        ("f = (builtins.__lazy_import__); f('example')", True),
+        ("__lazy_import__.__call__('example')", True),
+        ("(__lazy_import__.__call__)('example')", True),
+        ("((__lazy_import__).__call__)('example')", True),
+        ("__lazy_import__(name) returns a lazy import object.", False),
+        ("(__lazy_import__)(name) returns a lazy import object.", False),
+        ("f == (__lazy_import__)", False),
+        ("not__lazy_import__('example')", False),
+        ("π__lazy_import__('example')", False),
+        ("e\u0301__lazy_import__('example')", False),
+        ("f = __lazy_import__\u0301other", False),
+        ("https://example.invalid/docs/__lazy_import__(name)", False),
+    ],
+)
+def test_lazy_import_string_verdict_is_independent_of_encoding(literal: str, suspicious: bool) -> None:
+    encoded = base64.b64encode(literal.encode()).decode("ascii")
+    for text, label in ((literal, "__lazy_import__("), (encoded, "base64 __lazy_import__")):
+        report = scan_bytes(pickle.dumps(text))
+        if suspicious:
+            _assert_suspicious_string_report(report, label)
+        else:
+            _assert_clean_report(report)
 
 
 def test_scan_bytes_preserves_base64_finding_before_total_work_limit() -> None:
@@ -9315,6 +9376,7 @@ def test_scan_bytes_does_not_join_base64_fragments_across_removed_url() -> None:
     [
         b"X os.system is documented",
         b"x == os.system",
+        b"x == (eval)",
         b"https://a/path;section=eval(x)",
         b"https://a/path;handler=os.system(cmd)",
         b'x=f"{value:https://a;eval(y)}"',

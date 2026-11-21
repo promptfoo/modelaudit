@@ -15,7 +15,15 @@ from pickle_test_helpers import (
     _proto0_string_literal,
 )
 
-from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, ScanStatus, scan_bytes, scan_file
+from modelaudit_picklescan import (
+    PickleReport,
+    SafetyVerdict,
+    ScanOptions,
+    ScanStatus,
+    _storage_literals,
+    scan_bytes,
+    scan_file,
+)
 from modelaudit_picklescan import api as picklescan_api
 
 MAX_PROTOCOL0_LINE_OPERAND_BYTES = 8 * 1024 * 1024
@@ -271,15 +279,15 @@ def test_storage_literal_route_bounds_long_base64_without_size_only_signal(monke
     def bounded_decode(token: bytes, *, validate: bool) -> bytes:
         assert validate is True
         decode_lengths.append(len(token))
-        assert len(token) <= picklescan_api._MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES
+        assert len(token) <= _storage_literals._BASE64_WINDOW_BYTES
         return b"ordinary metadata"
 
-    monkeypatch.setattr(picklescan_api.base64, "b64decode", bounded_decode)
-    token = b"A" * (picklescan_api._MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES + 1024)
+    monkeypatch.setattr(base64, "b64decode", bounded_decode)
+    token = b"A" * (_storage_literals._BASE64_WINDOW_BYTES + 1024)
 
-    assert picklescan_api._base64_literal_value_has_suspicious_text(token) is False
+    assert picklescan_api._LITERAL_MATCHER.matches(token) is False
     assert decode_lengths
-    assert max(decode_lengths) <= picklescan_api._MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES
+    assert max(decode_lengths) <= _storage_literals._BASE64_WINDOW_BYTES
 
 
 @pytest.mark.parametrize(

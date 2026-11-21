@@ -214,7 +214,8 @@ def pickle_report_to_scan_result(
             details.setdefault("pickle_rule_code", finding.rule_code)
         severity = _to_issue_severity(finding.severity)
         legacy_rule_code = _legacy_rule_code_for_finding(finding)
-        _add_legacy_rule_alias_metadata(finding, details, legacy_rule_code)
+        if _is_specific_builtin_call(finding, legacy_rule_code):
+            details["legacy_rule_aliases"] = ["S115"]
         result.add_check(
             name=_legacy_check_name_for_finding(finding),
             passed=False,
@@ -536,13 +537,7 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
         module = finding.details.get("module")
         name = finding.details.get("name")
         if isinstance(module, str) and module.lower() in {"__builtin__", "__builtins__", "builtins"}:
-            if name in {"eval", "exec"}:
-                return "S104"
-            if name == "compile":
-                return "S105"
-            if name == "__import__":
-                return "S106"
-            return "S115"
+            return get_import_rule_code(module, name if isinstance(name, str) else None)
 
         opcode = finding.details.get("opcode")
         if isinstance(opcode, str):
@@ -566,7 +561,7 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
                 return "S101"
             if "subprocess" in pattern:
                 return "S103"
-            if "__import__" in pattern:
+            if "__import__" in pattern or "__lazy_import__" in pattern:
                 return "S106"
             if "compile" in pattern:
                 return "S105"
@@ -589,21 +584,8 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
     return finding.rule_code
 
 
-def _add_legacy_rule_alias_metadata(
-    finding: Finding,
-    details: dict[str, Any],
-    primary_rule_code: str | None,
-) -> None:
-    if primary_rule_code == "S115" or finding.rule_code != "DANGEROUS_CALL":
-        return
-    module = finding.details.get("module")
-    name = finding.details.get("name")
-    if (
-        isinstance(module, str)
-        and module.lower() in {"__builtin__", "__builtins__", "builtins"}
-        and name in {"eval", "exec", "compile", "__import__"}
-    ):
-        details["legacy_rule_aliases"] = ["S115"]
+def _is_specific_builtin_call(finding: Finding, primary_rule_code: str | None) -> bool:
+    return finding.rule_code == "DANGEROUS_CALL" and primary_rule_code in {"S104", "S105", "S106"}
 
 
 def _legacy_check_name_for_finding(finding: Finding) -> str:
@@ -650,59 +632,35 @@ def _add_legacy_supporting_finding_checks(
         )
         return
 
-    if finding.rule_code == "DANGEROUS_CALL" and primary_rule_code != "S201" and finding.message.startswith("Found "):
-        module = finding.details.get("module")
-        name = finding.details.get("name")
-        if (
-            isinstance(module, str)
-            and module.lower() in {"__builtin__", "__builtins__", "builtins"}
-            and name
-            in {
-                "eval",
-                "exec",
-                "compile",
-                "__import__",
-            }
-        ):
-            supporting_details = {
-                **details,
-                "supporting_rule_code": True,
-                "primary_rule_code": primary_rule_code,
-            }
-            result.add_check(
-                name="REDUCE Opcode Safety Check",
-                passed=False,
-                message=finding.message,
-                severity=severity,
-                location=finding.location,
-                details=supporting_details,
-                why=_legacy_why_for_finding(finding),
-                rule_code="S201",
-            )
-            if primary_rule_code != "S115":
-                details.setdefault("legacy_rule_aliases", ["S115"])
-        return
-
-    if finding.rule_code == "DANGEROUS_GLOBAL":
+    if _is_specific_builtin_call(finding, primary_rule_code) and finding.message.startswith("Found "):
+        opcode = finding.details.get("opcode")
+        if not isinstance(opcode, str):
+            return
+        rule_code = get_pickle_opcode_rule_code(opcode)
+        check_name = f"{opcode.upper()} Opcode Safety Check"
+        details = {**details, "supporting_rule_code": True, "primary_rule_code": primary_rule_code}
+    elif finding.rule_code == "DANGEROUS_GLOBAL":
         module = finding.details.get("module")
         name = finding.details.get("name")
         if not isinstance(module, str):
             return
-        import_rule_code = get_import_rule_code(
+        rule_code = get_import_rule_code(
             _IMPORT_MODULE_ALIASES.get(module.lower(), module),
             name if isinstance(name, str) else None,
         )
-        if import_rule_code is None or import_rule_code == primary_rule_code:
-            return
+        check_name = "GLOBAL Opcode Safety Check"
+    else:
+        return
+    if rule_code is not None and rule_code != primary_rule_code:
         result.add_check(
-            name="GLOBAL Opcode Safety Check",
+            name=check_name,
             passed=False,
             message=finding.message,
             severity=severity,
             location=finding.location,
             details=details,
             why=_legacy_why_for_finding(finding),
-            rule_code=import_rule_code,
+            rule_code=rule_code,
         )
 
 

@@ -437,13 +437,18 @@ def test_pickle_report_to_scan_result_preserves_reduce_associated_global_alias()
     [
         ("eval", "S104"),
         ("exec", "S104"),
+        ("execfile", "S104"),
         ("compile", "S105"),
         ("__import__", "S106"),
+        ("__lazy_import__", "S106"),
     ],
 )
+@pytest.mark.parametrize(("opcode", "opcode_rule"), [("REDUCE", "S201"), ("INST", "S202"), ("OBJ", "S203")])
 def test_pickle_report_to_scan_result_preserves_legacy_builtin_call_rule_alias(
     name: str,
     expected_primary_rule: str,
+    opcode: str,
+    opcode_rule: str,
 ) -> None:
     report = PickleReport(
         source=f"{name}.pkl",
@@ -451,18 +456,18 @@ def test_pickle_report_to_scan_result_preserves_legacy_builtin_call_rule_alias(
         verdict=SafetyVerdict.MALICIOUS,
         findings=(
             Finding(
-                message=f"Found REDUCE opcode invoking dangerous global: builtins.{name}",
+                message=f"Found {opcode} opcode invoking dangerous global: builtins.{name}",
                 severity=Severity.CRITICAL,
                 location="eval.pkl (pos 12)",
                 rule_code="DANGEROUS_CALL",
-                details={"opcode": "REDUCE", "module": "builtins", "name": name},
+                details={"opcode": opcode, "module": "builtins", "name": name},
             ),
         ),
     )
 
     result = pickle_report_to_scan_result(report)
 
-    assert [issue.rule_code for issue in result.issues] == [expected_primary_rule, "S201"]
+    assert [issue.rule_code for issue in result.issues] == [expected_primary_rule, opcode_rule]
     assert all(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert all(issue.details["legacy_rule_aliases"] == ["S115"] for issue in result.issues)
     assert result.issues[0].details.get("supporting_rule_code") is None
@@ -601,6 +606,8 @@ def test_pickle_report_to_scan_result_falls_back_for_unmapped_persistent_id_opco
         ("SUSPICIOUS_STRING", {"pattern": "os.system(payload)"}, "S101"),
         ("SUSPICIOUS_STRING", {"pattern": "subprocess.Popen(payload)"}, "S103"),
         ("SUSPICIOUS_STRING", {"pattern": "__import__('os')"}, "S106"),
+        ("SUSPICIOUS_STRING", {"pattern": "__lazy_import__("}, "S106"),
+        ("SUSPICIOUS_STRING", {"pattern": "base64 __lazy_import__"}, "S106"),
         ("SUSPICIOUS_STRING", {"pattern": "compile(source, path, mode)"}, "S105"),
         ("SUSPICIOUS_STRING", {"pattern": "base64 encoded string literal"}, "S601"),
         ("SUSPICIOUS_STRING", {"pattern": "ordinary string literal"}, None),
