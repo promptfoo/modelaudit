@@ -3,6 +3,22 @@
   "extends": ["local>promptfoo/renovate-config"],
   "packageRules": [
     {
+      "description": "Keep filelock updates above the affected releases even when Renovate reads the Python 3.10 lock for both markers.",
+      "matchFileNames": ["pyproject.toml"],
+      "matchManagers": ["pep621"],
+      "matchPackageNames": ["filelock"],
+      "allowedVersions": ">=4.2.9"
+    },
+    {
+      "description": "Check Requires-Python when updating the Python 3.10 filelock pin.",
+      "matchFileNames": ["pyproject.toml"],
+      "matchManagers": ["pep621"],
+      "matchPackageNames": ["filelock"],
+      "matchCurrentValue": "/^==/",
+      "constraints": { "python": "3.10" },
+      "constraintsFiltering": "strict"
+    },
+    {
       "description": "Keep NumPy 1.x constraints on Python 3.10 markers in pyproject.toml.",
       "matchFileNames": ["pyproject.toml"],
       "matchManagers": ["pep621"],
