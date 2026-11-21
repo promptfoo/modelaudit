@@ -2507,7 +2507,7 @@ def _unittest_mock_patch_start_payload(
 
 def _typing_eval_type_forward_ref_payload(marker: Path) -> bytes:
     parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"typing"), _short_binunicode(b"_eval_type"), b"\x93"]
+    parts += [_short_binunicode(b"typing"), _short_binunicode(b"_eval_type"), b"\x93("]
     parts += [_short_binunicode(b"typing"), _short_binunicode(b"ForwardRef"), b"\x93"]
     parts += [_short_binunicode(b"f(p) or int"), b"\x85R"]
     parts += [b"}"]
@@ -2521,7 +2521,10 @@ def _typing_eval_type_forward_ref_payload(marker: Path) -> bytes:
     parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
     parts += [b"tRs"]
     parts += [_short_binunicode(b"int"), _short_binunicode(b"builtins"), _short_binunicode(b"int"), b"\x93s"]
-    parts += [b"N\x87R."]
+    parts += [b"N"]
+    if sys.version_info >= (3, 13):
+        parts += [b")"]  # type_params, required on Python 3.15+
+    parts += [b"tR."]
     return b"".join(parts)
 
 
@@ -6463,6 +6466,52 @@ def test_scan_bytes_blocks_itertools_takewhile_forced_iteration_rce(tmp_path: Pa
     result = pickle.loads(payload)
     assert result == ()
     assert marker.exists()
+
+
+def _lazy_import_resolution_payload(resolver: bytes) -> bytes:
+    return b"\x80\x04" + resolver + b"cbuiltins\n__lazy_import__\nVmodelaudit_lazy_provider\n\x85R\x85R."
+
+
+def test_scan_bytes_blocks_lazy_import_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    marker = tmp_path / "imported"
+    (tmp_path / "modelaudit_lazy_provider.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = _lazy_import_resolution_payload(b"ctypes\nLazyImportType.resolve\n")
+
+    report = scan_bytes(payload)
+    critical_calls = {
+        finding.details.get("import_reference")
+        for finding in report.findings
+        if finding.rule_code == "DANGEROUS_CALL" and finding.severity == Severity.CRITICAL
+    }
+    assert {"builtins.__lazy_import__", "types.LazyImportType.resolve"} <= critical_calls
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert report.status == ScanStatus.COMPLETE
+    assert not marker.exists()
+
+    if sys.version_info >= (3, 15):
+        # CPython permits __lazy_import__ at module scope.
+        subprocess.run([sys.executable, "-c", f"import pickle\npickle.loads({payload!r})"], cwd=tmp_path, check=True)
+        assert marker.exists()
+
+
+def test_scan_bytes_allows_lazy_import_type_reference() -> None:
+    report = scan_bytes(b"ctypes\nLazyImportType\n.")
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+
+
+def test_scan_bytes_blocks_wrapped_lazy_import_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "modelaudit_lazy_wrapper.py").write_text(
+        "from types import LazyImportType as Deferred\n\ndef load(proxy):\n    return Deferred.resolve(proxy)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = _lazy_import_resolution_payload(b"cmodelaudit_lazy_wrapper\nload\n")
+    report = scan_bytes(payload)
+    assert _has_critical_call_graph_finding(report, "modelaudit_lazy_wrapper", "load", "types.LazyImportType.resolve")
 
 
 def test_scan_bytes_blocks_typing_eval_type_forward_ref_rce(tmp_path: Path) -> None:

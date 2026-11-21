@@ -10793,7 +10793,8 @@ def test_scan_bytes_fails_closed_when_native_extension_appears_during_source_ana
     ("stdlib_module", "shadow_module", "shadow_source"),
     [
         (
-            "pathlib",
+            # Python 3.15 delays pathlib's glob import until the first use.
+            "glob" if sys.version_info >= (3, 15) else "pathlib",
             "fnmatch",
             "def fnmatch(name, pattern): return False\n"
             "def fnmatchcase(name, pattern): return False\n"

@@ -25,7 +25,7 @@ Comparable tools: [`picklescan`](https://github.com/mmaitre314/picklescan) (pick
 
 ## Quick Start
 
-**Requires Python 3.10-3.14**
+**Requires standard CPython 3.10–3.15**
 
 ```bash
 pip install "modelaudit[all]"
@@ -177,13 +177,17 @@ docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 The lightweight Docker image runs on Python 3.14 and ships the scanner without pip or ensurepip.
 The full image uses Python 3.13 for stable TensorFlow CPU wheels.
 
-The ONNX extra, including the ONNX portion of `modelaudit[all]`, is packaged for Python 3.10-3.12.
-PyTorch-containing extras require Python 3.10-3.12 or standard (GIL-enabled) CPython 3.13-3.14. Free-threaded CPython
-3.13t/3.14t is not supported by ModelAudit's native pickle scanner. On Apple Silicon, PyTorch-containing extras require
-macOS 14 or newer because the wheels
-target `macosx_14_0_arm64`; the core-only installation remains available for static scanning on macOS 11-13.
+On Python 3.15, `all` and `all-ci` omit h5py. For Keras H5 scanning, install `modelaudit[all,h5]`.
+Building h5py from source requires the HDF5 development libraries and a C compiler. The 7z and
+UBJSON dependencies may also require a compiler. Use Python 3.14 if you need prebuilt h5py wheels.
 
-Dill files that serialize Python 3.14 functions or classes may report incomplete analysis and security findings.
+The ONNX extra is available on Python 3.10–3.12. TensorRT has no Python 3.15 bindings yet.
+The native pickle scanner requires a GIL-enabled CPython build. On Apple Silicon, PyTorch wheels
+require macOS 14 or newer. Use the core package for static scanning on macOS 11–13.
+
+ModelAudit can scan existing Dill files on Python 3.15. Dill 0.4.1 cannot serialize new functions
+on that interpreter. Scans of functions or classes serialized on Python 3.14 may report incomplete
+analysis alongside security findings.
 
 ## CLI Options
 
@@ -329,7 +333,7 @@ until ModelAudit can inspect it. ModelAudit does not load the checkpoint to reso
 - Run `modelaudit doctor --show-failed` to list unavailable scanners and missing optional deps.
 - Run `modelaudit debug --json` to collect environment/config diagnostics for bug reports. Inspect the raw output and remove sensitive values before sharing it.
 - Use `modelaudit cache cleanup --max-age 30` to remove stale cache entries safely.
-- If `pip` installs an older release, verify Python is supported (`python --version`; ModelAudit supports Python 3.10-3.14).
+- If `pip` installs an older release, check `python --version` against the supported range in [Quick Start](#quick-start).
 - For additional troubleshooting and cloud auth guidance, see:
   - https://www.promptfoo.dev/docs/model-audit/
   - https://www.promptfoo.dev/docs/model-audit/usage/

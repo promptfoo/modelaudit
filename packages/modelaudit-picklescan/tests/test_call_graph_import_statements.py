@@ -2135,6 +2135,60 @@ def test_call_graph_models_direct_shadowable_function_body_imports() -> None:
     assert call_graph._find_sink_path("base64.main") == ("base64.main", "builtins.__import__")
 
 
+@pytest.mark.skipif(sys.version_info < (3, 15), reason="PEP 810 requires Python 3.15")
+@pytest.mark.parametrize(
+    ("name", "operands", "loads_provider"),
+    [
+        ("module_alias", b"", True),
+        ("export", b"", True),
+        ("configured", b"", True),
+        ("other.export", b"", True),
+        ("Reader.read", b"NN\x86R", True),
+        ("Reader.read", b"", False),
+        ("local", b"N\x85R", False),
+        ("nested", b")R", False),
+        ("read_builtin", b")R", False),
+    ],
+)
+def test_scan_bytes_traces_lazy_module_bindings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, operands: bytes, loads_provider: bool
+) -> None:
+    module_name = "modelaudit_lazy_bindings"
+    marker = tmp_path / "loaded"
+    (tmp_path / "modelaudit_deferred_provider.py").write_text(
+        f"open({str(marker)!r}, 'w').close()\nvalue = 1\n", encoding="utf-8"
+    )
+    (tmp_path / "modelaudit_other.py").write_text(
+        "lazy from modelaudit_deferred_provider import value as export\n", encoding="utf-8"
+    )
+    (tmp_path / f"{module_name}.py").write_text(
+        "import modelaudit_other as other\n"
+        "lazy import modelaudit_deferred_provider as module_alias\n"
+        "lazy from modelaudit_deferred_provider import value as export\n"
+        "__lazy_modules__ = ['modelaudit_deferred_provider']\n"
+        "from modelaudit_deferred_provider import value as configured\n"
+        "lazy import sys\n"
+        "class Reader:\n"
+        "    def read(self, arg): return export\n"
+        "def local(export): return export\n"
+        "def nested():\n"
+        "    def unused(): return export\n"
+        "def read_builtin(): return sys\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"\x80\x04" + f"c{module_name}\n{name}\n".encode() + operands + b"."
+
+    report = scan_bytes(payload)
+    assert _has_critical_call_graph_finding(report, module_name, name, "builtins.__import__") is loads_provider
+    assert (report.verdict == SafetyVerdict.MALICIOUS) is loads_provider
+    assert not marker.exists()
+
+    child = _run_python_subprocess([sys.executable, "-c", f"import pickle\npickle.loads({payload!r})"], cwd=tmp_path)
+    assert child.returncode == 0, child.stderr
+    assert marker.exists() is loads_provider
+
+
 def test_call_graph_treats_proven_frozen_function_body_import_as_safe() -> None:
     if FrozenImporter.find_spec("ntpath") is None:
         pytest.skip("ntpath is not frozen on this interpreter")

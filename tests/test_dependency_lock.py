@@ -25,9 +25,7 @@ PATCHED_GITPYTHON_REQUIREMENT = "gitpython>=3.2.0"
 PATCHED_ANYIO_REQUIREMENT = "anyio>=4.14.2"
 PINNED_MATURIN_BACKEND = "maturin===1.13.3"
 PATCHED_PY7ZR_REQUIREMENT = "py7zr>=1.1.3"
-PY7ZR_EXTRAS = ("sevenzip", "all-ci", "all")
 PATCHED_MLFLOW_CLIENT_REQUIREMENT = "mlflow-skinny>=3.13.0"
-MLFLOW_EXTRAS = ("mlflow", "all-ci", "all")
 MLFLOW_SQL_STORAGE_REQUIREMENTS = ("sqlalchemy>=2.0.49", "alembic>=1.18.4")
 PATCHED_SQLPARSE_REQUIREMENT = "sqlparse>=0.6.0"
 NUMPY_REQUIREMENTS = {
@@ -39,7 +37,6 @@ XGBOOST_REQUIREMENTS = {
     "xgboost>=3.2,<3.3; python_version < '3.12'",
     "xgboost>=3.4,<3.5; python_version >= '3.12'",
 }
-XGBOOST_EXTRAS = ("xgboost", "all-ci", "all")
 
 
 def _lock_package_block(name: str) -> str:
@@ -113,9 +110,8 @@ def test_mlflow_extras_use_the_hardened_tracking_client() -> None:
     root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
     optional_dependencies = root_config["project"]["optional-dependencies"]
 
-    for extra in MLFLOW_EXTRAS:
-        assert PATCHED_MLFLOW_CLIENT_REQUIREMENT in optional_dependencies[extra]
-        assert PATCHED_GITPYTHON_REQUIREMENT in optional_dependencies[extra]
+    assert PATCHED_MLFLOW_CLIENT_REQUIREMENT in optional_dependencies["mlflow"]
+    assert PATCHED_GITPYTHON_REQUIREMENT in optional_dependencies["mlflow"]
 
 
 def test_base_install_requires_patched_anyio() -> None:
@@ -124,7 +120,7 @@ def test_base_install_requires_patched_anyio() -> None:
     assert PATCHED_ANYIO_REQUIREMENT in root_config["project"]["dependencies"]
 
 
-@pytest.mark.parametrize("python_version", ["3.10", "3.11", "3.12", "3.13", "3.14"])
+@pytest.mark.parametrize("python_version", ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"])
 def test_filelock_requirement_avoids_affected_releases(python_version: str) -> None:
     project = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))["project"]
     (requirement,) = [
@@ -142,20 +138,18 @@ def test_filelock_requirement_avoids_affected_releases(python_version: str) -> N
         assert Version("4.2.9") in requirement.specifier
 
 
-@pytest.mark.parametrize("extra", MLFLOW_EXTRAS)
-def test_mlflow_extras_preserve_sql_backed_model_registries(extra: str) -> None:
+def test_mlflow_extras_preserve_sql_backed_model_registries() -> None:
     root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
-    optional_dependencies = root_config["project"]["optional-dependencies"][extra]
+    optional_dependencies = root_config["project"]["optional-dependencies"]["mlflow"]
 
     for requirement in MLFLOW_SQL_STORAGE_REQUIREMENTS:
         assert requirement in optional_dependencies
         assert _lock_package_block(requirement.split(">=", maxsplit=1)[0])
 
 
-@pytest.mark.parametrize("extra", MLFLOW_EXTRAS)
-def test_mlflow_extras_require_patched_sqlparse(extra: str) -> None:
+def test_mlflow_extras_require_patched_sqlparse() -> None:
     root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
-    optional_dependencies = root_config["project"]["optional-dependencies"][extra]
+    optional_dependencies = root_config["project"]["optional-dependencies"]["mlflow"]
 
     assert PATCHED_SQLPARSE_REQUIREMENT in optional_dependencies
 
@@ -193,7 +187,7 @@ def test_root_requires_hardened_picklescan_release() -> None:
     bounds = {specifier.operator: specifier.version for specifier in dependency.specifier}
     assert len(dependency.specifier) == 2
     assert set(bounds) == {">=", "<"}
-    assert Version(bounds[">="]) >= Version("0.1.13")
+    assert Version(bounds[">="]) >= Version("0.1.17")
     assert Version(bounds["<"]) == Version("0.2.0")
     locked_version = ".".join(str(part) for part in _locked_version(_lock_package_block("modelaudit-picklescan")))
     assert dependency.specifier.contains(locked_version)
@@ -203,8 +197,7 @@ def test_py7zr_extras_require_patched_release() -> None:
     root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
     optional_dependencies = root_config["project"]["optional-dependencies"]
 
-    for extra in PY7ZR_EXTRAS:
-        assert PATCHED_PY7ZR_REQUIREMENT in optional_dependencies[extra]
+    assert PATCHED_PY7ZR_REQUIREMENT in optional_dependencies["sevenzip"]
 
 
 def test_numpy_requirements_follow_supported_python_versions() -> None:
@@ -212,18 +205,12 @@ def test_numpy_requirements_follow_supported_python_versions() -> None:
     project = root_config["project"]
 
     root_requirements = {requirement for requirement in project["dependencies"] if requirement.startswith("numpy")}
-    extra_requirements = {
-        requirement for requirement in project["optional-dependencies"]["numpy1"] if requirement.startswith("numpy")
-    }
-
     assert root_requirements == NUMPY_REQUIREMENTS
-    assert extra_requirements == NUMPY_REQUIREMENTS
 
 
-@pytest.mark.parametrize("extra", XGBOOST_EXTRAS)
-def test_xgboost_requirements_follow_supported_python_versions(extra: str) -> None:
+def test_xgboost_requirements_follow_supported_python_versions() -> None:
     root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
-    optional_dependencies = root_config["project"]["optional-dependencies"][extra]
+    optional_dependencies = root_config["project"]["optional-dependencies"]["xgboost"]
 
     requirements = {requirement for requirement in optional_dependencies if requirement.startswith("xgboost")}
 
@@ -249,8 +236,15 @@ def test_renovate_keeps_legacy_xgboost_cohort_compatible() -> None:
     assert current_value_pattern.search(">=3.4,<3.5") is None
 
 
-@pytest.mark.parametrize("extra", ["h5", "numpy1", "all-ci", "all"])
-@pytest.mark.parametrize("python_version", ["3.10", "3.11", "3.12", "3.13", "3.14"])
+def test_optional_bundles_reuse_framework_constraints() -> None:
+    extras = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))["project"]["optional-dependencies"]
+    assert "modelaudit[dill,joblib,onnx,pytorch,safetensors,tflite]" in extras["numpy1"]
+    assert extras["all"] == ["modelaudit[mlflow,numpy1,sevenzip,xgboost]"]
+    assert extras["all-ci"] == ["modelaudit[all]"]
+
+
+@pytest.mark.parametrize("extra", ["h5", "numpy1"])
+@pytest.mark.parametrize("python_version", ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"])
 def test_h5py_requirements_preserve_older_python_floors(extra: str, python_version: str) -> None:
     project = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))["project"]
     requirements = [
@@ -260,11 +254,13 @@ def test_h5py_requirements_preserve_older_python_floors(extra: str, python_versi
         and (requirement.marker is None or requirement.marker.evaluate({"python_version": python_version}))
     ]
 
-    assert len(requirements) == 1
-    requirement = requirements[0]
+    if extra == "numpy1" and python_version == "3.15":
+        assert not requirements
+        return
+    (requirement,) = requirements
     assert requirement.specifier.contains("3.15.0")
     assert not requirement.specifier.contains("4.0.0")
-    assert requirement.specifier.contains("3.14.0") is (python_version != "3.14")
+    assert requirement.specifier.contains("3.14.0") is (Version(python_version) < Version("3.14"))
 
 
 def test_renovate_python_updates_follow_runtime_support() -> None:
