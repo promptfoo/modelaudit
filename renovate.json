@@ -19,6 +19,14 @@
       "constraintsFiltering": "strict"
     },
     {
+      "description": "Keep the filelock compatibility check on the oldest supported Python.",
+      "matchManagers": ["renovate-config"],
+      "matchDepNames": ["python"],
+      "matchDepTypes": ["tool-constraint"],
+      "matchCurrentValue": "3.10",
+      "enabled": false
+    },
+    {
       "description": "Keep NumPy 1.x constraints on Python 3.10 markers in pyproject.toml.",
       "matchFileNames": ["pyproject.toml"],
       "matchManagers": ["pep621"],
