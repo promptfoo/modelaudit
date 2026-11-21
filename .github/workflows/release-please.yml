@@ -211,16 +211,24 @@ jobs:
             echo "Refusing release metadata for an unexpected branch."
             exit 1
           fi
-          pr=$(gh pr view "$branch" --repo "$GITHUB_REPOSITORY" --json number,state,isCrossRepository,baseRefName,headRefName,headRefOid)
-          jq -e --arg branch "$branch" '
-            .state == "OPEN" and .baseRefName == "main" and .isCrossRepository == false and
-            .headRefName == $branch and (.headRefOid | test("^[0-9a-f]{40}$"))
-          ' <<< "$pr" >/dev/null
-          {
-            echo "pr_branch=$branch"
-            echo "pr_number=$(jq -r '.number' <<< "$pr")"
-            echo "pr_head=$(jq -r '.headRefOid' <<< "$pr")"
-          } >> "$GITHUB_OUTPUT"
+          # The PR can briefly show the previous commit after Release Please pushes.
+          head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" --jq .object.sha)
+          [[ "$head" =~ ^[0-9a-f]{40}$ ]]
+          for delay in 0 1 2 4 8 16; do
+            sleep "$delay"
+            pr=$(gh pr view "$branch" --repo "$GITHUB_REPOSITORY" --json number,state,isCrossRepository,baseRefName,headRefName,headRefOid)
+            number=$(jq -er --arg branch "$branch" '
+              select(.state == "OPEN" and .baseRefName == "main" and .isCrossRepository == false and
+                .headRefName == $branch and (.headRefOid | test("\\A[0-9a-f]{40}\\z"))) | .number
+            ' <<< "$pr")
+            [[ "$number" =~ ^[1-9][0-9]*$ ]]
+            if jq -e --arg head "$head" '.headRefOid == $head' <<< "$pr" >/dev/null; then
+              printf 'pr_branch=%s\npr_number=%s\npr_head=%s\n' "$branch" "$number" "$head" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "Release PR did not reach the expected commit $head." >&2
+          exit 1
 
   sync-release-metadata:
     if: needs.release-please.outputs.pr_branch != ''
