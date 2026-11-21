@@ -9082,43 +9082,39 @@ class TestModelDownloadStreaming:
     ) -> None:
         import threading
 
-        class StalledResponse(_FakeRangeResponse):
-            def __init__(self) -> None:
-                super().__init__(
-                    b"12345678",
-                    headers={
-                        "Content-Range": "bytes 0-7/8",
-                        "Content-Length": "8",
-                        "ETag": '"stable"',
-                    },
-                    status_code=206,
-                )
-                self.closed = threading.Event()
-
-            def close(self) -> None:
-                self.closed.set()
-
-            def iter_content(self, chunk_size: int) -> Iterator[bytes]:
-                self.closed.wait(timeout=1.0)
-                yield from ()
-
-        response = StalledResponse()
+        response = _strict_range_response(b"12345678", 8)
         mock_requests_get.return_value = response
         mock_build_headers.side_effect = lambda *, token=None, headers=None: headers or {}
-        started = time.monotonic()
+        start_timer = threading.Timer.start
 
-        with pytest.raises(RuntimeError, match="ended before declared range"):
+        def stalled_body(chunk_size: int) -> Iterator[bytes]:
+            # Release the scheduled timer only once the body read is blocked.
+            schedule.assert_called_once()
+            timer: threading.Timer = schedule.call_args.args[0]
+            assert timer.interval == pytest.approx(0.05)
+            close.assert_not_called()
+            start_timer(timer)
+            timer.join()
+            close.assert_called_once_with()
+            return iter(())
+
+        with (
+            patch("modelaudit.utils.sources.huggingface.time.monotonic", return_value=100.0),
+            patch.object(threading.Timer, "start", autospec=True) as schedule,
+            patch.object(response, "close") as close,
+            patch.object(response, "iter_content", side_effect=stalled_body) as read,
+            pytest.raises(RuntimeError, match="ended before declared range"),
+        ):
             _read_huggingface_strict_range(
                 "test/model",
                 "model.safetensors",
                 _HF_TEST_REVISION,
                 8,
                 expected_size=8,
-                deadline=time.monotonic() + 0.05,
+                deadline=100.05,
             )
 
-        assert response.closed.is_set()
-        assert time.monotonic() - started < 0.5
+        read.assert_called_once()
 
     @patch("huggingface_hub.utils.build_hf_headers")
     @patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/model.safetensors")
