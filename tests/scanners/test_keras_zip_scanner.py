@@ -5735,18 +5735,19 @@ class TestCVE20251550ModuleReferences:
         assert cve_issues[0].details["module"] == "posix"
 
     @pytest.mark.parametrize(
-        "preprocessor",
+        ("preprocessor", "dangerous"),
         [
-            {"module": "posix", "class_name": "function", "config": "system"},
-            {"module": "subprocess", "class_name": "getoutput", "config": {}},
+            ({"module": "posix", "class_name": "function", "config": "system"}, True),
+            ({"module": "subprocess", "class_name": "getoutput", "config": {}}, True),
+            ({"module": "keras.layers", "class_name": "Normalization", "config": {}}, False),
         ],
     )
-    @pytest.mark.parametrize("standalone", [False, True])
-    def test_feature_space_nested_preprocessor_function_is_critical(
-        self, tmp_path: Path, preprocessor: dict[str, Any], standalone: bool
+    @pytest.mark.parametrize("layout", ["zip_layer", "zip_root", "h5_root"])
+    def test_feature_space_preprocessor_module(
+        self, tmp_path: Path, preprocessor: dict[str, Any], dangerous: bool, layout: str
     ) -> None:
         """FeatureSpace deserializes preprocessors under arbitrary feature names, including 'module'."""
-        scanner = KerasZipScanner()
+        standalone = layout != "zip_layer"
         feature_name = "module" if standalone else "x"
         feature_space = {
             "class_name": "FeatureSpace",
@@ -5768,10 +5769,20 @@ class TestCVE20251550ModuleReferences:
         }
         config = feature_space if standalone else _sequential_config(feature_space)
 
-        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+        if layout == "h5_root":
+            path = tmp_path / "feature_space.h5"
+            with pytest.importorskip("h5py").File(path, "w") as model:
+                model.attrs["model_config"] = json.dumps(config)
+            result = keras_h5_scanner_module.KerasH5Scanner().scan(str(path))
+        else:
+            result = KerasZipScanner().scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
-        assert cve_issues
+        if not dangerous:
+            assert result.success
+            assert not cve_issues
+            return
+        assert len(cve_issues) == 1
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
         assert cve_issues[0].details["module"] == preprocessor["module"]
         assert cve_issues[0].details["layer_name"] == ("model_config" if standalone else "features")
