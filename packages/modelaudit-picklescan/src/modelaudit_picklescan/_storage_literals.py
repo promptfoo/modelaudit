@@ -30,7 +30,6 @@ _ROUTE_PATTERNS = tuple(
     for pattern in (
         r"(?:compile|eval|exec)\(",
         r"__import__\(",
-        r"(?a:\b__lazy_import__\b)",
         r"import\s+[\w.]+",
         r"from\s+[\w.]+\s+import\s*(?:\(|\*|[\w.,\s]+)",
         r"importlib\.(?:import_module|__import__)\(",
@@ -134,12 +133,16 @@ class StorageLiteralMatcher:
     def __init__(self, patterns: Iterable[str] = _STANDALONE_PATTERNS) -> None:
         raw = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (*patterns, _MAGIC_METHOD_PATTERN))
         self._patterns = raw + _ROUTE_PATTERNS
+        # Decoding can erase token boundaries. Route the bare name, but let the
+        # native classifier decide whether it is a call, including in continued text.
+        self._discovery_patterns = (*self._patterns, re.compile("__lazy_import__", re.IGNORECASE))
 
-    def matches_text(self, text: str) -> bool:
-        if any(pattern.search(text) for pattern in self._patterns):
+    def matches_text(self, text: str, *, discovery: bool = False) -> bool:
+        patterns = self._discovery_patterns if discovery else self._patterns
+        if any(pattern.search(text) for pattern in patterns):
             return True
         normalized = normalize_continuations(text)
-        if normalized != text and any(pattern.search(normalized) for pattern in self._patterns):
+        if normalized != text and any(pattern.search(normalized) for pattern in patterns):
             return True
         compacted = _compact_member_access_and_calls(normalized)
         return compacted != normalized and any(pattern.search(compacted) for pattern in _ROUTE_PATTERNS)
@@ -147,7 +150,7 @@ class StorageLiteralMatcher:
     def matches(self, value: bytes) -> bool:
         text = value.decode("utf-8", errors="ignore") or value.decode("latin-1")
         return (
-            self.matches_text(text)
+            self.matches_text(text, discovery=True)
             or _matches_tokens(value, _BASE64_TOKEN, self._matches_base64)
             or _matches_tokens(value, _HEX_TOKEN, self._matches_hex)
         )
@@ -158,7 +161,7 @@ class StorageLiteralMatcher:
                 return True
             for encoding in ("utf-8", "latin-1"):
                 text = window.decode(encoding, errors="ignore")
-                if text and self.matches_text(text):
+                if text and self.matches_text(text, discovery=True):
                     return True
         return False
 

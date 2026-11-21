@@ -6676,8 +6676,9 @@ def test_base64_literal_text_route_scans_middle_windows_without_size_only_signal
     [
         (b"OS . system('id')", SafetyVerdict.SUSPICIOUS, True),
         (b"__import__", SafetyVerdict.SUSPICIOUS, True),
-        (b"__lazy_import__('example').resolve()", SafetyVerdict.SUSPICIOUS, True),
-        (base64.b64encode(b"__lazy_import__('example').resolve()"), SafetyVerdict.SUSPICIOUS, True),
+        (b"Code\xa0__lazy_import__('example').resolve()", SafetyVerdict.SUSPICIOUS, True),
+        (b"B" * 16 + b" " + base64.b64encode(b"__lazy_import__('example')"), SafetyVerdict.SUSPICIOUS, True),
+        (b"__lazy_import__(name) returns a\\\n proxy. ", SafetyVerdict.CLEAN, False),
         (b'importlib.import_module("os")', SafetyVerdict.SUSPICIOUS, True),
         (b"getattr(obj, 'system')", SafetyVerdict.MALICIOUS, False),
         (b"getattr(getattr(obj, key), arg)", SafetyVerdict.MALICIOUS, True),
@@ -6699,6 +6700,7 @@ def test_base64_literal_text_route_scans_middle_windows_without_size_only_signal
         "dunder-import",
         "lazy-import",
         "base64-lazy-import",
+        "lazy-import-docs",
         "importlib-import-module",
         "getattr-system",
         "nested-getattr",
@@ -9047,8 +9049,6 @@ def test_scan_bytes_allows_benign_security_documentation_strings() -> None:
                     "subprocess.run(args) is documented here as a blocked API.",
                     "An import statement loads a module.",
                     "importlib.import_module(name) is referenced in Python docs.",
-                    "__lazy_import__(name) returns a lazy import object.",
-                    "not__lazy_import__('example')",
                     "base64.b64decode(data) decodes text but is not executed here.",
                     r"The bytes are written as \x80 in the file format reference.",
                     "https://example.invalid/docs/os.system is a URL path, not code.",
@@ -9225,7 +9225,6 @@ def test_scan_bytes_allows_user_defined_dunder_metadata_literals(literal: str) -
         ("x=f'https://a/{eval(x)}'", "eval("),
         ("x=fr'https://a/{os.system(\"id\")}'", "os.system"),
         ('x=f"""https://a/{__import__("os")}"""', "__import__("),
-        ("builtins.__lazy_import__('example').resolve()", "__lazy_import__("),
         (r"x=f'https://a/\{eval(y)}'", "eval("),
         ("x=f'https://a/{{{eval(y)}}}'", "eval("),
         ('x=f"{ "" } https://a/{eval(y)}"', "eval("),
@@ -9291,13 +9290,12 @@ def test_scan_bytes_preserves_call_after_inline_comment_quotes(literal: str) -> 
         (b'OS.SYSTEM("id")', "base64 os.system"),
         (b"SUBPROCESS.RUN(x)", "base64 subprocess"),
         (b'__IMPORT__("os")', "base64 __import__"),
-        (b'__LAZY_IMPORT__("example").resolve()', "base64 __lazy_import__"),
-        (b'f = __lazy_import__;f("example").resolve()', "base64 __lazy_import__"),
         (b"https://attacker.example/payload$(eval(x))", "base64 eval("),
         (b"getattr(os,'system')('id')", "base64 os.system"),
         (b"os.system.__call__('id')", "base64 os.system"),
         (b"((os.system))('id')", "base64 os.system"),
         (b"f: object = os.system;f('id')", "base64 os.system"),
+        (b"f = (eval); f(x)", "base64 eval("),
         (b"x=f'https://a/{eval(y)}'", "base64 eval("),
         (b"x=f\"{f'https://a/{eval(y)}'}\"", "base64 eval("),
         (b'x=f"{value:https://a/{eval(y)}}"', "base64 eval("),
@@ -9311,6 +9309,34 @@ def test_scan_bytes_flags_base64_encoded_code_string_literals(literal: bytes, pa
     report = scan_bytes(pickle.dumps({"code": encoded}), source="encoded-code-string.pkl")
 
     _assert_suspicious_string_report(report, pattern)
+
+
+@pytest.mark.parametrize(
+    ("literal", "suspicious"),
+    [
+        ("__LAZY_IMPORT__('example').resolve()", True),
+        ("(__lazy_import__)('example').resolve()", True),
+        ("((builtins . __lazy_import__))('example')", True),
+        ("f = __lazy_import__; f('example').resolve()", True),
+        ("f = builtins.__lazy_import__; f('example').resolve()", True),
+        ("f = (builtins.__lazy_import__); f('example')", True),
+        ("__lazy_import__.__call__('example')", True),
+        ("__lazy_import__(name) returns a lazy import object.", False),
+        ("(__lazy_import__)(name) returns a lazy import object.", False),
+        ("f == (__lazy_import__)", False),
+        ("not__lazy_import__('example')", False),
+        ("π__lazy_import__('example')", False),
+        ("https://example.invalid/docs/__lazy_import__(name)", False),
+    ],
+)
+def test_lazy_import_string_verdict_is_independent_of_encoding(literal: str, suspicious: bool) -> None:
+    encoded = base64.b64encode(literal.encode()).decode("ascii")
+    for text, label in ((literal, "__lazy_import__("), (encoded, "base64 __lazy_import__")):
+        report = scan_bytes(pickle.dumps(text))
+        if suspicious:
+            _assert_suspicious_string_report(report, label)
+        else:
+            _assert_clean_report(report)
 
 
 def test_scan_bytes_preserves_base64_finding_before_total_work_limit() -> None:
@@ -9338,8 +9364,7 @@ def test_scan_bytes_does_not_join_base64_fragments_across_removed_url() -> None:
     [
         b"X os.system is documented",
         b"x == os.system",
-        b"not__lazy_import__('example')",
-        b"https://example.invalid/docs/__lazy_import__(name)",
+        b"x == (eval)",
         b"https://a/path;section=eval(x)",
         b"https://a/path;handler=os.system(cmd)",
         b'x=f"{value:https://a;eval(y)}"',

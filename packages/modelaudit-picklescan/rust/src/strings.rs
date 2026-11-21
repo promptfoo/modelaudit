@@ -183,6 +183,9 @@ fn suspicious_string_matches_impl(value: &str, scan_base64: bool) -> Vec<String>
         if contains_call_like(&lower, "__import__") {
             push_unique(&mut matches, "__import__(");
         }
+        if contains_lazy_import(&lower) {
+            push_unique(&mut matches, "__lazy_import__(");
+        }
         if lower.contains("\\x") && contains_hex_escape(plain) {
             push_unique(&mut matches, "hex escape");
         }
@@ -859,7 +862,6 @@ fn decoded_dangerous_string_matches(decoded: &[u8]) -> Vec<String> {
         ("eval", "base64 eval("),
         ("exec", "base64 exec("),
         ("__import__", "base64 __import__"),
-        ("__lazy_import__", "base64 __lazy_import__"),
     ] {
         if contains_dangerous_callable_invocation(&lower, name) {
             push_unique(&mut matches, label);
@@ -1156,6 +1158,22 @@ fn contains_call_like(lower: &str, name: &str) -> bool {
     })
 }
 
+fn contains_lazy_import(lower: &str) -> bool {
+    lower.match_indices("__lazy_import__").any(|(start, name)| {
+        let prefix = &lower[..start];
+        let rest = &lower[start + name.len()..];
+        if prefix.ends_with(is_python_word_char) || rest.starts_with(is_python_word_char) {
+            return false;
+        }
+        let prefix = prefix
+            .trim_end()
+            .strip_suffix('.')
+            .and_then(|module| module.trim_end().strip_suffix("builtins"))
+            .unwrap_or(prefix);
+        callable_use(prefix, rest, suffix_starts_non_prose_call)
+    })
+}
+
 fn contains_dangerous_callable_invocation(lower: &str, name: &str) -> bool {
     lower.match_indices(name).any(|(start, _)| {
         if start > 0 && is_python_word_byte(lower.as_bytes()[start - 1]) {
@@ -1165,54 +1183,42 @@ fn contains_dangerous_callable_invocation(lower: &str, name: &str) -> bool {
         if lower
             .as_bytes()
             .get(after)
-            .is_some_and(|byte| is_python_word_byte(*byte))
+            .is_some_and(|b| is_python_word_byte(*b))
         {
             return false;
         }
         let rest = &lower[after..];
-        let bounded_end = rest
-            .char_indices()
-            .nth(MAX_SUFFIX_CALL_LOOKAHEAD_CHARS)
-            .map_or(rest.len(), |(index, _)| index);
-        let bounded_rest = &rest[..bounded_end];
-        let prefix = lower[..start].trim_end();
-        let direct = trim_call_expression_spacing(bounded_rest).is_some_and(|suffix| {
-            suffix.starts_with('(') || suffix.is_empty() && bounded_end < rest.len()
-        });
-        let assignment = prefix.ends_with('=')
-            && !prefix
-                .as_bytes()
-                .get(prefix.len().saturating_sub(2))
-                .is_some_and(|byte| b"!<=>".contains(byte));
-        let wrappers = prefix
-            .chars()
-            .rev()
-            .take_while(|ch| ch.is_whitespace() || *ch == '(')
-            .filter(|ch| *ch == '(')
-            .count();
-        let mut suffix = bounded_rest;
-        let wrapped = (0..wrappers).any(|_| {
-            let Some(after_close) =
-                trim_call_expression_spacing(suffix).and_then(|trimmed| trimmed.strip_prefix(')'))
-            else {
-                return false;
-            };
-            suffix = after_close;
+        let limit = rest.char_indices().nth(MAX_SUFFIX_CALL_LOOKAHEAD_CHARS);
+        let bounded = limit.map_or(rest, |(i, _)| &rest[..i]);
+        callable_use(&lower[..start], bounded, |_, suffix| {
             trim_call_expression_spacing(suffix)
-                .is_some_and(|suffix| suffix.starts_with('(') || suffix_starts_dunder_call(suffix))
-        });
-        direct || suffix_starts_dunder_call(bounded_rest) || assignment || wrapped
+                .is_some_and(|s| s.starts_with('(') || s.is_empty() && limit.is_some())
+        })
     })
 }
 
-fn suffix_starts_dunder_call(value: &str) -> bool {
-    trim_call_expression_spacing(value)
-        .and_then(|value| value.strip_prefix('.'))
+fn callable_use(prefix: &str, mut suffix: &str, is_call: impl Fn(&str, &str) -> bool) -> bool {
+    let mut prefix = prefix.trim_end();
+    // Unwrap only balanced pairs around the name, including in alias assignments.
+    while let Some(left) = prefix.strip_suffix('(') {
+        let Some(right) = trim_call_expression_spacing(suffix).and_then(|s| s.strip_prefix(')'))
+        else {
+            break;
+        };
+        prefix = left.trim_end();
+        suffix = right;
+    }
+    if prefix
+        .strip_suffix('=')
+        .is_some_and(|s| !s.ends_with(['!', '<', '=', '>']))
+    {
+        return true;
+    }
+    let dunder = trim_call_expression_spacing(suffix)
+        .and_then(|s| s.strip_prefix('.'))
         .and_then(trim_call_expression_spacing)
-        .and_then(|value| value.strip_prefix("__call__"))
-        .filter(|value| !value.chars().next().is_some_and(is_python_word_char))
-        .and_then(trim_call_expression_spacing)
-        .is_some_and(|suffix| suffix.starts_with('('))
+        .and_then(|s| s.strip_prefix("__call__"));
+    is_call(prefix, dunder.unwrap_or(suffix))
 }
 
 fn prefix_ends_with_code_context(value: &str) -> bool {

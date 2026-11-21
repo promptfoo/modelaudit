@@ -34,7 +34,6 @@ pub(crate) const CALL_LIKE_PATTERNS: &[(&str, &str)] = &[
     ("compile", "compile("),
     ("eval", "eval("),
     ("exec", "exec("),
-    ("__lazy_import__", "__lazy_import__("),
 ];
 
 pub(crate) const MODULE_ATTR_PATTERNS: &[ModuleAttrPattern] = &[
