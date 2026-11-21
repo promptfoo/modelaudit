@@ -153,12 +153,29 @@ def _proto0_string_literal(value: bytes) -> bytes:
     return b"S'" + literal + b"'\n."
 
 
-def _pickle_binbytes(value: bytes) -> bytes:
-    return b"B" + struct.pack("<I", len(value)) + value + b"."
+def _pickle_binbytes(value: bytes, *, tail: bytes = b".") -> bytes:
+    return b"B" + struct.pack("<I", len(value)) + value + tail
 
 
 def _pickle_frame(payload: bytes) -> bytes:
     return b"\x95" + struct.pack("<Q", len(payload)) + payload
+
+
+_IMPOSSIBLE_BINUNICODE_PREFIX = b"X" + (3_191_733_531).to_bytes(4, "little")
+
+
+def _candidate_gap_prefix(prefix: bytes = _IMPOSSIBLE_BINUNICODE_PREFIX, *, padding_size: int = 70 * 1024) -> bytes:
+    """Place the next operand after more decoys than the raw candidate budget permits."""
+    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    return prefix + decoys + b"!" * padding_size
+
+
+def _storage_at_trusted_probe(payload: bytes, bytes_in_probe: int, *, prefix: bytes = b"N.") -> bytes:
+    """Pad the trivial stream so the trusted probe contains exactly bytes_in_probe of payload."""
+    probe_size = pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+    head = prefix.ljust(probe_size - bytes_in_probe) + payload[:bytes_in_probe]
+    assert len(head) == probe_size
+    return head + payload[bytes_in_probe:]
 
 
 def _float_storage_persistent_id_payload_for_bytes(key: str | bytes, data: bytes) -> bytes:
@@ -216,6 +233,14 @@ def _assert_incomplete_storage_discovery(result: ScanResult) -> None:
         and "archive/data/0" in check.details.get("zip_entries", [])
         for check in result.checks
     )
+
+
+def _assert_storage_probe(tmp_path: Path, storage: bytes, *, incomplete: bool, pad_with: bytes = b"!") -> None:
+    result = _scan_referenced_float_storage(tmp_path / "storage.pt", storage, pad_with=pad_with)
+    if incomplete:
+        _assert_incomplete_storage_discovery(result)
+    else:
+        _assert_storage_probe_skipped_cleanly(result)
 
 
 def _metadata_reduce_payload(module: str, name: str, value: bytes = b"metadata") -> bytes:
@@ -2152,7 +2177,7 @@ def test_pytorch_zip_discovery_skips_referenced_storage_blob_pickleish_bytes(tmp
 @pytest.mark.parametrize(
     "prefix",
     [
-        b"X" + (3_191_733_531).to_bytes(4, "little"),
+        _IMPOSSIBLE_BINUNICODE_PREFIX,
         b"T" + (2_000_463_965).to_bytes(4, "little"),
         b"\x95" + (15_978_500_789_337_202_991).to_bytes(8, "little"),
     ],
@@ -2175,7 +2200,7 @@ def test_pytorch_zip_discovery_charges_full_storage_probe_impossible_prefix(
     tmp_path: Path,
 ) -> None:
     model_path = tmp_path / "referenced_storage_probe_impossible_prefix_budget.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
+    prefix = _IMPOSSIBLE_BINUNICODE_PREFIX
     storage_size = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 1
     storage_blob = prefix + (b"A" * (storage_size - len(prefix)))
     with zipfile.ZipFile(model_path, "w") as zip_file:
@@ -2212,7 +2237,7 @@ def test_pytorch_zip_discovery_fails_closed_for_hidden_pickle_after_impossible_d
 ) -> None:
     model_path = tmp_path / "referenced_storage_impossible_declared_prefix_hidden_pickle.pt"
     malicious_suffix = _malicious_proto0_system_payload()
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
+    prefix = _IMPOSSIBLE_BINUNICODE_PREFIX
     storage_size = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 1024
     storage_blob = prefix + b"A" * 16 + malicious_suffix
     storage_blob += b"A" * (storage_size - len(storage_blob))
@@ -2433,72 +2458,44 @@ def test_ambiguous_storage_read_failure_cannot_be_downgraded(
     assert not should_cache_scan_result(result.to_dict())
 
 
-def test_pytorch_zip_discovery_skips_same_sized_benign_unread_tail_after_impossible_prefix(
-    tmp_path: Path,
+@pytest.mark.parametrize("hidden_pickle", [True, False], ids=["hidden-pickle", "benign"])
+def test_pytorch_zip_discovery_unread_tail_after_impossible_prefix(tmp_path: Path, hidden_pickle: bool) -> None:
+    limit = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    storage = _IMPOSSIBLE_BINUNICODE_PREFIX.ljust(limit + 128, b"A")
+    if hidden_pickle:
+        storage += _malicious_proto0_system_payload()
+    result = _scan_referenced_float_storage(tmp_path / "storage.pt", storage.ljust(limit + 512, b"A"))
+
+    if hidden_pickle:
+        _assert_incomplete_storage_discovery(result)
+    else:
+        _assert_storage_probe_skipped_cleanly(result)
+        assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+
+
+@pytest.mark.parametrize(
+    ("padding", "offset", "hidden_pickle"),
+    [
+        pytest.param(b" ", pytorch_zip_scanner_module._PICKLE_DISCOVERY_SHORT_PROBE_BYTES, True, id="short-probe"),
+        pytest.param(
+            b" ", pytorch_zip_scanner_module._PICKLE_DISCOVERY_SHORT_PROBE_BYTES, False, id="short-probe-control"
+        ),
+        pytest.param(
+            b" ", pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES + 8, True, id="past-trusted-probe"
+        ),
+        pytest.param(
+            b"\0", pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES + 8, True, id="nul-past-trusted-probe"
+        ),
+    ],
+)
+def test_pytorch_zip_discovery_padding_before_impossible_declared_prefix(
+    tmp_path: Path, padding: bytes, offset: int, hidden_pickle: bool
 ) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_unread_tail_benign.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    storage_size = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 512
-    storage_blob = prefix + (b"A" * (storage_size - len(prefix)))
-    result = _scan_referenced_float_storage(model_path, storage_blob)
-
-    _assert_storage_probe_skipped_cleanly(result)
-    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
-
-
-def test_pytorch_zip_discovery_expands_whitespace_before_impossible_declared_prefix(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_whitespace_impossible_prefix_hidden_pickle.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    malicious_suffix = _malicious_proto0_system_payload()
-    storage_blob = b" " * pytorch_zip_scanner_module._PICKLE_DISCOVERY_SHORT_PROBE_BYTES
-    storage_blob += prefix + b"A" * 16 + malicious_suffix
-    storage_blob += b"A" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES - len(storage_blob) + 512)
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
-
-
-def test_pytorch_zip_discovery_skips_whitespace_impossible_prefix_near_match(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_whitespace_impossible_prefix_near_match.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    storage_blob = b" " * pytorch_zip_scanner_module._PICKLE_DISCOVERY_SHORT_PROBE_BYTES
-    storage_blob += prefix
-    storage_blob += b"A" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES - len(storage_blob) + 512)
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
-
-
-def test_pytorch_zip_discovery_fails_closed_after_padding_beyond_trusted_probe(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_padding_beyond_trusted_probe_hidden_pickle.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    malicious_suffix = _malicious_proto0_system_payload()
-    storage_blob = b" " * (pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES + 8)
-    storage_blob += prefix + b"A" * 16 + malicious_suffix
-    storage_blob += b"A" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES - len(storage_blob) + 512)
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
-
-
-def test_pytorch_zip_discovery_fails_closed_after_nul_padding_beyond_trusted_probe(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_nul_padding_beyond_trusted_probe_hidden_pickle.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    malicious_suffix = _malicious_proto0_system_payload()
-    storage_blob = b"\x00" * (pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES + 8)
-    storage_blob += prefix + b"A" * 16 + malicious_suffix
-    storage_blob += b"A" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES - len(storage_blob) + 512)
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
+    storage = padding * offset + _IMPOSSIBLE_BINUNICODE_PREFIX
+    if hidden_pickle:
+        storage += b"A" * 16 + _malicious_proto0_system_payload()
+    storage = storage.ljust(pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 512, b"A")
+    _assert_storage_probe(tmp_path, storage, incomplete=hidden_pickle)
 
 
 def test_pytorch_zip_discovery_fails_closed_after_verified_nul_padding_separator(
@@ -2523,21 +2520,6 @@ def test_pytorch_zip_discovery_skips_verified_nul_padding_with_benign_tensor_tai
     assert not any(
         check.name == "Pickle Discovery" and check.details.get("analysis_incomplete") for check in result.checks
     )
-
-
-def test_pytorch_zip_discovery_fails_closed_for_hidden_pickle_beyond_unread_impossible_prefix(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_unread_tail_hidden_pickle.pt"
-    malicious_suffix = _malicious_proto0_system_payload()
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    malicious_offset = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 128
-    storage_size = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 512
-    storage_blob = prefix + (b"A" * (malicious_offset - len(prefix))) + malicious_suffix
-    storage_blob += b"A" * (storage_size - len(storage_blob))
-    result = _scan_referenced_float_storage(model_path, storage_blob)
-
-    _assert_incomplete_storage_discovery(result)
 
 
 @pytest.mark.parametrize("prefix", [b"\x8a\xff", b"\x8b\xff\xff\xff\x7f"])
@@ -2609,499 +2591,138 @@ def test_pytorch_zip_discovery_treats_negative_binstring_size_as_impossible() ->
     )
 
 
+_signal_and_control = pytest.mark.parametrize("has_signal", [True, False], ids=["signal", "same-size-control"])
+
+
+def _assert_sized_storage_probe(
+    tmp_path: Path, prefix: bytes, payload: bytes, has_signal: bool, *, pad_with: bytes = b"!"
+) -> None:
+    suffix = payload if has_signal else b"!" * len(payload)
+    _assert_storage_probe(tmp_path, prefix + suffix, incomplete=has_signal, pad_with=pad_with)
+
+
+@_signal_and_control
 @pytest.mark.parametrize("padding_kib", [70, 118])
-def test_pytorch_zip_discovery_fails_closed_for_hidden_pickle_after_raw_candidate_budget_gap(
-    tmp_path: Path,
-    padding_kib: int,
+def test_pytorch_zip_discovery_binary_pickle_after_raw_candidate_budget_gap(
+    tmp_path: Path, padding_kib: int, has_signal: bool
 ) -> None:
-    model_path = tmp_path / f"referenced_storage_impossible_declared_prefix_hidden_budget_gap_{padding_kib}k.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (padding_kib * 1024)
-    malicious_suffix = b"\x80\x04\x8c\x05posix\x94\x8c\x06system\x94\x93\x8c\x1decho inert-modelaudit-fixture\x94\x85R."
-    storage_blob = prefix + decoys + inert_padding + malicious_suffix
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
+    payload = b"\x80\x04\x8c\x05posix\x94\x8c\x06system\x94\x93\x8c\x1decho inert-modelaudit-fixture\x94\x85R."
+    _assert_sized_storage_probe(tmp_path, _candidate_gap_prefix(padding_size=padding_kib * 1024), payload, has_signal)
 
 
-@pytest.mark.parametrize("padding_kib", [70, 118])
-def test_pytorch_zip_discovery_skips_same_sized_candidate_budget_gap_near_match(
-    tmp_path: Path,
-    padding_kib: int,
+def _proto0_inst(argument: bytes, module: bytes = b"webbrowser") -> bytes:
+    return b"(S'" + argument + b"'\ni" + module + b"\nopen\n."
+
+
+@_signal_and_control
+@pytest.mark.parametrize(
+    "make_payload",
+    [
+        pytest.param(lambda: _proto0_inst(b"https://example.invalid/"), id="proto0-inst"),
+        pytest.param(lambda: _proto0_inst(b"a" * (9 * 1024)), id="long-inst-operand"),
+        pytest.param(lambda: _proto0_inst(b"a" * (70 * 1024)), id="cross-window-inst-operand"),
+        pytest.param(lambda: _proto0_inst(b"https://example.invalid/", b"a" * (64 * 1024)), id="truncated-inst-module"),
+        pytest.param(lambda: _pickle_binbytes(b"S" * (9 * 1024), tail=b"0Pexternal-storage-key\n."), id="persid"),
+        pytest.param(lambda: b"Vposix\nVsystem\n\x93(Vtrue\ntR.", id="unicode-stack-global"),
+        pytest.param(
+            lambda: (
+                _pickle_binunicode(b"posix")
+                + _pickle_binunicode(b"system")
+                + b"\x93"
+                + _pickle_binunicode(b"true")
+                + b"\x85R."
+            ),
+            id="headerless-binunicode-stack-global",
+        ),
+    ],
+)
+def test_pytorch_zip_discovery_operand_after_candidate_budget_gap(
+    tmp_path: Path, make_payload: Callable[[], bytes], has_signal: bool
 ) -> None:
-    model_path = tmp_path / f"referenced_storage_impossible_declared_prefix_budget_gap_near_match_{padding_kib}k.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (padding_kib * 1024)
-    payload_size = len(
-        b"\x80\x04\x8c\x05posix\x94\x8c\x06system\x94\x93\x8c\x1decho inert-modelaudit-fixture\x94\x85R."
+    _assert_sized_storage_probe(tmp_path, _candidate_gap_prefix(), make_payload(), has_signal)
+
+
+@_signal_and_control
+def test_pytorch_zip_discovery_proto0_inst_mark_before_budget_gap(tmp_path: Path, has_signal: bool) -> None:
+    prefix = _candidate_gap_prefix(_IMPOSSIBLE_BINUNICODE_PREFIX + b"(", padding_size=0)
+    payload = b"S'" + b"a" * (9 * 1024) + b"'\niwebbrowser\nopen\n."
+    _assert_sized_storage_probe(tmp_path, prefix, payload, has_signal)
+
+
+@_signal_and_control
+def test_pytorch_zip_discovery_post_budget_long_unicode_stack_global(tmp_path: Path, has_signal: bool) -> None:
+    payload = b"Vposix\nVsystem\n\x93(V" + b"a" * (9 * 1024) + b"\ntR."
+    _assert_sized_storage_probe(
+        tmp_path, _candidate_gap_prefix(_IMPOSSIBLE_BINUNICODE_PREFIX + b"!"), payload, has_signal, pad_with=b" "
     )
-    storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
 
 
-def test_pytorch_zip_discovery_fails_closed_for_proto0_inst_after_raw_candidate_budget_gap(
-    tmp_path: Path,
+def test_pytorch_zip_discovery_fails_closed_for_proto0_inst_operand_crossing_candidate_cap(tmp_path: Path) -> None:
+    _assert_storage_probe(tmp_path, _candidate_gap_prefix() + _proto0_inst(b"a" * 8_180), incomplete=True)
+
+
+def test_pytorch_zip_discovery_fails_closed_for_long_persid_operand_after_budget_gap(tmp_path: Path) -> None:
+    payload = b"P" + b"A" * (9 * 1024) + b"\n."
+    _assert_storage_probe(tmp_path, _candidate_gap_prefix() + payload, incomplete=True)
+
+
+def test_pytorch_zip_discovery_skips_marker_rich_binbytes_persid_near_match(tmp_path: Path) -> None:
+    payload = _pickle_binbytes(b"Q!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
+    _assert_storage_probe(tmp_path, _candidate_gap_prefix(padding_size=0) + payload, incomplete=False)
+
+
+@pytest.mark.parametrize(
+    "make_literal",
+    [
+        pytest.param(lambda pad: _pickle_binbytes(b"P" + pad), id="binbytes-leading-p"),
+        pytest.param(lambda pad: _pickle_binbytes(pad + b"P" + pad), id="binbytes-deep-p"),
+        pytest.param(lambda pad: _pickle_binunicode(pad + b"P" + pad) + b".", id="binunicode-deep-p"),
+        pytest.param(lambda pad: _pickle_binunicode8(pad + b"P" + pad) + b".", id="binunicode8-deep-p"),
+        pytest.param(lambda pad: _pickle_binbytes(b"(" + pad + b"ishutil\nrmtree\n" + pad), id="binbytes-inst"),
+    ],
+)
+def test_pytorch_zip_discovery_skips_markers_inside_literal_after_budget_gap(
+    tmp_path: Path, make_literal: Callable[[bytes], bytes]
 ) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_hidden_inst_budget_gap.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    malicious_suffix = b"(S'https://example.invalid/'\niwebbrowser\nopen\n."
-    storage_blob = prefix + decoys + inert_padding + malicious_suffix
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
+    literal = make_literal(b"!" * (9 * 1024))
+    _assert_storage_probe(tmp_path, _candidate_gap_prefix() + literal, incomplete=False)
 
 
-def test_pytorch_zip_discovery_fails_closed_for_proto0_inst_mark_before_budget_gap(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_preserved_mark_context.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    malicious_suffix = (
-        b"("
-        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
-        + b"S'"
-        + (b"a" * (9 * 1024))
-        + b"'\niwebbrowser\nopen\n."
-    )
-    storage_blob = prefix + malicious_suffix
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
+def test_pytorch_zip_discovery_skips_p_marker_beyond_literal_lookback(tmp_path: Path) -> None:
+    padding = b"!" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES * 4 + 32)
+    literal = _pickle_binbytes(padding + b"P" + b"!" * (9 * 1024))
+    _assert_storage_probe(tmp_path, _candidate_gap_prefix() + literal, incomplete=False)
 
 
-def test_pytorch_zip_discovery_skips_proto0_inst_mark_before_budget_gap_near_match(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_preserved_mark_near_match.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    payload_size = len(b"S'" + (b"a" * (9 * 1024)) + b"'\niwebbrowser\nopen\n.")
-    storage_blob = (
-        prefix
-        + b"("
-        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
-        + (b"!" * payload_size)
-    )
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
-
-
-def test_pytorch_zip_discovery_skips_proto0_inst_sized_candidate_budget_gap_near_match(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_inst_budget_gap_near_match.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    payload_size = len(b"(S'https://example.invalid/'\niwebbrowser\nopen\n.")
-    storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
-
-
-def test_pytorch_zip_discovery_fails_closed_for_proto0_inst_operand_crossing_candidate_cap(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_inst_operand_crosses_cap.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    malicious_suffix = b"(S'" + (b"a" * 8_180) + b"'\niwebbrowser\nopen\n."
-    storage_blob = prefix + decoys + inert_padding + malicious_suffix
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
-
-
-def test_pytorch_zip_discovery_fails_closed_for_late_headerless_binunicode_stack_global(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_late_binunicode_stack_global.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    malicious_suffix = (
-        _pickle_binunicode(b"posix") + _pickle_binunicode(b"system") + b"\x93" + _pickle_binunicode(b"true") + b"\x85R."
-    )
-    storage_blob = prefix + decoys + inert_padding + malicious_suffix
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
-
-
-def test_pytorch_zip_discovery_skips_late_headerless_binunicode_stack_global_near_match(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_late_binunicode_near_match.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    payload_size = len(
-        _pickle_binunicode(b"posix") + _pickle_binunicode(b"system") + b"\x93" + _pickle_binunicode(b"true") + b"\x85R."
-    )
-    storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
-
-
-def test_pytorch_zip_discovery_fails_closed_for_persid_after_candidate_budget_gap(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_late_persid.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    literal_payload = b"S" * (9 * 1024)
-    malicious_suffix = (
-        b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"0Pexternal-storage-key\n."
-    )
-    storage_blob = prefix + decoys + inert_padding + malicious_suffix
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
-
-
-def test_pytorch_zip_discovery_skips_persid_sized_budget_gap_near_match(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_late_persid_near_match.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    literal_payload = b"S" * (9 * 1024)
-    payload_size = len(
-        b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"0Pexternal-storage-key\n."
-    )
-    storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
-
-
-def test_pytorch_zip_discovery_fails_closed_for_long_persid_operand_after_budget_gap(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_long_persid.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    malicious_suffix = b"P" + (b"A" * (9 * 1024)) + b"\n."
-    storage_blob = prefix + decoys + inert_padding + malicious_suffix
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
-
-
-def test_pytorch_zip_discovery_skips_marker_rich_binbytes_persid_near_match(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_marker_rich_binbytes.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    literal_payload = b"Q!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    storage_blob = prefix + decoys + b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
-
-
-def test_pytorch_zip_discovery_skips_p_marker_inside_binbytes_literal(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_p_marker_binbytes.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    literal_payload = b"P" + (b"!" * (9 * 1024))
-    storage_blob = prefix + decoys + inert_padding
-    storage_blob += b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
-
-
-def test_pytorch_zip_discovery_skips_deep_p_marker_inside_binbytes_literal(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_deep_p_marker_binbytes.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    literal_payload = (b"!" * (9 * 1024)) + b"P" + (b"!" * (9 * 1024))
-    storage_blob = prefix + decoys + inert_padding
-    storage_blob += b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
-
-
-def test_pytorch_zip_discovery_skips_p_marker_beyond_literal_lookback(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_very_deep_p_marker_binbytes.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    literal_payload = b"!" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES * 4 + 32)
-    literal_payload += b"P" + (b"!" * (9 * 1024))
-    storage_blob = prefix + decoys + inert_padding
-    storage_blob += b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
-
-
-def test_pytorch_zip_discovery_skips_literal_p_marker_after_decoy_headers(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_prefix_literal_p_after_decoy_headers.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
+def test_pytorch_zip_discovery_skips_literal_p_marker_after_decoy_headers(tmp_path: Path) -> None:
     decoy_headers = b"B!!!!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    literal_payload = decoy_headers + b"P" + (b"!" * (9 * 1024))
-    storage_blob = prefix + decoys + inert_padding
-    storage_blob += b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
+    literal = _pickle_binbytes(decoy_headers + b"P" + b"!" * (9 * 1024))
+    _assert_storage_probe(tmp_path, _candidate_gap_prefix() + literal, incomplete=False)
 
 
-def test_pytorch_zip_discovery_skips_deep_p_marker_inside_binunicode_literal(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_deep_p_marker_binunicode.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    literal_payload = (b"!" * (9 * 1024)) + b"P" + (b"!" * (9 * 1024))
-    storage_blob = prefix + decoys + inert_padding
-    storage_blob += b"X" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
+def test_pytorch_zip_discovery_fails_closed_for_overlapping_persid_literal_decoy(tmp_path: Path) -> None:
+    _assert_storage_probe(tmp_path, _candidate_gap_prefix() + b"B\x06\x00\x00\x00!!!!Px\n.", incomplete=True)
 
 
-def test_pytorch_zip_discovery_skips_deep_p_marker_inside_binunicode8_literal(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_deep_p_marker_binunicode8.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    literal_payload = (b"!" * (9 * 1024)) + b"P" + (b"!" * (9 * 1024))
-    storage_blob = prefix + decoys + inert_padding
-    storage_blob += _pickle_binunicode8(literal_payload) + b"."
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
+def test_pytorch_zip_discovery_fails_closed_for_overlapping_persid_text_literal_decoy(tmp_path: Path) -> None:
+    padding = b"!" * (9 * 1024)
+    literal = _pickle_binunicode(padding + b"Pexternal-storage-key\n." + padding) + b"."
+    _assert_storage_probe(tmp_path, _candidate_gap_prefix() + literal, incomplete=True)
 
 
-def test_pytorch_zip_discovery_skips_inst_like_bytes_inside_binbytes_literal(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_inst_like_binbytes.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    literal_payload = b"(" + (b"!" * (9 * 1024)) + b"ishutil\nrmtree\n" + (b"!" * (9 * 1024))
-    storage_blob = prefix + decoys + inert_padding
-    storage_blob += b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
-
-
-def test_pytorch_zip_discovery_fails_closed_for_overlapping_persid_literal_decoy(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_overlapping_persid_decoy.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    storage_blob = prefix + decoys + inert_padding + b"B\x06\x00\x00\x00!!!!Px\n."
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
-
-
-def test_pytorch_zip_discovery_fails_closed_for_overlapping_persid_text_literal_decoy(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_overlapping_persid_text_decoy.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    literal_payload = (b"!" * (9 * 1024)) + b"Pexternal-storage-key\n." + (b"!" * (9 * 1024))
-    storage_blob = prefix + decoys + inert_padding + _pickle_binunicode(literal_payload) + b"."
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
-
-
-def test_pytorch_zip_discovery_fails_closed_for_overlapping_persid_after_many_literal_markers(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_prefix_many_literal_q_markers_then_persid.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    literal_payload = b"Q!" * pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
-    literal_payload += b"Pexternal-storage-key\n." + b"!"
-    storage_blob = prefix + decoys + inert_padding + _pickle_binunicode(literal_payload) + b"."
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
-
-
-def test_pytorch_zip_discovery_skips_many_literal_markers_without_overlapping_persid(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_prefix_many_literal_q_markers_near_match.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    literal_payload = b"Q!" * pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
-    literal_payload += b"Pexternal-storage-key!." + b"!"
-    storage_blob = prefix + decoys + inert_padding + _pickle_binunicode(literal_payload) + b"."
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
-
-
-def test_pytorch_zip_discovery_fails_closed_for_unicode_stack_global_after_budget_gap(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_late_unicode_stack_global.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    malicious_suffix = b"Vposix\nVsystem\n\x93(Vtrue\ntR."
-    storage_blob = prefix + decoys + inert_padding + malicious_suffix
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
-
-
-def test_pytorch_zip_discovery_skips_unicode_stack_global_after_budget_gap_near_match(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_late_unicode_near_match.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    payload_size = len(b"Vposix\nVsystem\n\x93(Vtrue\ntR.")
-    storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
-
-
-def test_pytorch_zip_discovery_fails_closed_for_long_proto0_inst_operand_after_budget_gap(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_hidden_long_inst.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    malicious_suffix = b"(S'" + (b"a" * (9 * 1024)) + b"'\niwebbrowser\nopen\n."
-    storage_blob = prefix + decoys + inert_padding + malicious_suffix
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
-
-
-def test_pytorch_zip_discovery_skips_long_proto0_inst_sized_budget_gap_near_match(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_long_inst_near_match.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    payload_size = len(b"(S'" + (b"a" * (9 * 1024)) + b"'\niwebbrowser\nopen\n.")
-    storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
-
-
-def test_pytorch_zip_discovery_fails_closed_for_cross_window_proto0_inst_operand_after_budget_gap(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_hidden_cross_window_inst.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    malicious_suffix = b"(S'" + (b"a" * (70 * 1024)) + b"'\niwebbrowser\nopen\n."
-    storage_blob = prefix + decoys + inert_padding + malicious_suffix
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
-
-
-def test_pytorch_zip_discovery_skips_cross_window_proto0_inst_sized_budget_gap_near_match(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_cross_window_inst_near_match.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    payload_size = len(b"(S'" + (b"a" * (70 * 1024)) + b"'\niwebbrowser\nopen\n.")
-    storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
-
-
-def test_pytorch_zip_discovery_fails_closed_for_truncated_inst_module_name_after_budget_gap(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_truncated_inst_module.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    malicious_suffix = b"(S'https://example.invalid/'\ni" + (b"a" * (64 * 1024)) + b"\nopen\n."
-    storage_blob = prefix + decoys + inert_padding + malicious_suffix
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_incomplete_storage_discovery(result)
-
-
-def test_pytorch_zip_discovery_skips_same_sized_truncated_inst_module_near_match(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_truncated_inst_module_near_match.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    payload_size = len(b"(S'https://example.invalid/'\ni" + (b"a" * (64 * 1024)) + b"\nopen\n.")
-    storage_blob = prefix + decoys + inert_padding + (b"!" * payload_size)
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
+@_signal_and_control
+def test_pytorch_zip_discovery_overlapping_persid_after_many_literal_markers(tmp_path: Path, has_signal: bool) -> None:
+    markers = b"Q!" * pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
+    terminator = b"\n" if has_signal else b"!"
+    literal = _pickle_binunicode(markers + b"Pexternal-storage-key" + terminator + b".!") + b"."
+    _assert_storage_probe(tmp_path, _candidate_gap_prefix() + literal, incomplete=has_signal)
 
 
 @pytest.mark.parametrize("marker_noise", [b"S!", b"S'!", b'S"!'])
 def test_pytorch_zip_discovery_skips_invalid_proto0_string_marker_budget_noise(
-    tmp_path: Path,
-    marker_noise: bytes,
+    tmp_path: Path, marker_noise: bytes
 ) -> None:
-    model_path = tmp_path / "referenced_storage_invalid_proto0_string_marker_budget_noise.pt"
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    storage_blob = prefix + decoys + inert_padding + (marker_noise * 128)
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b"!")
-
-    _assert_storage_probe_skipped_cleanly(result)
+    _assert_storage_probe(tmp_path, _candidate_gap_prefix() + marker_noise * 128, incomplete=False)
 
 
 def test_pytorch_zip_discovery_skips_referenced_float_storage_extension_like_bytes(tmp_path: Path) -> None:
@@ -3141,7 +2762,7 @@ def test_pytorch_zip_discovery_scans_binary_pickle_opcode_crossing_trusted_probe
     tmp_path: Path,
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_binary_opcode_boundary.pt"
-    storage_blob = b"N." + (b" " * 4093) + _malicious_eval_pickle_payload()
+    storage_blob = _storage_at_trusted_probe(_malicious_eval_pickle_payload(), 1)
     _assert_referenced_storage_critical(model_path, storage_blob)
 
 
@@ -3161,20 +2782,22 @@ def test_pytorch_zip_discovery_scans_binary_pickle_after_mixed_padding_trivial_p
     )
 
 
-def test_pytorch_zip_discovery_scans_short_binunicode_crossing_trusted_probe_boundary(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("opcode", "bytes_in_probe"),
+    [
+        pytest.param(_pickle_short_binunicode(b"abc"), 1, id="short-binunicode"),
+        pytest.param(b"J\x01\x00\x00\x00", 1, id="binint"),
+        pytest.param(b"I1\n.", 2, id="protocol0-int"),
+        pytest.param(_pickle_binunicode(b"abc"), 1, id="binunicode-length"),
+        pytest.param(_pickle_frame(b"\x85"), 10, id="frame-without-stop"),
+        pytest.param(b"#", 1, id="comment-marker"),
+    ],
+)
+def test_pytorch_zip_discovery_scans_after_opcode_at_trusted_probe_boundary(
+    tmp_path: Path, opcode: bytes, bytes_in_probe: int
 ) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_short_binunicode_boundary.pt"
-    storage_blob = b"N." + (b" " * 4093) + b"\x8c\x03abc" + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_binint_crossing_trusted_probe_boundary(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_binint_boundary.pt"
-    storage_blob = b"N." + (b" " * 4093) + b"J" + (1).to_bytes(4, "little") + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
+    storage = _storage_at_trusted_probe(opcode, bytes_in_probe) + _malicious_proto0_system_payload()
+    _assert_referenced_storage_critical(tmp_path / "storage.pt", storage)
 
 
 def test_pytorch_zip_discovery_scans_binbytes_literal_after_trivial_stream(
@@ -3192,18 +2815,6 @@ def test_pytorch_zip_discovery_scans_malformed_separator_run_in_expanded_probe(
     model_path = tmp_path / "referenced_malformed_separator_run_expanded.pt"
     encoded_payload = base64.b64encode(_malicious_proto0_system_payload())
     storage_blob = b"N." + (b"!" * 5000) + _proto0_string_literal(encoded_payload)
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_expands_frame_without_stop_at_trusted_probe_boundary(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_frame_without_stop_boundary.pt"
-    frame_payload = b"\x85"
-    padding = b" " * (
-        pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(_pickle_frame(frame_payload))
-    )
-    storage_blob = b"N." + padding + _pickle_frame(frame_payload) + _malicious_proto0_system_payload()
     _assert_referenced_storage_critical(model_path, storage_blob)
 
 
@@ -3226,19 +2837,11 @@ def test_pytorch_zip_literal_route_bounds_long_base64_without_size_only_signal(
     assert max(decode_lengths) <= pytorch_zip_scanner_module._MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES
 
 
-def test_pytorch_zip_discovery_scans_protocol0_int_crossing_trusted_probe_boundary(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_protocol0_int_boundary.pt"
-    storage_blob = b"N." + (b" " * 4092) + b"I1\n." + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
 def test_pytorch_zip_discovery_scans_extension_opcode_crossing_trusted_probe_boundary(
     tmp_path: Path,
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_ext_opcode_boundary.pt"
-    storage_blob = b"N." + (b" " * 4093) + b"\x82\x01."
+    storage_blob = _storage_at_trusted_probe(b"\x82\x01.", 1)
     result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b" ")
 
     assert "archive/data/0" in result.metadata["pickle_files"]
@@ -3344,12 +2947,12 @@ def test_pytorch_zip_preserves_later_payload_after_exhausted_extension_context(
     )
 
 
+@pytest.mark.parametrize("prefix", [b"N.N.", b"N.I1\n."], ids=["none-none", "none-int"])
 def test_pytorch_zip_discovery_scans_repeated_trivial_prefix_crossing_trusted_probe_boundary(
-    tmp_path: Path,
+    tmp_path: Path, prefix: bytes
 ) -> None:
-    model_path = tmp_path / "referenced_repeated_scalar_prefix_global_boundary.pt"
-    storage_blob = b"N.N." + (b" " * (4096 - 4 - 5)) + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
+    storage = _storage_at_trusted_probe(_malicious_proto0_system_payload(), 5, prefix=prefix)
+    _assert_referenced_storage_critical(tmp_path / "storage.pt", storage)
 
 
 def test_pytorch_zip_discovery_skips_padding_only_expanded_probe(
@@ -3913,16 +3516,6 @@ def test_pytorch_zip_discovery_scans_raw_nested_binary_prefix_at_padding_probe_b
     assert any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
 
 
-def test_pytorch_zip_discovery_scans_length_operand_crossing_trusted_probe_boundary(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_length_operand_boundary.pt"
-    storage_blob = (
-        b"N." + (b" " * 4093) + b"X" + (3).to_bytes(4, "little") + b"abc" + _malicious_proto0_system_payload()
-    )
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
 def test_pytorch_zip_discovery_marks_oversized_length_operand_incomplete(
     tmp_path: Path,
 ) -> None:
@@ -3938,45 +3531,27 @@ def test_pytorch_zip_discovery_marks_oversized_length_operand_incomplete(
     assert discovery_check.details["zip_entries"] == ["archive/data/0"]
 
 
-def test_pytorch_zip_discovery_scans_frame_header_crossing_trusted_probe_boundary(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("previous_frame", "header_bytes_in_probe"),
+    [
+        pytest.param(b"", 8, id="split-header"),
+        pytest.param(b"", 9, id="payload-outside-probe"),
+        pytest.param(_pickle_frame(b"]"), 1, id="split-second-header"),
+    ],
+)
+def test_pytorch_zip_discovery_scans_frame_crossing_trusted_probe_boundary(
+    tmp_path: Path, previous_frame: bytes, header_bytes_in_probe: int
 ) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_frame_header_boundary.pt"
-    frame_body = _malicious_proto0_system_payload()
-    frame = b"\x95" + len(frame_body).to_bytes(8, "little") + frame_body
-    storage_blob = b"N." + (b" " * 4086) + frame
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_frame_payload_crossing_trusted_probe_boundary(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_frame_payload_boundary.pt"
-    frame_body = _malicious_proto0_system_payload()
-    frame = b"\x95" + len(frame_body).to_bytes(8, "little") + frame_body
-    storage_blob = b"N." + (b" " * (4096 - 2 - 9)) + frame
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_second_frame_header_crossing_trusted_probe_boundary(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_second_frame_header_boundary.pt"
-    first_frame = _pickle_frame(b"]")
-    second_frame_body = _malicious_proto0_system_payload()
-    second_frame = _pickle_frame(second_frame_body)
-    padding = b" " * (4096 - len(b"N.") - len(first_frame) - 1)
-    storage_blob = b"N." + padding + first_frame + second_frame
-    _assert_referenced_storage_critical(model_path, storage_blob)
+    frames = previous_frame + _pickle_frame(_malicious_proto0_system_payload())
+    storage = _storage_at_trusted_probe(frames, len(previous_frame) + header_bytes_in_probe)
+    _assert_referenced_storage_critical(tmp_path / "storage.pt", storage)
 
 
 def test_pytorch_zip_discovery_scans_frame_first_trivial_pickle_before_large_padding(
     tmp_path: Path,
 ) -> None:
     model_path = tmp_path / "referenced_frame_first_trivial_before_large_padding.pt"
-    storage_blob = b"\x95" + (2).to_bytes(8, "little") + b"N."
-    storage_blob += b" " * 5000
-    storage_blob += _malicious_proto0_system_payload()
+    storage_blob = _pickle_frame(b"N.") + b" " * 5000 + _malicious_proto0_system_payload()
     _assert_referenced_storage_critical(model_path, storage_blob)
 
 
@@ -4000,15 +3575,7 @@ def test_pytorch_zip_discovery_scans_security_opcode_ending_at_trusted_probe_bou
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_global_opcode_boundary.pt"
     global_opcode = b"cbuiltins\neval\n"
-    storage_blob = b"N." + (b" " * (4096 - 2 - len(global_opcode))) + global_opcode + b"(S'echo hidden'\ntR."
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_after_second_trivial_stream_crossing_trusted_probe_boundary(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_second_trivial_global_boundary.pt"
-    storage_blob = b"N.I1\n." + (b" " * (4096 - len(b"N.I1\n.") - 5)) + _malicious_proto0_system_payload()
+    storage_blob = _storage_at_trusted_probe(global_opcode, len(global_opcode)) + b"(S'echo hidden'\ntR."
     _assert_referenced_storage_critical(model_path, storage_blob)
 
 
@@ -4028,36 +3595,21 @@ def test_pytorch_zip_discovery_scans_long_global_operand_crossing_trusted_probe_
     _assert_referenced_storage_critical(model_path, storage_blob)
 
 
-def test_pytorch_zip_discovery_scans_pickle_after_padding_at_trusted_probe_boundary(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_padding_boundary_pickle.pt"
-    storage_blob = b"N." + (b" " * 4094) + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_pickle_after_large_padding_past_trusted_probe_boundary(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_large_padding_pickle.pt"
-    storage_blob = b"N." + (b" " * 50000) + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_pickle_after_expanded_text_padding_prefix(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_expanded_text_padding_pickle.pt"
-    storage_blob = b"N." + (b" " * 65536) + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_pickle_after_expanded_nul_padding_prefix(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_expanded_nul_padding_pickle.pt"
-    storage_blob = b"N." + (b"\x00" * 65536) + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
+@pytest.mark.parametrize(
+    ("padding", "count"),
+    [
+        pytest.param(b" ", 4094, id="text-at-trusted-boundary"),
+        pytest.param(b" ", 50_000, id="text-past-trusted-boundary"),
+        pytest.param(b" ", 65_536, id="expanded-text"),
+        pytest.param(b"\0", 65_536, id="expanded-nul"),
+        pytest.param(b"\xff", 4094, id="malformed-separator-at-trusted-boundary"),
+        pytest.param(b"\xff", 65_536, id="expanded-malformed-separator"),
+        pytest.param(b"N", 4094, id="unfinished-trivial-opcodes"),
+    ],
+)
+def test_pytorch_zip_discovery_scans_pickle_after_padding(tmp_path: Path, padding: bytes, count: int) -> None:
+    storage = b"N." + padding * count + _malicious_proto0_system_payload()
+    _assert_referenced_storage_critical(tmp_path / "storage.pt", storage)
 
 
 def test_pytorch_zip_discovery_scans_pickle_after_nul_padding_with_bad_storage_crc(
@@ -4088,104 +3640,52 @@ def test_pytorch_zip_discovery_skips_complete_text_padding_prefix(tmp_path: Path
     _assert_storage_padding_clean(tmp_path, ("referenced_scalar_prefix_complete_text_padding.pt"), (b" "), (5002))
 
 
-def test_pytorch_zip_discovery_scans_pickle_after_unfinished_trivial_opcode_run(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "make_prefix",
+    [
+        pytest.param(lambda: b"N." * 600, id="many-none"),
+        pytest.param(lambda: b"N." * 2048, id="none-filling-trusted-probe"),
+        pytest.param(lambda: b"N." + b"I1\n." * 1200, id="many-int"),
+        pytest.param(lambda: b"N.#", id="comment-after-none"),
+        pytest.param(lambda: b"N.#" + b"N." * 1200, id="comment-before-many-none"),
+        pytest.param(lambda: b"N." + b"I1\n." * 1200 + b"#", id="comment-after-many-int"),
+    ],
+)
+def test_pytorch_zip_discovery_scans_pickle_after_trivial_streams(
+    tmp_path: Path, make_prefix: Callable[[], bytes]
 ) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_unfinished_trivial_run_pickle.pt"
-    storage_blob = b"N." + (b"N" * 4094) + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_pickle_after_repeated_trivial_streams(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_repeated_trivial_streams_pickle.pt"
-    storage_blob = (b"N." * 600) + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_pickle_after_repeated_trivial_streams_past_trusted_probe(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_long_repeated_trivial_streams_pickle.pt"
-    storage_blob = (b"N." * 2048) + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_pickle_after_many_trivial_int_streams(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_many_trivial_int_streams_pickle.pt"
-    storage_blob = b"N." + (b"I1\n." * 1200) + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_proto0_string_operand_split_at_trusted_probe_boundary(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_split_proto0_string_pickle.pt"
-    storage_prefix = (
-        b"N."
-        + (b" " * (pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(b"S")))
-        + b"S"
-    )
-    assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
-    storage_blob = storage_prefix + b"'tensor-name'\n." + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_skips_benign_proto0_string_operand_split_at_trusted_probe_boundary(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_split_proto0_string_benign.pt"
-    storage_prefix = (
-        b"N."
-        + (b" " * (pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(b"S")))
-        + b"S"
-    )
-    assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
-    storage_blob = storage_prefix + b"'tensor-name'\n."
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b" ")
-
-    _assert_clean_metadata_pickle_only(result)
-    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
-    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+    _assert_referenced_storage_critical(tmp_path / "storage.pt", make_prefix() + _malicious_proto0_system_payload())
 
 
 @pytest.mark.parametrize(
-    ("memo_prefix", "memo_suffix"),
+    ("opcode", "bytes_in_probe", "benign_tail"),
     [
-        (b"Nq", b"\x00"),
-        (b"Nr", b"\x00\x00\x00\x00"),
+        pytest.param(b"S'tensor-name'\n.", 1, b"", id="proto0-string"),
+        pytest.param(b"Nq\x00", 2, b".", id="memo-binput"),
+        pytest.param(b"Nr\x00\x00\x00\x00", 2, b".", id="memo-long-binput"),
     ],
 )
-def test_pytorch_zip_discovery_scans_truncated_memo_operand_after_trivial_stream_at_trusted_probe_boundary(
-    tmp_path: Path,
-    memo_prefix: bytes,
-    memo_suffix: bytes,
+@pytest.mark.parametrize("hidden_pickle", [True, False], ids=["hidden-pickle", "benign"])
+def test_pytorch_zip_discovery_operand_split_at_trusted_probe_boundary(
+    tmp_path: Path, opcode: bytes, bytes_in_probe: int, benign_tail: bytes, hidden_pickle: bool
 ) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_split_memo_operand_pickle.pt"
-    storage_prefix = (
-        b"N."
-        + (b" " * (pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(memo_prefix)))
-        + memo_prefix
-    )
-    assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
-    storage_blob = storage_prefix + memo_suffix + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
+    path = tmp_path / "storage.pt"
+    storage = _storage_at_trusted_probe(opcode, bytes_in_probe)
+    if hidden_pickle:
+        _assert_referenced_storage_critical(path, storage + _malicious_proto0_system_payload())
+        return
+
+    result = _scan_referenced_float_storage(path, storage + benign_tail, pad_with=b" ")
+    _assert_clean_metadata_pickle_only(result)
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
 
 
 def test_pytorch_zip_discovery_scans_truncated_inst_operand_after_trivial_stream_at_trusted_probe_boundary(
     tmp_path: Path,
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_split_inst_operand_pickle.pt"
-    storage_prefix = (
-        b"N."
-        + (b" " * (pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(b"i")))
-        + b"i"
-    )
-    assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
-    storage_blob = storage_prefix + b"posix\nsystem\n(S'echo hidden'\ntR."
+    storage_blob = _storage_at_trusted_probe(b"iposix\nsystem\n(S'echo hidden'\ntR.", 1)
     result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b" ")
 
     assert result.success is False
@@ -4230,42 +3730,9 @@ def test_pytorch_zip_discovery_routes_base64_extension_reduce_literal_storage(tm
     )
 
 
-@pytest.mark.parametrize(
-    ("memo_prefix", "memo_suffix"),
-    [
-        (b"Nq", b"\x00"),
-        (b"Nr", b"\x00\x00\x00\x00"),
-    ],
-)
-def test_pytorch_zip_discovery_skips_benign_truncated_memo_operand_at_trusted_probe_boundary(
-    tmp_path: Path,
-    memo_prefix: bytes,
-    memo_suffix: bytes,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_split_memo_operand_benign.pt"
-    storage_prefix = (
-        b"N."
-        + (b" " * (pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(memo_prefix)))
-        + memo_prefix
-    )
-    assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
-    storage_blob = storage_prefix + memo_suffix + b"."
-    result = _scan_referenced_float_storage(model_path, storage_blob, pad_with=b" ")
-
-    _assert_clean_metadata_pickle_only(result)
-    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
-    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
-
-
 def test_pytorch_zip_discovery_scans_malformed_separator_at_trusted_probe_boundary(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_split_malformed_separator_pickle.pt"
-    storage_prefix = (
-        b"N."
-        + (b" " * (pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(b"!")))
-        + b"!"
-    )
-    assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
-    storage_blob = storage_prefix + b"S'AAAAAAcos\\x0asystem\\x0a)R.BBBB'\n."
+    storage_blob = _storage_at_trusted_probe(b"!S'AAAAAAcos\\x0asystem\\x0a)R.BBBB'\n.", 1)
     _assert_referenced_storage_critical(model_path, storage_blob)
 
 
@@ -4714,23 +4181,25 @@ def test_pytorch_zip_discovery_tracks_memos_defined_after_candidate_exhaustion(
         assert result.metadata.get("pickle_verdict") == "clean"
 
 
+_SYSTEM_CALL_MEMOS = b"\x8c\x02osq\x00\x8c\x06systemq\x01\x8c\x04trueq\x02"
+_POPPED_SYSTEM_CALL_MEMOS = b"\x8c\x02osq\x000\x8c\x06systemq\x010\x8c\x04trueq\x020"
+
+
+def _scan_memo_literal_after_gap(
+    tmp_path: Path,
+    memo_prefix: bytes,
+    *,
+    padding_size: int = 9_000,
+    suffix: bytes = b"h\x00h\x01\x93h\x02\x85R.",
+) -> ScanResult:
+    literal = _candidate_gap_prefix(memo_prefix, padding_size=padding_size) + suffix
+    return _scan_referenced_float_storage_blob(tmp_path, "storage.pt", _proto0_string_literal(literal))
+
+
 def test_pytorch_zip_discovery_fails_closed_for_post_budget_stack_global_with_prior_memo_context(
     tmp_path: Path,
 ) -> None:
-    memo_prefix = b"\x8c\x02osq\x00\x8c\x06systemq\x01\x8c\x04trueq\x02"
-    literal = (
-        memo_prefix
-        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
-        + (b"!" * 9_000)
-        + b"h\x00h\x01\x93h\x02\x85R."
-    )
-    storage_blob = _proto0_string_literal(literal)
-
-    result = _scan_referenced_float_storage_blob(
-        tmp_path,
-        "referenced_prior_memo_stack_global_after_raw_candidate_budget_gap.pt",
-        storage_blob,
-    )
+    result = _scan_memo_literal_after_gap(tmp_path, _SYSTEM_CALL_MEMOS)
 
     assert result.success is False
     assert "archive/data/0" in result.metadata["pickle_files"]
@@ -4743,20 +4212,7 @@ def test_pytorch_zip_discovery_fails_closed_for_post_budget_stack_global_with_pr
 def test_pytorch_zip_discovery_fails_closed_for_later_window_stack_global_with_prior_memo_context(
     tmp_path: Path,
 ) -> None:
-    memo_prefix = b"\x8c\x02osq\x000\x8c\x06systemq\x010\x8c\x04trueq\x020"
-    literal = (
-        memo_prefix
-        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
-        + (b"!" * (118 * 1024))
-        + b"h\x00h\x01\x93h\x02\x85R."
-    )
-    storage_blob = _proto0_string_literal(literal)
-
-    result = _scan_referenced_float_storage_blob(
-        tmp_path,
-        "referenced_later_window_prior_memo_stack_global.pt",
-        storage_blob,
-    )
+    result = _scan_memo_literal_after_gap(tmp_path, _POPPED_SYSTEM_CALL_MEMOS, padding_size=118 * 1024)
 
     _assert_incomplete_storage_discovery(result)
 
@@ -4764,27 +4220,9 @@ def test_pytorch_zip_discovery_fails_closed_for_later_window_stack_global_with_p
 def test_pytorch_zip_discovery_fails_closed_for_prior_memo_execution_spanning_candidate_cap(
     tmp_path: Path,
 ) -> None:
-    memo_prefix = b"\x8c\x02osq\x00\x8c\x06systemq\x01\x8c\x04trueq\x02"
     neutral_padding = b"(1" * 5000
-    literal = (
-        memo_prefix
-        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
-        + (b"!" * 9_000)
-        + b"h\x00"
-        + neutral_padding
-        + b"h\x01"
-        + neutral_padding
-        + b"\x93h\x02"
-        + neutral_padding
-        + b"\x85R."
-    )
-    storage_blob = _proto0_string_literal(literal)
-
-    result = _scan_referenced_float_storage_blob(
-        tmp_path,
-        "referenced_prior_memo_stack_global_spans_candidate_cap.pt",
-        storage_blob,
-    )
+    suffix = neutral_padding.join((b"h\x00", b"h\x01", b"\x93h\x02", b"\x85R."))
+    result = _scan_memo_literal_after_gap(tmp_path, _SYSTEM_CALL_MEMOS, suffix=suffix)
 
     assert result.success is False
     assert any(
@@ -4796,27 +4234,9 @@ def test_pytorch_zip_discovery_fails_closed_for_prior_memo_execution_spanning_ca
 def test_pytorch_zip_discovery_skips_prior_memo_span_without_stack_dependent_opcode(
     tmp_path: Path,
 ) -> None:
-    memo_prefix = b"\x8c\x02osq\x00\x8c\x06systemq\x01\x8c\x04trueq\x02"
     neutral_padding = b"(1" * 5000
-    literal = (
-        memo_prefix
-        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
-        + (b"!" * 9_000)
-        + b"h\x00"
-        + neutral_padding
-        + b"h\x01"
-        + neutral_padding
-        + b"h\x02"
-        + neutral_padding
-        + b"."
-    )
-    storage_blob = _proto0_string_literal(literal)
-
-    result = _scan_referenced_float_storage_blob(
-        tmp_path,
-        "referenced_prior_memo_long_span_near_match.pt",
-        storage_blob,
-    )
+    suffix = neutral_padding.join((b"h\x00", b"h\x01", b"h\x02", b"."))
+    result = _scan_memo_literal_after_gap(tmp_path, _SYSTEM_CALL_MEMOS, suffix=suffix)
 
     assert result.success is True
     assert result.metadata.get("pickle_verdict") == "clean"
@@ -4830,21 +4250,8 @@ def test_pytorch_zip_discovery_skips_prior_memo_span_without_stack_dependent_opc
 def test_pytorch_zip_discovery_fails_closed_for_prior_memo_beyond_later_window_lookback(
     tmp_path: Path,
 ) -> None:
-    memo_prefix = b"\x8c\x02osq\x00\x8c\x06systemq\x01\x8c\x04trueq\x02"
-    literal = (
-        memo_prefix
-        + (b"!" * (70 * 1024))
-        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
-        + (b"!" * (70 * 1024))
-        + b"h\x00h\x01\x93h\x02\x85R."
-    )
-    storage_blob = _proto0_string_literal(literal)
-
-    result = _scan_referenced_float_storage_blob(
-        tmp_path,
-        "referenced_far_prior_memo_stack_global.pt",
-        storage_blob,
-    )
+    prefix = _SYSTEM_CALL_MEMOS + b"!" * (70 * 1024)
+    result = _scan_memo_literal_after_gap(tmp_path, prefix, padding_size=70 * 1024)
 
     _assert_incomplete_storage_discovery(result)
 
@@ -4854,22 +4261,9 @@ def test_pytorch_zip_discovery_tracks_memoize_keys_after_explicit_memos(
 ) -> None:
     explicit_memos = b"".join(b"\x8c\x01xq" + bytes([index]) for index in range(10))
     memoized_callable = b"\x8c\x02os\x94\x8c\x06system\x94\x8c\x04true\x94"
-    storage_blob = (
-        b"X"
-        + (3_191_733_531).to_bytes(4, "little")
-        + explicit_memos
-        + memoized_callable
-        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
-        + (b"!" * 9_000)
-        + b"h\x0ah\x0b\x93h\x0c\x85R."
-    )
-    storage_blob += b"!" * (-len(storage_blob) % 4)
-
-    result = _scan_referenced_float_storage_blob(
-        tmp_path,
-        "referenced_memoize_after_explicit_memos_stack_global.pt",
-        storage_blob,
-    )
+    prefix = _IMPOSSIBLE_BINUNICODE_PREFIX + explicit_memos + memoized_callable
+    storage = _candidate_gap_prefix(prefix, padding_size=9_000) + b"h\x0ah\x0b\x93h\x0c\x85R."
+    result = _scan_referenced_float_storage(tmp_path / "storage.pt", storage, pad_with=b"!")
 
     _assert_incomplete_storage_discovery(result)
 
@@ -4877,22 +4271,9 @@ def test_pytorch_zip_discovery_tracks_memoize_keys_after_explicit_memos(
 def test_pytorch_zip_discovery_fails_closed_for_impossible_prefix_prior_memo_with_zero_padded_get(
     tmp_path: Path,
 ) -> None:
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    memo_prefix = b"\x8c\x02osq\x000\x8c\x06systemq\x010\x8c\x04trueq\x020"
-    storage_blob = (
-        prefix
-        + b"!"
-        + memo_prefix
-        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
-        + (b"!" * (70 * 1024))
-        + b"g00\ng01\n\x93g02\n\x85R."
-    )
-
-    result = _scan_referenced_float_storage_blob(
-        tmp_path,
-        "referenced_impossible_prefix_zero_padded_get_prior_memo.pt",
-        storage_blob,
-    )
+    prefix = _IMPOSSIBLE_BINUNICODE_PREFIX + b"!" + _POPPED_SYSTEM_CALL_MEMOS
+    storage = _candidate_gap_prefix(prefix) + b"g00\ng01\n\x93g02\n\x85R."
+    result = _scan_referenced_float_storage_blob(tmp_path, "storage.pt", storage)
 
     _assert_incomplete_storage_discovery(result)
 
@@ -4900,104 +4281,18 @@ def test_pytorch_zip_discovery_fails_closed_for_impossible_prefix_prior_memo_wit
 def test_pytorch_zip_discovery_skips_post_budget_stack_global_without_prior_memo_context(
     tmp_path: Path,
 ) -> None:
-    literal = (
-        b"!" * 24
-        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
-        + (b"!" * 9_000)
-        + b"h\x00h\x01\x93h\x02\x85R."
-    )
-    storage_blob = _proto0_string_literal(literal)
-
-    result = _scan_referenced_float_storage_blob(
-        tmp_path,
-        "referenced_no_memo_stack_global_after_raw_candidate_budget_gap.pt",
-        storage_blob,
-    )
+    result = _scan_memo_literal_after_gap(tmp_path, b"!" * len(_SYSTEM_CALL_MEMOS))
 
     _assert_clean_metadata_pickle_only(result)
     assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
 
 
-def test_pytorch_zip_discovery_skips_raw_memo_byte_without_coherent_prior_memo(
-    tmp_path: Path,
-) -> None:
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    storage_blob = (
-        prefix
-        + b"!q"
-        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
-        + (b"!" * 9_000)
-        + b"h\x00R."
-    )
-    storage_blob += b"!" * (-len(storage_blob) % 4)
-
-    result = _scan_referenced_float_storage_blob(
-        tmp_path,
-        "referenced_raw_memo_byte_without_prior_memo.pt",
-        storage_blob,
-    )
-
+@pytest.mark.parametrize("marker", [b"!q", b"!!"], ids=["raw-memo", "same-size-control"])
+def test_pytorch_zip_discovery_skips_raw_memo_byte_without_coherent_prior_memo(tmp_path: Path, marker: bytes) -> None:
+    storage = _candidate_gap_prefix(_IMPOSSIBLE_BINUNICODE_PREFIX + marker, padding_size=9_000) + b"h\x00R."
+    result = _scan_referenced_float_storage(tmp_path / "storage.pt", storage, pad_with=b"!")
     _assert_clean_metadata_pickle_only(result)
     assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
-
-
-def test_pytorch_zip_discovery_skips_same_sized_raw_memo_byte_near_match(
-    tmp_path: Path,
-) -> None:
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    storage_blob = (
-        prefix
-        + b"!!"
-        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
-        + (b"!" * 9_000)
-        + b"h\x00R."
-    )
-    storage_blob += b"!" * (-len(storage_blob) % 4)
-
-    result = _scan_referenced_float_storage_blob(
-        tmp_path,
-        "referenced_raw_memo_byte_without_prior_memo_near_match.pt",
-        storage_blob,
-    )
-
-    _assert_clean_metadata_pickle_only(result)
-    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
-
-
-def test_pytorch_zip_discovery_fails_closed_for_post_budget_long_unicode_stack_global(
-    tmp_path: Path,
-) -> None:
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    malicious_suffix = b"Vposix\nVsystem\n\x93(V" + (b"a" * 9216) + b"\ntR."
-    storage_blob = prefix + b"!" + decoys + inert_padding + malicious_suffix
-
-    result = _scan_referenced_float_storage_blob(
-        tmp_path,
-        "referenced_long_unicode_stack_global_after_raw_candidate_budget_gap.pt",
-        storage_blob,
-    )
-
-    _assert_incomplete_storage_discovery(result)
-
-
-def test_pytorch_zip_discovery_skips_same_sized_long_unicode_stack_global_near_match(
-    tmp_path: Path,
-) -> None:
-    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
-    inert_padding = b"!" * (70 * 1024)
-    malicious_suffix = b"Vposix\nVsystem\n\x93(V" + (b"a" * 9216) + b"\ntR."
-    storage_blob = prefix + b"!" + decoys + inert_padding + (b"!" * len(malicious_suffix))
-
-    result = _scan_referenced_float_storage_blob(
-        tmp_path,
-        "referenced_long_unicode_stack_global_after_raw_candidate_budget_gap_near_match.pt",
-        storage_blob,
-    )
-
-    _assert_storage_probe_skipped_cleanly(result)
 
 
 def test_pytorch_zip_discovery_routes_global_after_malformed_global_candidate(tmp_path: Path) -> None:
@@ -5268,20 +4563,6 @@ def test_pytorch_zip_discovery_scans_malformed_separator_after_benign_binary_can
 ) -> None:
     model_path = tmp_path / "referenced_malformed_separator_after_benign_binary_candidates.pt"
     storage_blob = b"N." + tail
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_after_long_malformed_separator_trusted_probe_prefix(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_long_malformed_separator_prefix_pickle.pt"
-    storage_blob = b"N." + (b"\xff" * 4094) + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_after_expanded_malformed_separator_prefix(tmp_path: Path) -> None:
-    model_path = tmp_path / "referenced_expanded_malformed_separator_prefix_pickle.pt"
-    storage_blob = b"N." + (b"\xff" * 65_536) + _malicious_proto0_system_payload()
     _assert_referenced_storage_critical(model_path, storage_blob)
 
 
@@ -7741,20 +7022,6 @@ def test_pytorch_zip_discovery_scans_malformed_separator_unicode_literal_nested_
     )
 
 
-def test_pytorch_zip_discovery_scans_comment_marker_split_at_trusted_probe_boundary(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_split_comment_marker_pickle.pt"
-    storage_prefix = (
-        b"N."
-        + (b" " * (pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(b"#")))
-        + b"#"
-    )
-    assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
-    storage_blob = storage_prefix + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
 def test_pytorch_zip_discovery_marks_repeated_trivial_streams_filling_expanded_probe_incomplete(
     tmp_path: Path,
 ) -> None:
@@ -7796,30 +7063,6 @@ def test_pytorch_zip_trailing_candidate_consumes_repeated_trivial_streams_before
 
     assert PyTorchZipScanner._trailing_pickle_candidate_needs_more_bytes(b"N." * 32768) is False
     assert counted_trivial_prefix_trailing.call_count == 0
-
-
-def test_pytorch_zip_discovery_scans_comment_prefixed_pickle_after_trivial_scalar_prefix(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_comment_prefixed_pickle.pt"
-    storage_blob = b"N.#" + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_comment_prefixed_pickle_after_many_trivial_streams(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_comment_many_trivial_streams_pickle.pt"
-    storage_blob = b"N.#" + (b"N." * 1200) + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
-
-
-def test_pytorch_zip_discovery_scans_comment_prefixed_pickle_after_many_proto0_int_streams(
-    tmp_path: Path,
-) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_comment_many_int_streams_pickle.pt"
-    storage_blob = b"N." + (b"I1\n." * 1200) + b"#" + _malicious_proto0_system_payload()
-    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_persid_after_trivial_prefix_crossing_probe_boundary(
