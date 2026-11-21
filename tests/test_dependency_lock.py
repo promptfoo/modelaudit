@@ -280,6 +280,11 @@ def test_renovate_python_updates_follow_runtime_support() -> None:
     versions = [*supported_versions, next_minor]
     runtime_support = SpecifierSet(project["requires-python"])
     rules = json.loads(RENOVATE_CONFIG.read_text(encoding="utf-8"))["packageRules"]
+    # Filelock's exact pin must remain installable on the oldest supported interpreter.
+    (pin_rule,) = [rule for rule in rules if rule.get("matchPackageNames") == ["filelock"] and "constraints" in rule]
+    assert pin_rule["constraints"]["python"] == str(supported_versions[0])
+    assert pin_rule["constraintsFiltering"] == "strict"
+
     python_rules = [(index, rule) for index, rule in enumerate(rules) if rule.get("matchPackageNames") == ["python"]]
     global_rules = [(index, rule) for index, rule in python_rules if "matchFileNames" not in rule]
     assert len(global_rules) == 1
