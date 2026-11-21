@@ -10,6 +10,7 @@ import threading
 import time
 import zipfile
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from importlib.abc import MetaPathFinder
@@ -1368,49 +1369,37 @@ def test_clear_cache_waits_for_active_identity_capture(
 ) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache = ScanResultsCache(str(tmp_path / "cache"))
-    capture_hash_entered = threading.Event()
-    allow_capture_hash = threading.Event()
-    capture_completed = threading.Event()
-    clear_started = threading.Event()
-    clear_completed = threading.Event()
+    scope_cache_ancestor_identity_to_tree(cache, tmp_path, monkeypatch)
+    waiting = threading.Event()
+    original_wait = cache._change_clock_probe_condition.wait
     original_hash = cache.hasher.hash_file_with_stat
+    clear: Future[None] | None = None
 
-    def block_identity_hash(path: str, file_stat: os.stat_result) -> str:
-        capture_hash_entered.set()
-        if not allow_capture_hash.wait(timeout=10):
-            raise TimeoutError("identity capture was not released")
-        return original_hash(path, file_stat)
+    def observe_clear_wait() -> bool:
+        assert cache._active_identity_captures == 1
+        waiting.set()
+        if not original_wait(timeout=30):
+            raise TimeoutError("identity capture did not wake cache clearing")
+        return True
 
-    def capture_identity() -> None:
+    with ThreadPoolExecutor(max_workers=1) as worker:
+
+        def hash_during_clear(path: str, file_stat: os.stat_result) -> str:
+            nonlocal clear
+            if clear is None:
+                # Start the clear only once the platform's file identity barrier has settled.
+                clear = worker.submit(cache.clear_cache)
+                assert waiting.wait(timeout=10), "clear_cache did not wait for the active capture"
+            assert not clear.done()
+            return original_hash(path, file_stat)
+
+        monkeypatch.setattr(cache._change_clock_probe_condition, "wait", observe_clear_wait)
+        monkeypatch.setattr(cache.hasher, "hash_file_with_stat", hash_during_clear)
         identity = cache.capture_file_identity(str(file_path))
         cache.release_ancestor_identity(identity[-1])
-        capture_completed.set()
+        assert clear is not None
+        clear.result(timeout=30)
 
-    def clear_identity_cache() -> None:
-        clear_started.set()
-        cache.clear_cache()
-        clear_completed.set()
-
-    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", block_identity_hash)
-    capture_thread = threading.Thread(target=capture_identity, daemon=True)
-    clear_thread = threading.Thread(target=clear_identity_cache, daemon=True)
-    capture_thread.start()
-
-    try:
-        assert capture_hash_entered.wait(timeout=10)
-        clear_thread.start()
-        assert clear_started.wait(timeout=10)
-        assert clear_completed.wait(timeout=0.05) is False
-    finally:
-        allow_capture_hash.set()
-        capture_thread.join(timeout=10)
-        if clear_thread.is_alive():
-            clear_thread.join(timeout=10)
-
-    assert not capture_thread.is_alive()
-    assert not clear_thread.is_alive()
-    assert capture_completed.is_set()
-    assert clear_completed.is_set()
     assert cache._active_identity_captures == 0
     assert cache.metadata_file.exists()
 
