@@ -544,22 +544,13 @@ class TestFalsePositiveFixes:
         completed = subprocess.run(
             [
                 sys.executable,
-                "-c",
-                "\n".join(
-                    [
-                        "import runpy",
-                        "import sys",
-                        "if sys.platform == 'darwin':",
-                        "    import modelaudit.cli as cli",
-                        "    cli._darwin_fd_has_extended_acl = lambda _fd: False",
-                        "sys.argv = [",
-                        "    'modelaudit', 'scan', sys.argv[1],",
-                        "    '--format', 'json', '--output', sys.argv[2],",
-                        "]",
-                        "runpy.run_module('modelaudit', run_name='__main__')",
-                    ]
-                ),
+                "-m",
+                "modelaudit",
+                "scan",
                 str(model_dir),
+                "--format",
+                "json",
+                "--output",
                 str(output_file),
             ],
             check=False,
@@ -655,25 +646,7 @@ class TestFalsePositiveFixes:
 
         try:
             completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    "\n".join(
-                        [
-                            "import sys",
-                            "import modelaudit.cli as cli",
-                            "if sys.platform == 'darwin':",
-                            "    cli._darwin_fd_has_extended_acl = lambda _fd: False",
-                            "sys.argv = [",
-                            "    'modelaudit', 'scan', sys.argv[1],",
-                            "    '--format', 'json', '--output', sys.argv[2],",
-                            "]",
-                            "cli.main()",
-                        ]
-                    ),
-                    path,
-                    output_file,
-                ],
+                [sys.executable, "-m", "modelaudit", "scan", path, "--format", "json", "--output", output_file],
                 check=False,
                 capture_output=True,
                 encoding="utf-8",

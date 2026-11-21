@@ -872,7 +872,7 @@ def test_copy_local_mlflow_artifact_rejects_symlink_swap(
     original_open = os.open
     swapped = False
 
-    def swapping_open(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+    def swapping_open(path: Any, flags: int, mode: int = 0o600, *, dir_fd: int | None = None) -> int:
         nonlocal swapped
         if path == "nested" and dir_fd is not None and not swapped:
             preserved = source_root / "preserved"
@@ -907,7 +907,7 @@ def test_copy_local_mlflow_artifact_rejects_symlink_swap_without_secure_walk(
     original_open = os.open
     swapped = False
 
-    def swapping_open(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+    def swapping_open(path: Any, flags: int, mode: int = 0o600, *, dir_fd: int | None = None) -> int:
         nonlocal swapped
         if Path(path) == source_root / "nested" / "model.bin" and not swapped:
             nested.rename(source_root / "preserved")

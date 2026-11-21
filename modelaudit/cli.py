@@ -526,14 +526,34 @@ def _darwin_fd_has_extended_acl(fd: int) -> bool:
     import ctypes
 
     libc = ctypes.CDLL(None, use_errno=True)
-    acl_extended_fd = libc.acl_extended_fd_np
-    acl_extended_fd.argtypes = (ctypes.c_int,)
-    acl_extended_fd.restype = ctypes.c_int
-    result = acl_extended_fd(fd)
-    if result < 0:
-        error = ctypes.get_errno()
+    try:
+        libc.acl_get_fd.argtypes = (ctypes.c_int,)
+        libc.acl_get_fd.restype = ctypes.c_void_p
+        libc.acl_get_entry.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))
+        libc.acl_valid.argtypes = (ctypes.c_void_p,)
+        libc.acl_free.argtypes = (ctypes.c_void_p,)
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "macOS ACL inspection is unavailable") from exc
+
+    ctypes.set_errno(0)
+    acl = libc.acl_get_fd(fd)
+    if acl is None:
+        error = ctypes.get_errno() or errno.EIO
+        if error == errno.ENOENT:  # No FILESEC_ACL on the pinned descriptor.
+            return False
         raise OSError(error, os.strerror(error))
-    return bool(result)
+    try:
+        entry = ctypes.c_void_p()
+        ctypes.set_errno(0)
+        if libc.acl_get_entry(acl, 0, ctypes.byref(entry)) == 0:  # ACL_FIRST_ENTRY
+            return True
+        error = ctypes.get_errno() or errno.EIO
+        # Darwin reports EINVAL for both an empty ACL and an invalid ACL.
+        if error == errno.EINVAL and libc.acl_valid(acl) == 0:
+            return False
+        raise OSError(error, os.strerror(error))
+    finally:
+        libc.acl_free(acl)
 
 
 def _directory_can_replace_entries(path: Path) -> bool:
@@ -1151,29 +1171,14 @@ def _validate_existing_output_path(
     return path_stat
 
 
-def _validate_fallback_temporary_file(
-    output_path: str,
-    absolute_path: Path,
-    temp_path: Path,
-    temp_fd: int,
-) -> None:
-    """Ensure fallback path resolution did not redirect temporary-file creation."""
+def _validate_windows_temporary_file(output_path: str, absolute_path: Path, temp_fd: int) -> None:
+    """Recheck the output path and the exclusively held Windows temporary file."""
     output_display = _display_path(output_path)
     if _validated_absolute_output_path(output_path) != absolute_path:
         raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
 
     opened_stat = os.fstat(temp_fd)
     if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
-        raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
-    if os.name == "nt":
-        return
-
-    try:
-        path_stat = temp_path.lstat()
-    except OSError as exc:
-        raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}") from exc
-
-    if not os.path.samestat(opened_stat, path_stat):
         raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
 
 
@@ -1185,17 +1190,11 @@ def _open_existing_output_file(
     parent_fd: int | None,
 ) -> int:
     """Open an existing validated output without truncating or following a replacement link."""
-    if os.name == "nt":
+    if parent_fd is None:
         output_fd = _open_windows_existing_output_file(output_path, absolute_path)
     else:
-        flags = os.O_WRONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        if nofollow:
-            flags |= nofollow
-        if parent_fd is None:
-            output_fd = os.open(absolute_path, flags)
-        else:
-            output_fd = os.open(absolute_path.name, flags, dir_fd=parent_fd)
+        flags = os.O_WRONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        output_fd = os.open(absolute_path.name, flags, dir_fd=parent_fd)
 
     try:
         opened_stat = os.fstat(output_fd)
@@ -1230,6 +1229,8 @@ def _open_posix_output_staging_directory(output_path: str, parent_fd: int, stagi
             raise _OutputWriteError(
                 f"Refusing to write output because its staging path changed: {_display_path(output_path)}"
             )
+        if _darwin_fd_has_extended_acl(staging_fd):
+            raise _OutputWriteError(f"Unable to ensure owner-only staging permissions for {_display_path(output_path)}")
         return staging_fd
     except Exception:
         if staging_fd is not None:
@@ -1244,8 +1245,15 @@ def _copy_posix_output_metadata(output_path: str, source_fd: int, target_fd: int
     source_stat = os.fstat(source_fd)
     target_stat = os.fstat(target_fd)
     try:
-        if _posix_fd_has_extended_acl(output_path, source_fd):
+        if _posix_fd_has_extended_acl(output_path, source_fd) or _posix_fd_has_extended_acl(output_path, target_fd):
             raise _OutputWriteError(f"Unable to preserve extended output ACL for {_display_path(output_path)}")
+        if sys.platform == "linux":
+            # Restoring group bits with fchmod could unmask inherited grants absent from the source.
+            try:
+                os.removexattr(target_fd, "system.posix_acl_access")
+            except OSError as exc:
+                if exc.errno not in {errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                    raise
         if (source_stat.st_uid, source_stat.st_gid) != (target_stat.st_uid, target_stat.st_gid):
             os.fchown(target_fd, source_stat.st_uid, source_stat.st_gid)
         os.fchmod(target_fd, stat.S_IMODE(source_stat.st_mode))
@@ -1331,113 +1339,21 @@ def _fsync_posix_output_parent(output_path: str, parent_sync_fd: int) -> None:
 
 def _preflight_output_text_file(output_path: str) -> None:
     """Reject unsupported output destinations before a model scan begins."""
-    absolute_path: Path | None = None
-    parent_fd: int | None = None
-    parent_guard: int | None = None
-    parent_lock: int | None = None
-    existing_fd: int | None = None
-    parent_sync_fd: int | None = None
-    staging_fd: int | None = None
-    staging_name = ""
-    temp_fd: int | None = None
-    temp_path: Path | None = None
-    temp_name = ""
-    try:
-        absolute_path, parent_fd, parent_guard = _open_output_parent_directory(output_path)
-        if os.name == "nt":
-            assert parent_guard is not None
-            parent_lock = _open_windows_output_parent_lock(output_path, absolute_path, parent_guard)
-        initial_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
-        if initial_stat is not None:
-            if os.name == "posix" and parent_fd is not None:
-                _validate_posix_output_replacement_permission(output_path, parent_fd, initial_stat)
-            existing_fd = _open_existing_output_file(
-                output_path,
-                absolute_path,
-                initial_stat,
-                parent_fd=parent_fd,
-            )
-            if os.name == "nt":
-                _reject_windows_encrypted_output(output_path, existing_fd)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        if nofollow:
-            flags |= nofollow
-
-        if os.name == "nt":
-            temp_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
-            temp_fd, temp_path = _open_windows_output_temp_file(
-                output_path,
-                absolute_path,
-                temp_name,
-                preserve_security=initial_stat is not None,
-            )
-            _validate_fallback_temporary_file(output_path, absolute_path, temp_path, temp_fd)
-        elif parent_fd is not None:
-            parent_sync_fd = _open_posix_output_parent_sync_fd(output_path, parent_fd)
-            staging_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
-            staging_fd = _open_posix_output_staging_directory(output_path, parent_fd, staging_name)
-            temp_name = "output.tmp"
-            temp_fd = os.open(temp_name, flags, 0o666, dir_fd=staging_fd)
-            if initial_stat is None:
-                _probe_posix_hard_link_support(output_path, staging_fd, parent_fd, temp_name)
-        else:
-            return
-
-        if initial_stat is not None:
-            assert existing_fd is not None
-            assert temp_fd is not None
-            if os.name == "nt":
-                _copy_windows_output_security(output_path, existing_fd, temp_fd)
-                if hasattr(os, "fchmod"):
-                    os.fchmod(temp_fd, stat.S_IMODE(initial_stat.st_mode))
-            else:
-                _copy_posix_output_metadata(output_path, existing_fd, temp_fd)
-    except _OutputWriteError:
-        raise
-    except OSError as exc:
-        raise _OutputWriteError(
-            f"Unable to prepare output {_display_path(output_path)}: {exc.strerror or exc}"
-        ) from exc
-    finally:
-        if temp_fd is not None:
-            os.close(temp_fd)
-        if staging_fd is not None:
-            if temp_name:
-                with contextlib.suppress(OSError):
-                    os.unlink(temp_name, dir_fd=staging_fd)
-            staging_stat: os.stat_result | None = None
-            with contextlib.suppress(OSError):
-                staging_stat = os.fstat(staging_fd)
-            os.close(staging_fd)
-            if parent_fd is not None and staging_name and staging_stat is not None:
-                with contextlib.suppress(OSError):
-                    named_stat = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
-                    if os.path.samestat(staging_stat, named_stat):
-                        os.rmdir(staging_name, dir_fd=parent_fd)
-        if parent_sync_fd is not None:
-            os.close(parent_sync_fd)
-        if existing_fd is not None:
-            os.close(existing_fd)
-        if parent_fd is not None:
-            os.close(parent_fd)
-        elif temp_path is not None:
-            with contextlib.suppress(OSError):
-                temp_path.unlink()
-        if parent_lock is not None:
-            _close_windows_handle(parent_lock)
-        if parent_guard is not None:
-            _close_windows_handle(parent_guard)
+    _stage_output_file(output_path, None)
 
 
 def _write_output_text_file(output_path: str, output_text: str, *, trailing_newline: bool = False) -> None:
     """Write CLI output without following attacker-controlled path entries."""
-    output_display = _display_path(output_path)
     try:
         output_bytes = output_text.encode("utf-8") + (b"\n" if trailing_newline else b"")
     except UnicodeError as exc:
-        raise _OutputWriteError(f"Unable to encode output {output_display}: {exc}") from exc
-    absolute_path: Path | None = None
+        raise _OutputWriteError(f"Unable to encode output {_display_path(output_path)}: {exc}") from exc
+    _stage_output_file(output_path, output_bytes)
+
+
+def _stage_output_file(output_path: str, output_bytes: bytes | None) -> None:
+    """Stage and publish a report, or probe the destination without publishing if given None."""
+    output_display = _display_path(output_path)
     parent_fd: int | None = None
     parent_guard: int | None = None
     parent_lock: int | None = None
@@ -1450,37 +1366,26 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
     temp_name = ""
     try:
         absolute_path, parent_fd, parent_guard = _open_output_parent_directory(output_path)
-        if os.name == "nt":
+        if parent_fd is None:
             assert parent_guard is not None
             parent_lock = _open_windows_output_parent_lock(output_path, absolute_path, parent_guard)
-        if parent_fd is None and _validated_absolute_output_path(output_path) != absolute_path:
-            raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+            if output_bytes is not None and _validated_absolute_output_path(output_path) != absolute_path:
+                raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
         initial_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
-
         if initial_stat is not None:
-            if os.name == "posix" and parent_fd is not None:
+            if parent_fd is not None:
                 _validate_posix_output_replacement_permission(output_path, parent_fd, initial_stat)
-            existing_fd = _open_existing_output_file(
-                output_path,
-                absolute_path,
-                initial_stat,
-                parent_fd=parent_fd,
-            )
-            if os.name == "nt":
+            existing_fd = _open_existing_output_file(output_path, absolute_path, initial_stat, parent_fd=parent_fd)
+            if parent_fd is None:
                 _reject_windows_encrypted_output(output_path, existing_fd)
-            current_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
-            if current_stat is None or not os.path.samestat(initial_stat, current_stat):
-                raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
-            if parent_fd is None and _validated_absolute_output_path(output_path) != absolute_path:
-                raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
-        if parent_fd is not None:
-            parent_sync_fd = _open_posix_output_parent_sync_fd(output_path, parent_fd)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        if nofollow:
-            flags |= nofollow
+            if output_bytes is not None:
+                current_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
+                if current_stat is None or not os.path.samestat(initial_stat, current_stat):
+                    raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+                if parent_fd is None and _validated_absolute_output_path(output_path) != absolute_path:
+                    raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
 
-        if os.name == "nt":
+        if parent_fd is None:
             temp_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
             temp_fd, temp_path = _open_windows_output_temp_file(
                 output_path,
@@ -1488,38 +1393,35 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
                 temp_name,
                 preserve_security=initial_stat is not None,
             )
-            _validate_fallback_temporary_file(output_path, absolute_path, temp_path, temp_fd)
-        elif parent_fd is None:
-            temp_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
-            temp_path = absolute_path.parent / temp_name
-            temp_fd = os.open(temp_path, flags, 0o666)
-            _validate_fallback_temporary_file(output_path, absolute_path, temp_path, temp_fd)
-        else:
-            staging_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
-            staging_fd = _open_posix_output_staging_directory(output_path, parent_fd, staging_name)
-            temp_name = "output.tmp"
-            temp_fd = os.open(temp_name, flags, 0o666, dir_fd=staging_fd)
-
-        if os.name == "nt":
+            _validate_windows_temporary_file(output_path, absolute_path, temp_fd)
             if initial_stat is not None:
                 assert existing_fd is not None
                 _copy_windows_output_security(output_path, existing_fd, temp_fd)
                 if hasattr(os, "fchmod"):
                     os.fchmod(temp_fd, stat.S_IMODE(initial_stat.st_mode))
-            with os.fdopen(temp_fd, "wb", closefd=False) as output_file:
-                output_file.write(output_bytes)
         else:
-            if initial_stat is not None:
-                assert existing_fd is not None
+            parent_sync_fd = _open_posix_output_parent_sync_fd(output_path, parent_fd)
+            staging_name = f".modelaudit-output-{secrets.token_hex(12)}.tmp"
+            staging_fd = _open_posix_output_staging_directory(output_path, parent_fd, staging_name)
+            temp_name = "output.tmp"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            # A new report retains the staged inode's mode when linked into the output directory.
+            temp_fd = os.open(temp_name, flags, 0o600, dir_fd=staging_fd)
+            if existing_fd is not None:
                 _copy_posix_output_metadata(output_path, existing_fd, temp_fd)
-            with os.fdopen(temp_fd, "wb", closefd=False) as output_file:
-                output_file.write(output_bytes)
+            elif stat.S_IMODE(os.fstat(temp_fd).st_mode) & ~0o600 or _posix_fd_has_extended_acl(output_path, temp_fd):
+                raise _OutputWriteError(f"Unable to ensure owner-only output permissions for {output_display}")
+            elif output_bytes is None:
+                _probe_posix_hard_link_support(output_path, staging_fd, parent_fd, temp_name)
+
+        if output_bytes is None:
+            return
+        with os.fdopen(temp_fd, "wb", closefd=False) as output_file:
+            output_file.write(output_bytes)
         os.fsync(temp_fd)
 
-        if parent_fd is None:
-            current_path = _validated_absolute_output_path(output_path)
-            if current_path != absolute_path:
-                raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
+        if parent_fd is None and _validated_absolute_output_path(output_path) != absolute_path:
+            raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
         current_stat = _validate_existing_output_path(output_path, absolute_path, parent_fd=parent_fd)
         if initial_stat is None:
             if current_stat is not None:
@@ -1527,20 +1429,13 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
         elif current_stat is None or not os.path.samestat(initial_stat, current_stat):
             raise _OutputWriteError(f"Refusing to write output because its path changed: {output_display}")
 
-        if os.name == "nt":
-            assert parent_guard is not None
-            assert temp_fd is not None
+        if parent_fd is None:
             _replace_windows_output_file(
                 output_path,
                 temp_fd,
                 absolute_path,
                 replace_existing=initial_stat is not None,
             )
-            temp_path = None
-            temp_name = ""
-        elif parent_fd is None:
-            assert temp_path is not None
-            os.replace(temp_path, absolute_path)
             temp_path = None
         else:
             assert staging_fd is not None
@@ -1553,34 +1448,30 @@ def _write_output_text_file(output_path: str, output_text: str, *, trailing_newl
             temp_name = ""
             assert parent_sync_fd is not None
             _fsync_posix_output_parent(output_path, parent_sync_fd)
-    except _OutputWriteError:
-        raise
     except OSError as exc:
-        raise _OutputWriteError(f"Unable to write output {output_display}: {exc.strerror or exc}") from exc
+        action = "prepare" if output_bytes is None else "write"
+        raise _OutputWriteError(f"Unable to {action} output {output_display}: {exc.strerror or exc}") from exc
     finally:
-        if existing_fd is not None:
-            os.close(existing_fd)
         if temp_fd is not None:
             os.close(temp_fd)
-        staging_stat: os.stat_result | None = None
         if staging_fd is not None:
             if temp_name:
                 with contextlib.suppress(OSError):
                     os.unlink(temp_name, dir_fd=staging_fd)
+            staging_stat: os.stat_result | None = None
             with contextlib.suppress(OSError):
                 staging_stat = os.fstat(staging_fd)
             os.close(staging_fd)
-        if parent_fd is not None:
-            if temp_name and staging_fd is None:
-                with contextlib.suppress(OSError):
-                    os.unlink(temp_name, dir_fd=parent_fd)
-            if staging_name and staging_stat is not None:
+            if parent_fd is not None and staging_stat is not None:
                 with contextlib.suppress(OSError):
                     named_stat = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
                     if os.path.samestat(staging_stat, named_stat):
                         os.rmdir(staging_name, dir_fd=parent_fd)
-            if parent_sync_fd is not None:
-                os.close(parent_sync_fd)
+        if parent_sync_fd is not None:
+            os.close(parent_sync_fd)
+        if existing_fd is not None:
+            os.close(existing_fd)
+        if parent_fd is not None:
             os.close(parent_fd)
         elif temp_path is not None:
             with contextlib.suppress(OSError):

@@ -1,0 +1,1 @@
+On POSIX systems, new `--output` and `--sbom` files are private to their owner even with a permissive umask. Overwriting a report preserves its permissions without enabling extra access inherited from the directory.

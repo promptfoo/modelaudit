@@ -3,10 +3,15 @@
 import json
 import os
 import pickle
+import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
+from modelaudit.cli import cli
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
@@ -16,6 +21,24 @@ from tests.helpers.file_creators import SystemCommandPayload
 
 def test_recent_python_versions_keep_the_broad_test_profile() -> None:
     assert {(3, 14), (3, 15)}.isdisjoint(root_conftest.RESTRICTED_PYTHON_VERSIONS)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Native macOS ACLs are required")
+def test_macos_cli_report_permissions(tmp_path: Path) -> None:
+    report = tmp_path / "scanners.json"
+    args = ["scan", "--list-scanners", "--format", "json", "--output", str(report)]
+    runner = CliRunner()
+    result = runner.invoke(cli, args)
+    assert result.exit_code == 0, result.output
+    assert json.loads(report.read_text())["scanners"]
+    assert stat.S_IMODE(report.stat().st_mode) == 0o600
+
+    report.write_text("sentinel")
+    subprocess.run(["chmod", "+a", "everyone allow readattr", str(report)], check=True)
+    result = runner.invoke(cli, args)
+    assert result.exit_code == 2, result.output
+    assert "Unable to preserve extended output ACL" in result.output
+    assert report.read_text() == "sentinel"
 
 
 @pytest.mark.parametrize("protocol", [None, 4, 5], ids=["runtime-default", "protocol-4", "protocol-5"])

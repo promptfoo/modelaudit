@@ -31,7 +31,7 @@ def _patch_open(monkeypatch: pytest.MonkeyPatch, before_open: Callable[[str], No
     def open_file(
         path: str,
         flags: int,
-        mode: int = 0o777,
+        mode: int = 0o600,
         *,
         dir_fd: int | None = None,
     ) -> int:
