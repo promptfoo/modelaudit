@@ -43,7 +43,7 @@
       "allowedVersions": "<3.3"
     },
     {
-      "description": "Keep Python updates within the project's supported 3.10-3.14 range.",
+      "description": "Keep Python updates within the project's supported range.",
       "matchPackageNames": ["python"],
       "allowedVersions": "<3.16"
     },
