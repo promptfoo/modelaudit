@@ -1,3 +1,4 @@
+import errno
 import os
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
@@ -15,7 +16,6 @@ from modelaudit.utils.sources.pytorch_hub import (
     _extract_weight_urls,
     _get_model_extensions,
     _get_total_size,
-    _open_directory_fd,
     _open_trusted_artifact_response,
     _supports_secure_cache_commit,
     download_pytorch_hub_model,
@@ -915,63 +915,106 @@ def test_download_pytorch_hub_model_rolls_back_cache_on_commit_failure(
     assert not list(tmp_path.glob(".modelaudit_pth_stage_*"))
 
 
-def test_secure_cache_commit_rolls_back_nested_files_on_interruption(
+@pytest.mark.parametrize("error", [None, OSError, KeyboardInterrupt])
+def test_secure_cache_commit_reuses_and_closes_directories_after_install_or_rollback(
+    error: type[BaseException] | None,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     if not _supports_secure_cache_commit():
         pytest.skip("secure directory-descriptor cache commits are unavailable")
 
-    relative_paths = [Path("nested/first.pth"), Path("nested/second.pth")]
+    relative_paths = [Path("nested/first.pth"), Path("nested/new/extra.pth"), Path("nested/second.pth")]
     artifacts = [(f"https://download.pytorch.org/models/{path.as_posix()}", path) for path in relative_paths]
     files_dir = tmp_path / "stage" / "files"
     backup_dir = tmp_path / "stage" / "backups"
     dest_dir = tmp_path / "cache"
-    for root in (files_dir, dest_dir):
-        (root / "nested").mkdir(parents=True)
+    (files_dir / "nested/new").mkdir(parents=True)
+    (dest_dir / "nested").mkdir(parents=True)
     backup_dir.mkdir(parents=True)
     for path in relative_paths:
         (files_dir / path).write_bytes(f"new-{path.stem}".encode())
-        (dest_dir / path).write_bytes(f"old-{path.stem}".encode())
+        if (dest_dir / path).parent.exists():
+            (dest_dir / path).write_bytes(f"old-{path.stem}".encode())
 
+    opened: list[int] = []
+    original_open = os.open
     original_rename = os.rename
 
-    def interrupt_second_install(
+    def track_open(path: str | Path, flags: int, *, dir_fd: int | None = None) -> int:
+        fd = original_open(path, flags, dir_fd=dir_fd)
+        opened.append(fd)
+        return fd
+
+    def fail_last_install(
         source: str | os.PathLike[str],
         destination: str | os.PathLike[str],
         *,
         src_dir_fd: int | None = None,
         dst_dir_fd: int | None = None,
     ) -> None:
-        if Path(source) == files_dir / relative_paths[1] and destination == relative_paths[1].name:
-            raise KeyboardInterrupt("simulated commit interruption")
+        if error is not None and Path(source) == files_dir / relative_paths[-1]:
+            raise error("simulated commit failure")
         original_rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
-    monkeypatch.setattr(os, "rename", interrupt_second_install)
+    monkeypatch.setattr(os, "open", track_open)
+    monkeypatch.setattr(os, "rename", fail_last_install)
 
-    with pytest.raises(KeyboardInterrupt, match="simulated commit interruption"):
+    if error is None:
         _commit_staged_weight_files_secure(artifacts, files_dir, backup_dir, dest_dir)
+        for path in relative_paths:
+            assert (dest_dir / path).read_bytes() == f"new-{path.stem}".encode()
+        assert (dest_dir / "nested/new").stat().st_mode & 0o077 == 0
+    else:
+        with pytest.raises(error, match="simulated commit failure"):
+            _commit_staged_weight_files_secure(artifacts, files_dir, backup_dir, dest_dir)
+        assert (dest_dir / "nested/first.pth").read_bytes() == b"old-first"
+        assert (dest_dir / "nested/second.pth").read_bytes() == b"old-second"
+        assert not (dest_dir / "nested/new").exists()
 
-    assert (dest_dir / relative_paths[0]).read_bytes() == b"old-first"
-    assert (dest_dir / relative_paths[1]).read_bytes() == b"old-second"
+    assert len(opened) == 3  # cache, nested and new
+    for fd in opened:
+        with pytest.raises(OSError) as exc:
+            os.fstat(fd)
+        assert exc.value.errno == errno.EBADF
 
 
-def test_open_directory_fd_closes_on_exception(monkeypatch: pytest.MonkeyPatch) -> None:
-    closed: list[int] = []
-    monkeypatch.setattr(os, "open", lambda *_args, **_kwargs: 123)
-    monkeypatch.setattr(os, "close", closed.append)
+@pytest.mark.parametrize("replace_with_symlink", [False, True])
+def test_secure_cache_commit_rejects_replaced_parent_and_rolls_back_through_pin(
+    replace_with_symlink: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    if not _supports_secure_cache_commit():
+        pytest.skip("secure directory-descriptor cache commits are unavailable")
 
-    caught_exception: RuntimeError | None = None
-    try:
-        with _open_directory_fd("cache", 0) as fd:
-            assert fd == 123
-            raise RuntimeError("stop")
-    except RuntimeError as exc:
-        caught_exception = exc
+    files_dir = tmp_path / "files"
+    backup_dir = tmp_path / "backups"
+    dest_dir = tmp_path / "cache"
+    (files_dir / "nested").mkdir(parents=True)
+    dest_dir.mkdir()
+    paths = [Path("nested/first.pth"), Path("nested/second.pth")]
+    for path in paths:
+        (files_dir / path).write_bytes(b"new")
+    parent = dest_dir / "nested"
+    moved = tmp_path / "moved"
+    original_rename = os.rename
 
-    assert caught_exception is not None
-    assert str(caught_exception) == "stop"
-    assert closed == [123]
+    def replace_parent(source: str | Path, destination: str | Path, **kwargs: int) -> None:
+        original_rename(source, destination, **kwargs)
+        if source == files_dir / paths[0]:
+            original_rename(parent, moved)
+            if replace_with_symlink:
+                parent.symlink_to(moved, target_is_directory=True)
+            else:
+                parent.mkdir()
+
+    monkeypatch.setattr(os, "rename", replace_parent)
+    with pytest.raises(ValueError, match="cache parent changed"):
+        _commit_staged_weight_files_secure([("", path) for path in paths], files_dir, backup_dir, dest_dir)
+
+    assert (files_dir / paths[1]).read_bytes() == b"new"
+    assert not list(moved.iterdir())
+    assert parent.is_symlink() == replace_with_symlink
+    assert not list(parent.iterdir())
 
 
 @_mock_hub_download()

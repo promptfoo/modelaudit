@@ -626,42 +626,48 @@ def _supports_secure_cache_commit() -> bool:
     )
 
 
+class _CacheDirectory:
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+        self.children: dict[str, _CacheDirectory] = {}
+
+    def matches(self, parent_fd: int, name: str) -> bool:
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        return os.path.samestat(entry, os.fstat(self.fd))
+
+
 @contextmanager
-def _open_directory_fd(
-    path: str | os.PathLike[str],
-    flags: int,
-    *,
-    dir_fd: int | None = None,
-) -> Iterator[int]:
-    fd = os.open(path, flags, dir_fd=dir_fd)
+def _pin_cache_directory(path: str | Path, *, dir_fd: int | None = None) -> Iterator[_CacheDirectory]:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
     try:
-        yield fd
+        yield _CacheDirectory(fd)
     finally:
         os.close(fd)
 
 
 def _open_cache_parent_fd(
-    root_fd: int,
+    root: _CacheDirectory,
     relative_path: Path,
     fd_stack: ExitStack,
-    created_dirs: list[tuple[int, str]],
+    created_dirs: list[tuple[_CacheDirectory, str]],
 ) -> int:
-    """Pin a cache parent directory without following replaceable symlinks."""
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    parent_fd = root_fd
+    """Borrow the parent's descriptor until the commit or rollback finishes."""
+    parent = root
     for part in relative_path.parent.parts:
-        try:
-            child_fd = fd_stack.enter_context(_open_directory_fd(part, directory_flags, dir_fd=parent_fd))
-        except FileNotFoundError:
+        child = parent.children.get(part)
+        if child is None:
             try:
-                os.mkdir(part, mode=0o700, dir_fd=parent_fd)
-                created_dirs.append((parent_fd, part))
-            except FileExistsError:
-                # Another process won the create race; the no-follow open below validates it.
-                pass
-            child_fd = fd_stack.enter_context(_open_directory_fd(part, directory_flags, dir_fd=parent_fd))
-        parent_fd = child_fd
-    return parent_fd
+                child = fd_stack.enter_context(_pin_cache_directory(part, dir_fd=parent.fd))
+            except FileNotFoundError:
+                with suppress(FileExistsError):
+                    os.mkdir(part, mode=0o700, dir_fd=parent.fd)
+                    created_dirs.append((parent, part))
+                child = fd_stack.enter_context(_pin_cache_directory(part, dir_fd=parent.fd))
+            parent.children[part] = child
+        elif not child.matches(parent.fd, part):
+            raise ValueError(f"PyTorch Hub cache parent changed during commit: {relative_path.as_posix()}")
+        parent = child
+    return parent.fd
 
 
 def _remove_path_entry_at(parent_fd: int, name: str) -> None:
@@ -677,15 +683,14 @@ def _commit_staged_weight_files_secure(
 ) -> None:
     """Commit staged files through pinned cache directories."""
     committed: list[tuple[int, str, Path, bool]] = []
-    created_dirs: list[tuple[int, str]] = []
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    with _open_directory_fd(dest_dir, directory_flags) as root_fd, ExitStack() as fd_stack:
+    created_dirs: list[tuple[_CacheDirectory, str]] = []
+    with _pin_cache_directory(dest_dir) as root, ExitStack() as fd_stack:
         try:
             for _, relative_path in artifacts:
                 staged_file = _safe_destination_path(files_dir, relative_path)
                 backup_file = _safe_destination_path(backup_dir, relative_path)
                 backup_file.parent.mkdir(parents=True, exist_ok=True)
-                parent_fd = _open_cache_parent_fd(root_fd, relative_path, fd_stack, created_dirs)
+                parent_fd = _open_cache_parent_fd(root, relative_path, fd_stack, created_dirs)
                 filename = relative_path.name
                 try:
                     destination_stat = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
@@ -714,9 +719,11 @@ def _commit_staged_weight_files_secure(
                         _remove_path_entry_at(parent_fd, filename)
                 except BaseException as rollback_error:  # pragma: no cover - catastrophic filesystem failure
                     rollback_errors.append(rollback_error)
-            for parent_fd, name in reversed(created_dirs):
+            for parent, name in reversed(created_dirs):
                 with suppress(OSError):
-                    os.rmdir(name, dir_fd=parent_fd)
+                    child = parent.children.get(name)
+                    if child is None or child.matches(parent.fd, name):
+                        os.rmdir(name, dir_fd=parent.fd)
             if rollback_errors:
                 raise Exception("Failed to commit PyTorch Hub cache and restore its previous state") from commit_error
             raise
