@@ -735,12 +735,33 @@ def bridge():
     assert isinstance(bridge, ast.FunctionDef)
     call_graph._function_imports.cache_clear()
 
-    imports = call_graph._function_imports(bridge, "pkg.bridge", False)
-    assert imports == (
-        {"os": "os", "pkg": "pkg", "run": "pkg.provider.value", "fallback": "fallback"},
-        ("os", "pkg.helper", "subprocess", "pkg.provider", "fallback"),
+    imports = call_graph._function_imports(bridge)
+    assert tuple(map(ast.unparse, imports)) == (
+        "import os, pkg.helper",
+        "from subprocess import run",
+        "from .provider import value as run",
+        "import fallback",
     )
-    assert call_graph._function_imports(bridge, "pkg.bridge", False) is imports
+    assert call_graph._function_imports(bridge) is imports
+    aliases = call_graph._cached_import_aliases(imports, "pkg.bridge", False)
+    assert aliases == {"os": "os", "pkg": "pkg", "run": "pkg.provider.value", "fallback": "fallback"}
+    assert call_graph._cached_import_aliases(imports, "pkg.bridge", False) is aliases
+
+
+def test_direct_import_check_resolves_relative_names_on_demand(monkeypatch: pytest.MonkeyPatch) -> None:
+    bridge = ast.parse("def bridge(): from .first import a; from .second import b").body[0]
+    assert isinstance(bridge, ast.FunctionDef)
+    resolve = create_autospec(
+        call_graph._resolve_import_from_module, side_effect=call_graph._resolve_import_from_module
+    )
+    monkeypatch.setattr(call_graph, "_resolve_import_from_module", resolve)
+    monkeypatch.setattr(call_graph, "_import_module_can_execute_user_code", lambda module: True)
+    assert call_graph._direct_import_execution_calls(bridge, "pkg.bridge", False) == ("builtins.__import__",)
+    resolve.assert_called_once_with("pkg.bridge", False, 1, "first")
+
+    monkeypatch.setattr(call_graph, "_import_module_can_execute_user_code", lambda module: False)
+    assert call_graph._direct_import_execution_calls(bridge, "pkg.bridge", False) == ()
+    assert [call.args[-1] for call in resolve.call_args_list] == ["first", "first", "second"]
 
 
 def test_parameter_controlled_names_reuses_cached_analysis(monkeypatch: pytest.MonkeyPatch) -> None:

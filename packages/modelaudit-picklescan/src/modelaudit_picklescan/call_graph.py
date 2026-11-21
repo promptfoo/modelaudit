@@ -8666,15 +8666,11 @@ def _collect_module_export_summary(
     return _WildcardExportSummary(frozenset(direct_names), tuple(wildcard_imports))
 
 
-def _collect_import_aliases(
-    nodes: Iterable[ast.AST], module_name: str, is_package: bool, *, modules: list[str] | None = None
-) -> dict[str, str]:
+def _collect_import_aliases(nodes: Iterable[ast.AST], module_name: str, is_package: bool) -> dict[str, str]:
     aliases: dict[str, str] = {}
     for statement in nodes:
         if isinstance(statement, ast.Import):
             for alias in statement.names:
-                if modules is not None:
-                    modules.append(alias.name)
                 if alias.asname:
                     aliases[alias.asname] = alias.name
                 else:
@@ -8684,8 +8680,6 @@ def _collect_import_aliases(
             if statement.module == "__future__":
                 continue
             imported_module = _resolve_import_from_module(module_name, is_package, statement.level, statement.module)
-            if modules is not None:
-                modules.append(imported_module)
             for alias in statement.names:
                 if alias.name == "*":
                     continue
@@ -8694,27 +8688,22 @@ def _collect_import_aliases(
     return aliases
 
 
+_cached_import_aliases = _register_source_sensitive_cache(lru_cache(maxsize=4096)(_collect_import_aliases))
+
+
 @_register_source_sensitive_cache
 @lru_cache(maxsize=4096)
-def _function_imports(
-    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
-    module_name: str,
-    is_package: bool,
-) -> tuple[dict[str, str], tuple[str, ...]]:
-    """Collect local aliases and imported modules from every lexical branch."""
-    modules: list[str] = []
-    aliases = _collect_import_aliases(_scope_imports(function_node), module_name, is_package, modules=modules)
-    return aliases, tuple(modules)
-
-
-def _scope_imports(function: ast.FunctionDef | ast.AsyncFunctionDef) -> Iterator[ast.Import | ast.ImportFrom]:
+def _function_imports(function: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[ast.Import | ast.ImportFrom, ...]:
+    """Collect function-local imports from every lexical branch in source order."""
+    imports: list[ast.Import | ast.ImportFrom] = []
     pending: list[ast.AST] = list(reversed(function.body))
     while pending:
         node = pending.pop()
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            yield node
+            imports.append(node)
         elif not isinstance(node, (ast.expr, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             pending.extend(reversed(list(ast.iter_child_nodes(node))))
+    return tuple(imports)
 
 
 def _collect_local_defs(statements: Iterable[ast.stmt]) -> set[str]:
@@ -9937,7 +9926,7 @@ def _calls_in_function(
 ) -> tuple[str, ...]:
     calls: list[str] = []
     call_nodes = _iter_call_nodes(function_node)
-    local_aliases, _ = _function_imports(function_node, module_name, is_package)
+    local_aliases = _cached_import_aliases(_function_imports(function_node), module_name, is_package)
     function_aliases = {**aliases, **local_aliases}
     instance_aliases, parameter_controlled_names = _collect_function_instance_aliases(
         function_node,
@@ -10067,8 +10056,15 @@ def _direct_import_execution_calls(
     module_name: str,
     is_package: bool,
 ) -> tuple[str, ...]:
-    _, modules = _function_imports(function_node, module_name, is_package)
-    return (_IMPORT_EXECUTION_SINK,) if any(_import_module_can_execute_user_code(name) for name in modules) else ()
+    for node in _function_imports(function_node):
+        if isinstance(node, ast.Import):
+            if any(_import_module_can_execute_user_code(alias.name) for alias in node.names):
+                return (_IMPORT_EXECUTION_SINK,)
+        elif node.module != "__future__":
+            module = _resolve_import_from_module(module_name, is_package, node.level, node.module)
+            if _import_module_can_execute_user_code(module):
+                return (_IMPORT_EXECUTION_SINK,)
+    return ()
 
 
 @_register_source_sensitive_cache
