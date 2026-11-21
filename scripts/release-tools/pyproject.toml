@@ -1,7 +1,7 @@
 [project]
 name = "modelaudit-release-tools"
 version = "0.0.0"
-requires-python = ">=3.15,<3.16"
+requires-python = ">=3.10,<3.16"
 dependencies = ["towncrier==26.9.0"]
 
 [tool.uv]

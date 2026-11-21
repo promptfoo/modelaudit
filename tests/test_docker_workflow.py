@@ -12,7 +12,6 @@ import yaml
 from tests.helpers.workflows import _jobs, _step_by_name, _workflow_triggers
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_PINNED_PYTHON_IMAGE_RE = re.compile(r"^python:(?P<version>\d+\.\d+-slim)@sha256:(?P<digest>[0-9a-f]{64})$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -50,10 +49,6 @@ def _dockerfile_lines(path: str) -> list[str]:
     return content.splitlines()
 
 
-def _python_image_from_arg(path: str) -> str:
-    return _dockerfile_arg(path, "PYTHON_IMAGE")
-
-
 def _dockerfile_arg(path: str, name: str) -> str:
     lines = _dockerfile_lines(path)
     prefix = f"ARG {name}="
@@ -61,12 +56,6 @@ def _dockerfile_arg(path: str, name: str) -> str:
         if line.startswith(prefix):
             return line.removeprefix(prefix)
     raise AssertionError(f"{path} does not define {name}")
-
-
-def _assert_pinned_python_image(image: str, expected_version: str) -> None:
-    match = _PINNED_PYTHON_IMAGE_RE.fullmatch(image)
-    assert match is not None
-    assert match.group("version") == expected_version
 
 
 def _job_steps(workflow: dict[str, Any], job_name: str) -> list[dict[str, Any]]:
@@ -94,23 +83,16 @@ def test_image_scans_use_the_verified_trivy_binary(image: str) -> None:
     }
 
 
-def test_dockerfiles_pin_python_base_images_by_digest() -> None:
-    lightweight_image = _python_image_from_arg("Dockerfile")
-    full_image = _python_image_from_arg("Dockerfile.full")
-    tensorflow_image = _python_image_from_arg("Dockerfile.tensorflow")
-
-    _assert_pinned_python_image(lightweight_image, "3.14-slim")
-    _assert_pinned_python_image(full_image, "3.13-slim")
-    _assert_pinned_python_image(tensorflow_image, "3.12-slim")
-
-    for path in ("Dockerfile", "Dockerfile.full"):
-        lines = _dockerfile_lines(path)
-        assert lines.count("FROM ${PYTHON_IMAGE} AS builder") == 1
-        assert lines.count("FROM ${PYTHON_IMAGE} AS runtime") == 1
-
-    tensorflow_lines = _dockerfile_lines("Dockerfile.tensorflow")
-    assert tensorflow_lines.count("FROM ${PYTHON_IMAGE} AS builder") == 1
-    assert tensorflow_lines.count("FROM ${PYTHON_IMAGE} AS runtime") == 1
+@pytest.mark.parametrize(
+    ("path", "version"), [("Dockerfile", "3.15"), ("Dockerfile.full", "3.13"), ("Dockerfile.tensorflow", "3.12")]
+)
+def test_dockerfiles_pin_python_base_images_by_digest(path: str, version: str) -> None:
+    tag, digest = _dockerfile_arg(path, "PYTHON_IMAGE").split("@sha256:")
+    assert tag == f"python:{version}-slim"
+    assert _SHA256_RE.fullmatch(digest)
+    lines = _dockerfile_lines(path)
+    assert lines.count("FROM ${PYTHON_IMAGE} AS builder") == 1
+    assert lines.count("FROM ${PYTHON_IMAGE} AS runtime") == 1
 
 
 @pytest.mark.parametrize("dockerfile", ("Dockerfile", "Dockerfile.full", "Dockerfile.tensorflow"))

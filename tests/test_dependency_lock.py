@@ -275,6 +275,8 @@ def test_renovate_python_updates_follow_runtime_support() -> None:
     next_minor = Version(f"{last_supported.major}.{last_supported.minor + 1}")
     versions = [*supported_versions, next_minor]
     runtime_support = SpecifierSet(project["requires-python"])
+    tools = tomllib.loads((ROOT_DIR / "scripts/release-tools/pyproject.toml").read_text(encoding="utf-8"))
+    assert SpecifierSet(tools["project"]["requires-python"]) == runtime_support
     rules = json.loads(RENOVATE_CONFIG.read_text(encoding="utf-8"))["packageRules"]
     # Filelock's exact pin must remain installable on the oldest supported interpreter.
     (pin_rule,) = [rule for rule in rules if rule.get("matchPackageNames") == ["filelock"] and "constraints" in rule]
