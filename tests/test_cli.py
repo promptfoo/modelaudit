@@ -3383,12 +3383,87 @@ def test_format_text_output_complete_benign_scan_remains_clean() -> None:
     assert "Incomplete security coverage" not in clean_output
 
 
+def test_nonverbose_report_preserves_debug_coverage_evidence_on_reload() -> None:
+    from modelaudit.core_results import determine_exit_code
+    from modelaudit.models import create_audit_result_model
+
+    result = create_initial_audit_result()
+    result.aggregate_scan_result(
+        {
+            "files_scanned": 1,
+            "checks": [
+                {
+                    "name": "Bounded analysis",
+                    "status": "failed",
+                    "message": "Inspection reached its limit",
+                    "severity": "debug",
+                    "details": {"analysis_incomplete": True},
+                },
+                {
+                    "name": "Trace",
+                    "status": "passed",
+                    "message": "Ordinary debug check",
+                    "severity": "debug",
+                },
+            ],
+        }
+    )
+    result.finalize_statistics()
+    report = json.loads(_format_scan_output(result, ["model.bin"], output_format="json", verbose=False))
+    assert report["incomplete_coverage"] is True
+    assert report["failed_checks"] == 1
+    assert [check["name"] for check in report["checks"]] == ["Bounded analysis"]
+    assert [check.name for check in result.checks] == ["Bounded analysis", "Trace"]
+    saved = create_audit_result_model(report)
+    assert saved.success is False
+    assert determine_exit_code(saved) == 2
+    assert saved.checks[0].details["analysis_incomplete"] is True
+
+
+def test_cli_reports_incomplete_routing_in_check_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 2)
+    ambiguous = tmp_path / "ambiguous.model"
+    ambiguous.write_bytes(b"\x08\x01" + b"\x18\x00" * 4)
+    report_path = tmp_path / "report.json"
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            str(ambiguous),
+            "--no-cache",
+            "--no-triage",
+            "--verbose",
+            "--format",
+            "json",
+            "--output",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Scan coverage incomplete" in result.output
+    report = json.loads(report_path.read_text())
+    assert report["incomplete_coverage"] is True
+    assert report["success"] is False
+    assert report["has_errors"] is False
+    assert report["failed_checks"] == 1
+    assert report["total_checks"] == report["passed_checks"] + 1
+    check = next(check for check in report["checks"] if check["name"] == "TensorFlow Protobuf Routing")
+    assert check["status"] == "failed"
+    assert check["severity"] == "info"
+    assert check["details"]["scan_outcome_reason"] == "tensorflow_protobuf_routing_incomplete"
+
+
 def test_format_text_output_incomplete_coverage_without_findings_is_not_clean() -> None:
     """Incomplete coverage without findings should not be presented as a clean scan."""
     results = {
         "files_scanned": 1,
         "bytes_scanned": 10,
         "duration": 0.1,
+        "total_checks": 31,
+        "passed_checks": 31,
+        "failed_checks": 0,
         "issues": [],
         "file_metadata": {
             "model.bin": {
@@ -3401,6 +3476,7 @@ def test_format_text_output_incomplete_coverage_without_findings_is_not_clean() 
 
     output = format_text_output(results, verbose=False)
     clean_output = strip_ansi(output)
+    assert "Success Rate" not in clean_output
     assert "Incomplete security coverage" in clean_output
     assert "bounded_probe_exhausted" in clean_output
     assert "SCAN COVERAGE INCOMPLETE" in clean_output

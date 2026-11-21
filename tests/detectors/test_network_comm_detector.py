@@ -8971,15 +8971,19 @@ def test_shared_evidence_redaction_classification_budget_fails_closed(
     assert findings[-1]["max_classifications"] == calls
 
 
-def test_model_card_endpoint_classification_scales_with_document_size() -> None:
-    # Unlike hostnames inside URLs, bare hostnames near token prose need evidence classification.
-    hosts = b"".join(f"mirror{index}.example.org\n".encode() for index in range(48))
-    data = b"per token weights\n" + hosts + b"ordinary documentation " * 380 + b"\ngit clone https://github.com/a/b"
-    detector = NetworkCommDetector({"max_findings": 100})
-    findings = detector.scan(data, "README.md")
-    assert detector._evidence_redaction_classifications > 32
-    assert not detector._evidence_redaction_limit_reached
-    assert any("git clone" in finding["message"].lower() for finding in findings)
+@pytest.mark.parametrize(("document_size", "expected_hosts"), [(8192, 32), (8193, 48)])
+def test_model_card_endpoint_classification_scales_with_document_size(document_size: int, expected_hosts: int) -> None:
+    hosts = [f"mirror{index}.example.org" for index in range(48)]
+    card = "\n".join(f"api_key=example endpoint={host}" for host in hosts).encode()
+    command = b"\ngit clone https://github.com/a/b"
+    data = card.ljust(document_size - len(command)) + command
+
+    findings = NetworkCommDetector({"max_findings": 100}).scan(data, "README.md")
+
+    domains = {finding.get("domain") for finding in findings}
+    assert domains.intersection(hosts) == set(hosts[:expected_hosts])
+    assert any(finding.get("analysis_incomplete") for finding in findings) == (expected_hosts < len(hosts))
+    assert any(finding.get("command_type") == "git_clone" for finding in findings)
 
 
 def test_filtered_code_tokens_leave_redaction_budget_for_real_endpoints() -> None:
