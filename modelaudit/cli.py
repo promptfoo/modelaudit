@@ -4114,23 +4114,14 @@ def _resolve_scan_source_for_path(
 
 
 class DefaultCommandGroup(click.Group):
-    """Custom group that makes 'scan' the default command"""
+    """Select the default scan before Click consumes options or the `--` separator."""
 
-    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
-        """Get command by name, return None if not found"""
-        # Simply delegate to parent's get_command - no default logic here
-        return click.Group.get_command(self, ctx, cmd_name)
-
-    def resolve_command(  # type: ignore[override]
-        self, ctx: click.Context, args: list[str]
-    ) -> tuple[str | None, click.Command | None, list[str]]:
-        """Resolve command, using 'scan' as default when paths are provided"""
-        # If we have args and the first arg is not a known command, use 'scan' as default
-        if args and args[0] not in self.list_commands(ctx):
-            # Insert 'scan' at the beginning
-            args = ["scan", *list(args)]
-
-        return super().resolve_command(ctx, args)
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if args and self.get_command(ctx, args[0]) is None:
+            option = args[0].partition("=")[0]
+            if not any(option in param.opts or option in param.secondary_opts for param in self.get_params(ctx)):
+                args = ["scan", *args]
+        return super().parse_args(ctx, args)
 
     def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         """Show help with both commands but emphasize scan as primary"""
