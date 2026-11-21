@@ -10,13 +10,13 @@ orphan_prefix = "+"
 issue_format = "[#{issue}](https://github.com/promptfoo/modelaudit/issues/{issue})"
 
 [[tool.towncrier.type]]
-directory = "highlight"
-name = "Highlights"
+directory = "upgrade"
+name = "Upgrade notes"
 showcontent = true
 
 [[tool.towncrier.type]]
-directory = "upgrade"
-name = "Upgrade notes"
+directory = "highlight"
+name = "Highlights"
 showcontent = true
 
 [[tool.towncrier.type]]

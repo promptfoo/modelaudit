@@ -5567,6 +5567,32 @@ def _bert_like_multilingual_vocabulary(*tail_tokens: str) -> str:
     return "\n".join(tokens) + "\n"
 
 
+@pytest.mark.parametrize(
+    ("tokens", "expected"),
+    [
+        (["##@bank.com."], IssueSeverity.INFO),
+        (["##@bank.tk"], IssueSeverity.CRITICAL),
+        (["www.bank.com/researchdisclosures,"], IssueSeverity.INFO),
+        (["##@bank.com", 'connect("bank.com")'], IssueSeverity.WARNING),
+        (["##@bank.com", "bank.com/?token=secret"], IssueSeverity.WARNING),
+        (
+            ["##@bank.com", "__import__('socket').gethostbyname(", "'''", "bank.com", "'''.strip()", ")"],
+            IssueSeverity.WARNING,
+        ),
+        (["##@bank.com", "require('dns').resolve(", "`", "bank.com", "`", ")"], IssueSeverity.WARNING),
+    ],
+)
+def test_wordpiece_domain_requires_only_passive_occurrences(
+    tmp_path: Path, tokens: list[str], expected: IssueSeverity
+) -> None:
+    path = tmp_path / "vocab.txt"
+    path.write_text(_bert_like_multilingual_vocabulary(*tokens), encoding="utf-8")
+    result = TextScanner().scan(str(path))
+    findings = [c for c in result.checks if c.details.get("type") == "domain_name"]
+    assert findings
+    assert all(c.severity == expected for c in findings)
+
+
 class _LineIterationGuardBytes(bytes):
     def find(self, *args: Any, **kwargs: Any) -> int:
         raise AssertionError("line iteration must not call bytes.find")
@@ -6235,6 +6261,21 @@ def test_text_scanner_documentation_code_url_after_limit_fails_closed(tmp_path: 
     assert result.success is False
     assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+
+
+def test_model_card_links_near_token_prose_complete_network_inspection(tmp_path: Path) -> None:
+    links = "".join(f"[Example {i}](https://GitHub.com/org/example{i})\n" for i in range(40))
+    result = _scan_text_content(
+        tmp_path / "README.md",
+        f"To obtain token weights, see these examples.\n{links}\n```sh\ngit clone https://github.com/org/model\n```\n",
+    )
+
+    assert result.success
+    assert any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+    assert any(check.details.get("command_type") == "git_clone" for check in _failed_network_detection_checks(result))
+    assert not any(check.name == "Network Communication Reporting Limit" for check in result.checks)
 
 
 def test_text_scanner_documentation_passive_endpoint_redaction_limit_is_informational(

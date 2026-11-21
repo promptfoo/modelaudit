@@ -89,6 +89,7 @@ from .pytorch_zip_support import (
     read_member_to_spooled_file,
     read_zip_header,
 )
+from .pytorch_zip_support.tensor_usage import uses_only_raw_tensors
 from .rule_mapper import get_generic_rule_code
 from .zip_scanner import ZipPreflightRejected
 
@@ -260,6 +261,21 @@ _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS = (
     b"commands\ngetoutput\n",
     b"commands\ngetstatusoutput\n",
 )
+
+
+# Match a direct GLOBAL or an encoded module operand. Confirm STACK_GLOBAL's
+# second operand and memo writes in the same instruction stream before reporting.
+_STORAGE_MODULE_NAMES = {marker.split(b"\n", 1)[0] for marker in _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS}
+_STORAGE_GLOBAL_REFERENCE = re.compile(
+    b"c("
+    + b"|".join(map(re.escape, _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS))
+    + b")|"
+    + b"|".join(
+        re.escape(op + len(module).to_bytes(width, "little") + module)
+        for module in sorted(_STORAGE_MODULE_NAMES)
+        for op, width in ((b"\x8c", 1), (b"X", 4), (b"\x8d", 8))
+    )
+)
 _PICKLE_ENGINE_MAGIC_METHOD_LITERAL_PATTERN = (
     r"(?<!\w)__(?:reduce|reduce_ex|setstate|getstate|getnewargs|getnewargs_ex|subclasses|globals|code|"
     r"builtins|import|mro|base|bases|abs|add|aiter|and|anext|bool|bytes|call|ceil|contains|del|"
@@ -334,6 +350,7 @@ class _ValidatedPytorchStorageDataPklMembers:
     persistent_id_downgrade_keys_by_data_pkl: dict[str, set[str]]
     additional_pid_keys_by_data_pkl: dict[str, set[str]]
     storage_member_sizes_by_data_pkl: dict[str, dict[str, int]]
+    tensor_only: bool = False
 
 
 class _NumericPickleProofReader(io.BytesIO):
@@ -432,6 +449,9 @@ _PICKLE_FRAME_OPCODE_BYTES = 9
 _PROTO0_1_TEXT_WHITESPACE_BYTES = b" \t\r\n"
 _PICKLE_DISCOVERY_PADDING_PROBE_BYTES = 256 * 1024
 _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES = 64 * 1024
+# Full-member recovery has a separate ledger. An exhausted ledger never clears a failure.
+_STORAGE_RECOVERY_MAX_MEMBER_BYTES = 16 * 1024 * 1024
+_STORAGE_RECOVERY_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 _PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES = 4 * 1024 * 1024
 _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES = 64 * 1024 * 1024
 _PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
@@ -539,6 +559,10 @@ _InstNameValidation = tuple[bytes, dict[int, tuple[tuple[int, ...], int, int | N
 # Fields: inspected high-water, rejected start/end, observed name limit.
 # The high-water mark accounts for work; it never resumes UTF-8 decoding.
 _GlobalNameInspection = tuple[bytes, list[int]]
+
+
+class _StorageProbeLimit(ValueError):
+    """A bounded raw-storage probe could not decide whether to route the member."""
 
 
 class PyTorchZipScanner(BaseScanner):
@@ -1719,9 +1743,33 @@ class PyTorchZipScanner(BaseScanner):
         # adversarial archive with many unreadable members does not flood the
         # checks list with one INFO finding apiece.
         probe_failures: list[dict[str, Any]] = []
+        storage_diagnostics: list[dict[str, Any]] = []
+        storage_recovery_bytes_remaining = [_STORAGE_RECOVERY_MAX_ARCHIVE_BYTES]
         padding_probe_bytes_remaining = [_PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES]
         nul_padding_verify_bytes_remaining = [_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES]
         deferred_padding_probe_entries: list[zipfile.ZipInfo] = []
+
+        def record_probe_failure(entry: zipfile.ZipInfo, exc: Exception) -> None:
+            failure = {
+                "zip_entry": entry.filename,
+                "exception": str(exc),
+                "exception_type": "ValueError" if isinstance(exc, _StorageProbeLimit) else type(exc).__name__,
+                "location": f"{self.current_file_path}:{entry.filename}",
+            }
+            if isinstance(exc, _StorageProbeLimit) and self._get_zip_member_name(entry) in trusted_storage_blob_members:
+                try:
+                    reason = self._review_ambiguous_storage(zip_file, entry, result, storage_recovery_bytes_remaining)
+                except Exception as read_exc:
+                    failure.update(exception=str(read_exc), exception_type=type(read_exc).__name__)
+                else:
+                    if reason is None and not validated_pytorch_storage_data_pkl_members.tensor_only:
+                        reason = "unverified_tensor_usage"
+                    if reason is None and not self.config.get("strict_tensor_storage"):
+                        storage_diagnostics.append({**failure, "bytes_read": entry.file_size})
+                        return
+                    failure["storage_recovery"] = reason or "strict_hidden_pickle_discovery"
+            probe_failures.append(failure)
+
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
             if id(entry) in entries_by_id or entry.is_dir():
@@ -1756,14 +1804,7 @@ class PyTorchZipScanner(BaseScanner):
                     deferred_padding_probe_entries.append(entry)
             except Exception as exc:
                 logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
-                probe_failures.append(
-                    {
-                        "zip_entry": entry.filename,
-                        "exception": str(exc),
-                        "exception_type": type(exc).__name__,
-                        "location": f"{self.current_file_path}:{entry.filename}",
-                    }
-                )
+                record_probe_failure(entry, exc)
 
         for entry in deferred_padding_probe_entries:
             if id(entry) in entries_by_id or entry.is_dir():
@@ -1781,16 +1822,29 @@ class PyTorchZipScanner(BaseScanner):
                     entries_by_id[id(entry)] = entry
             except Exception as exc:
                 logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
-                probe_failures.append(
-                    {
-                        "zip_entry": entry.filename,
-                        "exception": str(exc),
-                        "exception_type": type(exc).__name__,
-                        "location": f"{self.current_file_path}:{entry.filename}",
-                    }
-                )
+                record_probe_failure(entry, exc)
+
+        if storage_diagnostics:
+            result.metadata["hidden_pickle_coverage"] = "inconclusive"
+            result.add_check(
+                name="Hidden Pickle Coverage",
+                passed=False,
+                message=(
+                    f"PyTorch uses {len(storage_diagnostics)} ambiguous members as raw tensor values. "
+                    "A separate pickle hidden in those bytes could not be ruled out. "
+                    "Use --strict to count this gap as incomplete."
+                ),
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={
+                    "entries": storage_diagnostics,
+                    "scope": "pytorch_tensor_storage",
+                    "hidden_pickle_coverage": "inconclusive",
+                },
+            )
 
         if probe_failures:
+            result.metadata["hidden_pickle_coverage"] = "inconclusive"
             mark_inconclusive_scan_result(result, "pytorch_zip_pickle_discovery_incomplete")
             count = len(probe_failures)
             noun = "member" if count == 1 else "members"
@@ -1811,6 +1865,86 @@ class PyTorchZipScanner(BaseScanner):
         pickle_files = list(entries_by_id.values())
         result.metadata["pickle_files"] = self._get_zip_member_names(pickle_files)
         return pickle_files
+
+    def _review_ambiguous_storage(
+        self,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        result: ScanResult,
+        bytes_remaining: list[int],
+    ) -> str | None:
+        """Require a full read and check for stronger evidence before separating coverage."""
+        limit = min(bytes_remaining[0], _STORAGE_RECOVERY_MAX_MEMBER_BYTES)
+        if self.max_file_read_size > 0:
+            limit = min(limit, self.max_file_read_size)
+        full_read = entry.file_size <= limit
+        if full_read:
+            bytes_remaining[0] -= entry.file_size
+            sample = self._read_member_bytes(
+                zip_file, entry, max_bytes=entry.file_size, phase="pickle_discovery", result=result
+            )
+        else:
+            # A readable prefix can still establish a finding, even when the
+            # uninspected tail prevents reporting complete coverage.
+            prefix_size = min(limit, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
+            if prefix_size <= 0:
+                return "full_member_read_limit"
+            bytes_remaining[0] -= prefix_size
+            sample = self._read_member_prefix(zip_file, entry, prefix_size, phase="pickle_discovery", result=result)
+
+        for count, match in enumerate(_STORAGE_GLOBAL_REFERENCE.finditer(sample)):
+            if count >= _MAX_RAW_NESTED_PICKLE_CANDIDATES:
+                return "pickle_witness_budget_exhausted"
+            offset = match.start()
+            candidate = sample[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+            marker = match[1] or self._storage_stack_global_marker(candidate)
+            if marker and self._has_complete_pickle_stream_without_frame_stop_overrun(candidate):
+                result.add_check(
+                    name="Embedded Pickle Payload",
+                    passed=False,
+                    message="A complete pickle stream in raw tensor storage references a dangerous callable",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{self.current_file_path}:{entry.filename}",
+                    details={
+                        "zip_entry": entry.filename,
+                        "offset": offset,
+                        "callable": marker.decode().strip(),
+                    },
+                )
+                break
+        if not full_read:
+            return "full_member_read_limit"
+        if len(sample) != entry.file_size:
+            return "incomplete_member_read"
+        if not self._zip_payload_bounds_match(zip_file, entry):
+            return "unverified_storage_bounds"
+        if self._impossible_declared_storage_prefix_header_end(sample, entry_size=len(sample)) is None:
+            return "unresolved_storage_prefix"
+        # This is not proof that the bytes cannot be unpickled separately.
+        # The caller reports that uncertainty in both modes.
+        return None
+
+    @staticmethod
+    def _storage_stack_global_marker(candidate: bytes) -> bytes | None:
+        names: list[str] = []
+        try:
+            for opcode, arg, _ in pickletools.genops(candidate):
+                if opcode.name == "STACK_GLOBAL" and len(names) == 2:
+                    marker = ("\n".join(names) + "\n").encode()
+                    return marker if marker in _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS else None
+                if opcode.name in {"PUT", "BINPUT", "LONG_BINPUT", "MEMOIZE"} and names:
+                    continue
+                if (
+                    opcode.name not in {"SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8"}
+                    or not isinstance(arg, str)
+                    or len(names) == 2
+                ):
+                    break
+                names.append(arg)
+        except (ValueError, UnicodeError, OverflowError):
+            # An undecodable operand cannot establish the named callable.
+            pass
+        return None
 
     def _scan_nested_zip_members(
         self,
@@ -2176,10 +2310,10 @@ class PyTorchZipScanner(BaseScanner):
             )
         except ValueError as exc:
             if work_budget_remaining[0] < 0:
-                raise ValueError("trusted PyTorch storage literal inspection work allowance exhausted") from exc
+                raise _StorageProbeLimit("trusted PyTorch storage literal inspection work allowance exhausted") from exc
             raise
         if work_budget_remaining[0] < 0:
-            raise ValueError("trusted PyTorch storage literal inspection work allowance exhausted")
+            raise _StorageProbeLimit("trusted PyTorch storage literal inspection work allowance exhausted")
         return should_scan
 
     def _trusted_storage_entry_looks_like_pickle_with_work_budget(
@@ -2258,7 +2392,7 @@ class PyTorchZipScanner(BaseScanner):
                         context_start=0,
                         work_budget_remaining=work_budget_remaining,
                     ):
-                        raise ValueError("trusted PyTorch storage prefix exceeds pickle discovery probe")
+                        raise _StorageProbeLimit("trusted PyTorch storage prefix exceeds pickle discovery probe")
                     return False
                 if defer_padding_probe is not None:
                     defer_padding_probe[0] = True
@@ -2371,7 +2505,7 @@ class PyTorchZipScanner(BaseScanner):
                 work_budget_remaining=work_budget_remaining,
             ):
                 return charge_deferred_probe_budget_before_skip()
-            raise ValueError("trusted PyTorch storage prefix exceeds pickle discovery probe")
+            raise _StorageProbeLimit("trusted PyTorch storage prefix exceeds pickle discovery probe")
 
         if entry.file_size > len(data_start):
             probe_bytes = max_probe_bytes
@@ -2538,6 +2672,7 @@ class PyTorchZipScanner(BaseScanner):
                 expanded_probe_bytes,
                 PyTorchZipScanner._proto0_or_1_trusted_storage_probe_should_scan,
                 work_budget_remaining=work_budget_remaining,
+                previous_sample=sample,
             ):
                 return True
             sample = expanded_sample
@@ -2616,7 +2751,7 @@ class PyTorchZipScanner(BaseScanner):
                         work_budget_remaining=work_budget_remaining,
                     )
                 raise ValueError("trusted PyTorch storage padding probe limit reached")
-            raise ValueError("trusted PyTorch storage prefix exceeds pickle discovery probe")
+            raise _StorageProbeLimit("trusted PyTorch storage prefix exceeds pickle discovery probe")
         return charge_deferred_probe_budget_before_skip()
 
     def _verified_nul_padding_storage_probe_should_scan(
@@ -2755,10 +2890,15 @@ class PyTorchZipScanner(BaseScanner):
         predicate: Callable[..., bool],
         *,
         work_budget_remaining: list[int] | None = None,
+        previous_sample: bytes | None = None,
     ) -> bool:
         if max_probe_bytes <= _TRUSTED_STORAGE_PICKLE_PROBE_BYTES:
             return False
         short_sample = sample[:_TRUSTED_STORAGE_PICKLE_PROBE_BYTES]
+        # The short probe and its replay share a work allowance. Only inspect
+        # a prefix again when the expanded read returned different bytes.
+        if short_sample == previous_sample:
+            return False
         if work_budget_remaining is not None:
             return predicate(
                 short_sample,
@@ -2775,7 +2915,7 @@ class PyTorchZipScanner(BaseScanner):
         if probe_bytes <= 0:
             return
         if padding_probe_bytes_remaining[0] < probe_bytes:
-            raise ValueError("trusted PyTorch storage padding probe budget exceeded")
+            raise _StorageProbeLimit("trusted PyTorch storage padding probe budget exceeded")
         padding_probe_bytes_remaining[0] -= probe_bytes
 
     @staticmethod
@@ -8721,6 +8861,7 @@ class PyTorchZipScanner(BaseScanner):
             else None
         )
         storage_member_sizes_by_data_pkl: dict[str, dict[str, int]] = {}
+        tensor_only = False
         storage_reference_bytes_read = 0
         storage_reference_opcodes_remaining = [_PYTORCH_STORAGE_TRUST_MAX_OPCODES]
         for data_pkl_member, data_pkl_entries in entries_by_name.items():
@@ -8861,7 +9002,37 @@ class PyTorchZipScanner(BaseScanner):
                     for storage_key in exact_trusted_storage_keys
                 }
 
+                # Certify how the loader consumes these members before separating
+                # speculative hidden-pickle coverage from checkpoint completion.
+                controls = {
+                    prefix + name
+                    for name in (
+                        "data.pkl",
+                        "version",
+                        "byteorder",
+                        ".data/serialization_id",
+                        ".format_version",
+                        ".storage_alignment",
+                    )
+                }
+                if (
+                    exact_trusted_storage_keys == existing_storage_keys
+                    and self.pickle_scanner is not None
+                    and prefix.count("/") == 1
+                    and len(entries_by_name) == len(zip_file.infolist())
+                    and entries_by_name.keys() <= controls | {data_prefix + key for key in existing_storage_keys}
+                    and all(
+                        entry.compress_type == zipfile.ZIP_STORED and entry.compress_size == entry.file_size
+                        for entry in safe_entries
+                    )
+                    and self._zip_payload_bounds_match(zip_file, data_pkl_entry)
+                ) and uses_only_raw_tensors(
+                    pickle_data, storage_member_sizes_by_data_pkl[data_pkl_member], self._check_timeout
+                ):
+                    tensor_only = True
+
         return _ValidatedPytorchStorageDataPklMembers(
+            tensor_only=tensor_only,
             storage_keys_by_data_pkl=trusted_members,
             storage_probe_keys_by_data_pkl=storage_probe_members,
             persistent_id_downgrade_keys_by_data_pkl=persistent_id_downgrade_members,

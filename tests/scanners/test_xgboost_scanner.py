@@ -2061,6 +2061,8 @@ class TestXGBoostFailClosedEndToEnd:
             _sentencepiece_trainer_spec_field(_unknown_sentencepiece_field(b"hidden payload")),
             _sentencepiece_trainer_spec(vocab_size=1 << 31),
             _sentencepiece_trainer_spec(vocab_size=(1 << 64) - 1),
+            bytes.fromhex("9a 80 80 80 80 00 00"),  # Empty normalizer with a six-byte tag.
+            _sentencepiece_trainer_spec_field(bytes.fromhex("0a 80 80 80 80 80 00")),  # Six-byte input length.
         ],
         ids=[
             "malformed-compiled-map",
@@ -2069,6 +2071,8 @@ class TestXGBoostFailClosedEndToEnd:
             "unknown-trainer-extension",
             "vocab-size-int32-overflow",
             "negative-vocab-size",
+            "oversized-tag",
+            "oversized-length-prefix",
         ],
     )
     def test_sentencepiece_incomplete_metadata_is_visible(self, tmp_path: Path, metadata: bytes) -> None:
@@ -2116,6 +2120,32 @@ class TestXGBoostFailClosedEndToEnd:
         assert determine_exit_code(result) == 2
         _assert_inconclusive_metadata(result, tokenizer, "sentencepiece_validation_incomplete")
 
+    @pytest.mark.parametrize(
+        ("model_type", "has_normal_piece", "valid"),
+        [
+            pytest.param(1, False, False, id="unigram-empty-trie"),
+            pytest.param(1, True, True, id="unigram-separate-maps"),
+            pytest.param(2, False, True, id="bpe-only-reserved"),
+            pytest.param(2, True, False, id="bpe-duplicate-name"),
+        ],
+    )
+    def test_sentencepiece_checks_model_specific_vocabulary(
+        self, tmp_path: Path, model_type: int, has_normal_piece: bool, valid: bool
+    ) -> None:
+        pieces = [_sentencepiece_piece("<unk>", 2), _sentencepiece_piece("<s>", 3)]
+        if has_normal_piece:
+            pieces.append(_sentencepiece_piece("<s>", 1))
+        tokenizer = tmp_path / "spm.model"
+        tokenizer.write_bytes(
+            b"".join(pieces) + _sentencepiece_trainer_spec(model_type=model_type, vocab_size=len(pieces))
+        )
+
+        result = scan_model_directory_or_file(str(tokenizer), cache_enabled=False)
+        assert "sentencepiece" in result.scanner_names
+        assert determine_exit_code(result) == (0 if valid else 2)
+        if not valid:
+            _assert_inconclusive_metadata(result, tokenizer, "sentencepiece_validation_incomplete")
+
     def test_sentencepiece_accepts_trainer_scalar_boundaries_and_disabled_ids(self, tmp_path: Path) -> None:
         extra_fields = b"".join(
             _proto_field(number, 0, _proto_varint(value))
@@ -2126,6 +2156,7 @@ class TestXGBoostFailClosedEndToEnd:
                 (12, (1 << 64) - (1 << 31)),
                 (19, 1),
                 (21, 0),
+                (55, 0),  # auto_character_coverage in SentencePiece 0.2.3
                 (41, (1 << 64) - 1),
                 (42, (1 << 64) - 1),
                 (43, (1 << 64) - 1),
@@ -2166,6 +2197,60 @@ class TestXGBoostFailClosedEndToEnd:
         result = scan_file(str(tokenizer), config={"cache_enabled": False})
         assert result.scanner_name == "sentencepiece"
         assert result.success is (leaf_offset == 0)
+
+    @pytest.mark.parametrize(
+        ("matches", "cycle", "valid"),
+        [(32, False, True), (33, False, False), (32, True, False)],
+        ids=["32-matches-in-33-bytes", "33-matches", "reachable-cycle"],
+    )
+    def test_sentencepiece_limits_normalization_prefix_matches(
+        self, tmp_path: Path, matches: int, cycle: bool, valid: bool
+    ) -> None:
+        # A single Darts block maps prefixes of 'a' to the empty string.
+        # Bases start at 192 so the positions for 'a' are outside the value slots.
+        units = [0x80000000] * 256
+        base = 192
+        units[0] = base << 10
+        for step in range(33):
+            index = base ^ ord("a")
+            base = 192 if cycle and step == 32 else base + 1
+            has_leaf = step >= 33 - matches
+            units[index] = ((index ^ base) << 10) | (has_leaf << 8) | ord("a")
+        charsmap = struct.pack("<257I", 1024, *units) + b"\0"
+        normalizer = _proto_field(2, 2, _proto_varint(len(charsmap)) + charsmap)
+        sample = _proto_field(1, 2, _proto_varint(66) + b"a" * 66)
+        self_test = _proto_field(1, 2, _proto_varint(len(sample)) + sample)
+        tokenizer = tmp_path / "spm.model"
+        tokenizer.write_bytes(
+            _sentencepiece_model_proto()
+            + _proto_field(3, 2, _proto_varint(len(normalizer)) + normalizer)
+            + _proto_field(4, 2, _proto_varint(len(self_test)) + self_test)
+        )
+
+        result = scan_model_directory_or_file(str(tokenizer), cache_enabled=False)
+        assert "sentencepiece" in result.scanner_names
+        assert result.success is valid
+        assert determine_exit_code(result) == (0 if valid else 2)
+        if not valid:
+            _assert_inconclusive_metadata(result, tokenizer, "sentencepiece_validation_incomplete")
+            assert any(
+                check.name == "SentencePiece Vocabulary Validation" and check.status == CheckStatus.FAILED
+                for check in result.checks
+            )
+
+    @pytest.mark.parametrize("matches", [64, 65])
+    def test_sentencepiece_limits_user_defined_prefix_matches(self, tmp_path: Path, matches: int) -> None:
+        symbols = ["a" * length for length in range(1, matches + 1)]
+        symbols.extend(["a" * 32 + "b", "b" * 66])
+        tokenizer = tmp_path / "spm.model"
+        tokenizer.write_bytes(
+            _sentencepiece_model_proto() + b"".join(_sentencepiece_piece(s, 4) for s in reversed(symbols))
+        )
+        result = scan_model_directory_or_file(str(tokenizer), cache_enabled=False)
+        assert "sentencepiece" in result.scanner_names
+        assert determine_exit_code(result) == (0 if matches == 64 else 2)
+        if matches > 64:
+            _assert_inconclusive_metadata(result, tokenizer, "sentencepiece_validation_incomplete")
 
     def test_malformed_model_fails_closed_without_xgboost(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
