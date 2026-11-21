@@ -9322,6 +9322,8 @@ def test_scan_bytes_flags_base64_encoded_code_string_literals(literal: bytes, pa
         ("(__lazy_import__)('example').resolve()", True),
         ("((builtins . __lazy_import__))('example')", True),
         ("(__builtins__.__lazy_import__)('example')", True),
+        ("((builtins).__lazy_import__)('example').resolve()", True),
+        ("f = ((builtins)).__lazy_import__; f('example')", True),
         ("f = __lazy_import__; f('example').resolve()", True),
         ("f = builtins.__lazy_import__; f('example').resolve()", True),
         ("f = __builtins__.__lazy_import__; f('example')", True),

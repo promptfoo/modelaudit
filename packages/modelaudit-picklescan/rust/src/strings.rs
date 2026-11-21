@@ -1167,17 +1167,23 @@ fn contains_lazy_import(lower: &str) -> bool {
         {
             return false;
         }
-        let prefix = prefix
-            .trim_end()
-            .strip_suffix('.')
-            .map(|module| {
-                module
-                    .trim_end()
-                    .trim_end_matches(is_suffix_identifier_continue)
-            })
-            .unwrap_or(prefix);
+        let prefix = before_module_qualifier(prefix).unwrap_or(prefix);
         callable_use(prefix, rest, suffix_starts_non_prose_call)
     })
+}
+
+fn before_module_qualifier(prefix: &str) -> Option<&str> {
+    let receiver = prefix.trim_end().strip_suffix('.')?;
+    let name = receiver.trim_end_matches(|ch: char| ch.is_whitespace() || ch == ')');
+    let mut before = name.trim_end_matches(is_suffix_identifier_continue);
+    if before.len() == name.len() {
+        return None;
+    }
+    // Parentheses around the receiver are distinct from those around the callable.
+    for _ in receiver[name.len()..].matches(')') {
+        before = before.trim_end().strip_suffix('(')?;
+    }
+    Some(before)
 }
 
 fn contains_dangerous_callable_invocation(lower: &str, name: &str) -> bool {

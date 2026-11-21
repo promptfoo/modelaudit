@@ -633,38 +633,34 @@ def _add_legacy_supporting_finding_checks(
         return
 
     if _is_specific_builtin_call(finding, primary_rule_code) and finding.message.startswith("Found "):
-        result.add_check(
-            name="REDUCE Opcode Safety Check",
-            passed=False,
-            message=finding.message,
-            severity=severity,
-            location=finding.location,
-            details={**details, "supporting_rule_code": True, "primary_rule_code": primary_rule_code},
-            why=_legacy_why_for_finding(finding),
-            rule_code="S201",
-        )
-        return
-
-    if finding.rule_code == "DANGEROUS_GLOBAL":
+        opcode = finding.details.get("opcode")
+        if not isinstance(opcode, str):
+            return
+        rule_code = get_pickle_opcode_rule_code(opcode)
+        check_name = f"{opcode.upper()} Opcode Safety Check"
+        details = {**details, "supporting_rule_code": True, "primary_rule_code": primary_rule_code}
+    elif finding.rule_code == "DANGEROUS_GLOBAL":
         module = finding.details.get("module")
         name = finding.details.get("name")
         if not isinstance(module, str):
             return
-        import_rule_code = get_import_rule_code(
+        rule_code = get_import_rule_code(
             _IMPORT_MODULE_ALIASES.get(module.lower(), module),
             name if isinstance(name, str) else None,
         )
-        if import_rule_code is None or import_rule_code == primary_rule_code:
-            return
+        check_name = "GLOBAL Opcode Safety Check"
+    else:
+        return
+    if rule_code is not None and rule_code != primary_rule_code:
         result.add_check(
-            name="GLOBAL Opcode Safety Check",
+            name=check_name,
             passed=False,
             message=finding.message,
             severity=severity,
             location=finding.location,
             details=details,
             why=_legacy_why_for_finding(finding),
-            rule_code=import_rule_code,
+            rule_code=rule_code,
         )
 
 
