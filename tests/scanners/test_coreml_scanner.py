@@ -8,7 +8,7 @@ import pytest
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, CheckStatus, IssueSeverity
-from modelaudit.scanners.coreml_scanner import CoreMLScanner
+from modelaudit.scanners.coreml_scanner import CoreMLScanner, _parse_message
 from modelaudit.utils.file.detection import (
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
     detect_file_format,
@@ -362,6 +362,26 @@ def test_coreml_scanner_detects_custom_layer_after_unknown_group_prefix(tmp_path
     assert any(
         issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
         for issue in result.issues
+    )
+
+
+def test_coreml_nested_groups_spend_field_budget_without_exposing_their_values() -> None:
+    # Fields 3 and 4 open groups. The embedded customModel must stay inside them.
+    group = b"\x1b\x23" + _field_bytes(555, b"ignored") + b"\x24\x1c"
+    data = group + _field_varint(1, 8)
+    fields, error = _parse_message(data, max_fields=6)
+    assert error is None
+    assert [(field.field_number, field.value) for field in fields] == [(1, 8)]
+    assert _parse_message(data, max_fields=5) == ([], "field count exceeded limit (5)")
+
+
+def test_coreml_group_endings_distinguish_a_short_prefix_from_malformed_data() -> None:
+    prefix = b"\x1b\x23"
+    assert _parse_message(prefix, max_fields=3) == ([], "truncated group field 3")
+    assert _parse_message(prefix, max_fields=3, allow_truncated=True) == ([], None)
+    assert _parse_message(prefix + b"\x1c", max_fields=3, allow_truncated=True) == (
+        [],
+        "mismatched end group field 3",
     )
 
 

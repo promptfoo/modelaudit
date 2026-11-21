@@ -166,6 +166,8 @@ _COREML_GROUP_INCOMPLETE: Literal["incomplete"] = "incomplete"
 _COREML_GROUP_MALFORMED: Literal["malformed"] = "malformed"
 _COREML_MAX_DESCRIPTION_PREFIX_FIELDS = 512
 _COREML_MAX_MODEL_PREFIX_FIELDS = 4096
+_COREML_MAX_SPECIFICATION_VERSION = 10000
+# Model.Type oneof field numbers from Core ML's Model.proto, shared with the scanner.
 _COREML_MODEL_TYPE_FIELDS = frozenset(
     {
         200,
@@ -4409,7 +4411,7 @@ def _starts_with_coreml_specification_version(data: bytes) -> bool:
     if tag != (1 << 3):
         return False
     value_result = _read_proto_varint(data, value_offset)
-    return value_result is not None and 0 < value_result[0] <= 10000
+    return value_result is not None and 0 < value_result[0] <= _COREML_MAX_SPECIFICATION_VERSION
 
 
 def _looks_like_coreml_model_proto_prefix(data: bytes, *, sample_is_prefix: bool = False) -> bool | None:
@@ -4441,7 +4443,7 @@ def _looks_like_coreml_model_proto_prefix(data: bytes, *, sample_is_prefix: bool
             if value_result is None:
                 return None if sample_is_prefix else False
             specification_version, offset = value_result
-            has_specification_version = 0 < specification_version <= 10000
+            has_specification_version = 0 < specification_version <= _COREML_MAX_SPECIFICATION_VERSION
         elif wire_type == 2:
             bounds = _read_length_delimited_proto_value(data, value_offset)
             if bounds is None:
@@ -8933,7 +8935,7 @@ def _has_bounded_coreml_model_text_candidate_field_signal(
     """Return whether a known CoreML field has a model-like value."""
     if field_number == 1 and wire_type == 0:
         value_result = _read_proto_varint(payload, value_offset)
-        return value_result is not None and 0 < value_result[0] <= 10000
+        return value_result is not None and 0 < value_result[0] <= _COREML_MAX_SPECIFICATION_VERSION
     if not ((field_number == 2 or field_number in _COREML_MODEL_TYPE_FIELDS) and wire_type == 2):
         return False
 

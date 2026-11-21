@@ -13,7 +13,13 @@ from typing import ClassVar, NamedTuple
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
+from ..utils.file.detection import (
+    _COREML_DESCRIPTION_FIELD_HINTS,
+    _COREML_MAX_DESCRIPTION_PREFIX_FIELDS,
+    _COREML_MAX_SPECIFICATION_VERSION,
+    _COREML_MODEL_TYPE_FIELDS,
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
+)
 from ..utils.file.detection import _read_proto_varint as _read_varint
 from .base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
@@ -46,101 +52,19 @@ class _ProtoField(NamedTuple):
     truncated: bool = False
 
 
-def _skip_group(
-    data: bytes,
-    offset: int,
-    start_field_number: int,
-    *,
-    max_fields: int,
-    fields_seen: int,
-    allow_truncated: bool,
-) -> tuple[int, int, str | None]:
-    """Skip an unknown protobuf group while preserving parser bounds."""
-    group_stack = [start_field_number]
-
-    while group_stack:
-        if offset >= len(data):
-            if allow_truncated:
-                return len(data), fields_seen, None
-            return offset, fields_seen, f"truncated group field {start_field_number}"
-
-        if fields_seen >= max_fields:
-            return offset, fields_seen, f"field count exceeded limit ({max_fields})"
-
-        key_info = _read_varint(data, offset)
-        if key_info is None:
-            return offset, fields_seen, f"truncated or invalid field key in group field {start_field_number}"
-        key, offset = key_info
-        fields_seen += 1
-
-        field_number = key >> 3
-        wire_type = key & 0x07
-        if field_number <= 0:
-            return offset, fields_seen, "invalid field number 0"
-
-        if wire_type == 0:
-            value_info = _read_varint(data, offset)
-            if value_info is None:
-                if allow_truncated:
-                    return len(data), fields_seen, None
-                return offset, fields_seen, f"invalid varint value for field {field_number}"
-            _value, offset = value_info
-            continue
-
-        if wire_type in (1, 5):  # fixed64 or fixed32
-            width = 8 if wire_type == 1 else 4
-            end = offset + width
-            if end > len(data):
-                if allow_truncated:
-                    return len(data), fields_seen, None
-                return offset, fields_seen, f"truncated fixed{width * 8} field {field_number}"
-            offset = end
-            continue
-
-        if wire_type == 2:
-            length_info = _read_varint(data, offset)
-            if length_info is None:
-                if allow_truncated:
-                    return len(data), fields_seen, None
-                return offset, fields_seen, f"invalid length varint for field {field_number}"
-            declared_length, offset = length_info
-            end = offset + declared_length
-            if end > len(data):
-                if allow_truncated:
-                    return len(data), fields_seen, None
-                return offset, fields_seen, f"truncated length-delimited field {field_number}"
-            offset = end
-            continue
-
-        if wire_type == 3:
-            group_stack.append(field_number)
-            continue
-
-        if wire_type == 4:
-            if field_number != group_stack[-1]:
-                return offset, fields_seen, f"mismatched end group field {field_number}"
-            group_stack.pop()
-            continue
-
-        return offset, fields_seen, f"unsupported wire type {wire_type} for field {field_number}"
-
-    return offset, fields_seen, None
-
-
 def _parse_message(
     data: bytes,
     *,
     max_fields: int,
     allow_truncated: bool = False,
 ) -> tuple[list[_ProtoField], str | None]:
-    """Parse a protobuf message into raw fields.
+    """Parse bounded protobuf fields without loading a schema.
 
-    This parser is intentionally narrow and safe:
-    - bounded by `max_fields`
-    - no dynamic schema loading
-    - optional truncated handling for bounded prefix parsing
+    Unknown groups share the enclosing field budget. Track their nesting without
+    recursion and skip their values without copying them into the parsed message.
     """
     fields: list[_ProtoField] = []
+    groups: list[int] = []
     offset = 0
     fields_seen = 0
 
@@ -150,85 +74,62 @@ def _parse_message(
 
         key_info = _read_varint(data, offset)
         if key_info is None:
-            return fields, "truncated or invalid field key"
+            context = f" in group field {groups[0]}" if groups else ""
+            return fields, f"truncated or invalid field key{context}"
         key, offset = key_info
         fields_seen += 1
 
         field_number = key >> 3
         wire_type = key & 0x07
-        if field_number <= 0:
+        if field_number == 0:
             return fields, "invalid field number 0"
 
         if wire_type == 0:  # varint
             value_info = _read_varint(data, offset)
             if value_info is None:
+                if groups and allow_truncated:
+                    return fields, None
                 return fields, f"invalid varint value for field {field_number}"
             value, offset = value_info
-            fields.append(_ProtoField(field_number, wire_type, value))
-            continue
-
-        if wire_type in (1, 5):  # fixed64 or fixed32
+            if not groups:
+                fields.append(_ProtoField(field_number, wire_type, value))
+        elif wire_type in (1, 5):  # fixed64 or fixed32
             width = 8 if wire_type == 1 else 4
             end = offset + width
             if end > len(data):
                 if allow_truncated:
                     return fields, None
                 return fields, f"truncated fixed{width * 8} field {field_number}"
-            value = int.from_bytes(data[offset:end], "little")
+            if not groups:
+                value = int.from_bytes(data[offset:end], "little")
+                fields.append(_ProtoField(field_number, wire_type, value))
             offset = end
-            fields.append(_ProtoField(field_number, wire_type, value))
-            continue
-
-        if wire_type == 2:  # length-delimited
+        elif wire_type == 2:  # length-delimited
             length_info = _read_varint(data, offset)
             if length_info is None:
+                if groups and allow_truncated:
+                    return fields, None
                 return fields, f"invalid length varint for field {field_number}"
             declared_length, offset = length_info
             end = offset + declared_length
-
-            if end > len(data):
-                if allow_truncated:
-                    fields.append(
-                        _ProtoField(
-                            field_number,
-                            wire_type,
-                            data[offset:],
-                            declared_length=declared_length,
-                            truncated=True,
-                        )
-                    )
-                    return fields, None
+            truncated = end > len(data)
+            if truncated and not allow_truncated:
                 return fields, f"truncated length-delimited field {field_number}"
-
-            fields.append(
-                _ProtoField(
-                    field_number,
-                    wire_type,
-                    data[offset:end],
-                    declared_length=declared_length,
-                )
-            )
+            if not groups:
+                fields.append(_ProtoField(field_number, wire_type, data[offset:end], declared_length, truncated))
             offset = end
-            continue
+        elif wire_type == 3:
+            groups.append(field_number)
+        elif wire_type == 4:
+            if not groups:
+                return fields, f"unexpected end group field {field_number}"
+            if groups.pop() != field_number:
+                return fields, f"mismatched end group field {field_number}"
+        else:
+            return fields, f"unsupported wire type {wire_type} for field {field_number}"
 
-        if wire_type == 3:  # start group (deprecated but valid protobuf encoding)
-            offset, fields_seen, group_error = _skip_group(
-                data,
-                offset,
-                field_number,
-                max_fields=max_fields,
-                fields_seen=fields_seen,
-                allow_truncated=allow_truncated,
-            )
-            if group_error:
-                return fields, group_error
-            continue
-
-        if wire_type == 4:
-            return fields, f"unexpected end group field {field_number}"
-
-        return fields, f"unsupported wire type {wire_type} for field {field_number}"
-
+    if groups and not allow_truncated:
+        return fields, f"truncated group field {groups[0]}"
     return fields, None
 
 
@@ -260,48 +161,7 @@ class CoreMLScanner(BaseScanner):
     MAX_RECURSIVE_PROTOBUF_DEPTH: ClassVar[int] = 64
     _allow_truncated_field_parse = False
 
-    # CoreML model oneof fields from Model.proto
-    MODEL_TYPE_FIELDS: ClassVar[frozenset[int]] = frozenset(
-        {
-            200,
-            201,
-            202,
-            300,
-            301,
-            302,
-            303,
-            304,
-            400,
-            401,
-            402,
-            403,
-            404,
-            500,
-            501,
-            502,
-            555,
-            556,
-            560,
-            600,
-            601,
-            602,
-            603,
-            604,
-            606,
-            607,
-            609,
-            610,
-            900,
-            2000,
-            2001,
-            2002,
-            2003,
-            2004,
-            2005,
-            2006,
-            3000,
-        }
-    )
+    MODEL_TYPE_FIELDS: ClassVar[frozenset[int]] = _COREML_MODEL_TYPE_FIELDS
     NEURAL_NETWORK_FIELDS: ClassVar[frozenset[int]] = frozenset({303, 403, 500})
     CUSTOM_MODEL_FIELD: ClassVar[int] = 555
     LINKED_MODEL_FIELD: ClassVar[int] = 556
@@ -424,7 +284,7 @@ class CoreMLScanner(BaseScanner):
     @classmethod
     def _has_coreml_structure(cls, fields: list[_ProtoField]) -> bool:
         spec_version = _first_varint(fields, 1)
-        if spec_version is None or spec_version <= 0 or spec_version > 10000:
+        if spec_version is None or not 0 < spec_version <= _COREML_MAX_SPECIFICATION_VERSION:
             return False
 
         description_fields = _len_fields(fields, 2)
@@ -446,11 +306,13 @@ class CoreMLScanner(BaseScanner):
         if not isinstance(desc_message, bytes):
             return False
 
-        parsed_desc, desc_error = _parse_message(desc_message, max_fields=512, allow_truncated=True)
+        parsed_desc, desc_error = _parse_message(
+            desc_message, max_fields=_COREML_MAX_DESCRIPTION_PREFIX_FIELDS, allow_truncated=True
+        )
         if desc_error:
             return False
 
-        return any(field.field_number in {1, 10, 20, 21, 100} for field in parsed_desc)
+        return any(field.field_number in _COREML_DESCRIPTION_FIELD_HINTS for field in parsed_desc)
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
