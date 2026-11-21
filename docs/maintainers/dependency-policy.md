@@ -64,7 +64,7 @@ Before approving any new dependency:
 
 ```toml
 # Example: platform-agnostic extra with minimum pin
-"onnx>=1.14.0",
+"onnx>=1.23.2,<2.0",
 
 # Example: environment marker for Python-version split
 "numpy>=1.19.0,<2.0; python_version == '3.10'",

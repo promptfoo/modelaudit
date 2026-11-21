@@ -486,14 +486,17 @@ jobs:
       - *pin-matrix-python
 
       - name: Sync smoke dependencies
-        run: uv sync --locked --extra all-ci-windows ${{ matrix.python-version == '3.14' && '--extra h5' || '' }}
+        run: uv sync --locked --extra all-ci-windows --extra onnx ${{ matrix.python-version == '3.14' && '--extra h5' || '' }}
 
       - name: Verify H5 import
         if: matrix.python-version == '3.14'
         run: uv run --locked python -c "import h5py; print(h5py.version.info)"
 
       - name: Test runtime compatibility
-        run: uv run --locked pytest tests/test_python_compatibility.py -n 0 --tb=short
+        run: >-
+          uv run --locked pytest -n 0 --tb=short tests/test_python_compatibility.py
+          tests/scanners/test_onnx_scanner.py::test_onnx_scanner_reuses_raw_bytes_for_model_parse
+          tests/scanners/test_onnx_scanner.py::test_onnx_scanner_python_op
 
   slow-tests:
     name: Slow/Integration Tests (Python 3.12)

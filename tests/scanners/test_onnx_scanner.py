@@ -7,10 +7,11 @@ import struct
 import sys
 import time
 import tracemalloc
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from inspect import getclosurevars
 from pathlib import Path
-from types import SimpleNamespace
+from types import FrameType, SimpleNamespace
 from typing import Any, BinaryIO, ClassVar, cast
 
 import pytest
@@ -54,6 +55,24 @@ from tests.helpers import is_huggingface_rate_limit_error
 from tests.helpers.file_creators import _encode_protobuf_varint
 from tests.helpers.file_creators import write_binary_fixture as _write_onnx_payload
 
+_ONNX_SCANNER_GLOBALS = vars(onnx_scanner_module)
+
+
+@contextmanager
+def _profile_calls(callback: Callable[[FrameType, str, Any], None]) -> Iterator[None]:
+    previous = sys.getprofile()
+    try:
+        sys.setprofile(callback)
+        yield
+    finally:
+        sys.setprofile(previous)
+
+
+def _enable_opcode_events(frame: FrameType, trace: Callable[[FrameType, str, Any], Any]) -> None:
+    # CPython 3.13+ needs a local tracer when the flag is set to instrument the first call.
+    frame.f_trace = trace
+    frame.f_trace_opcodes = True
+
 
 def _fixture_raw_control_admission(model: Any, *, fixture_model: Any | None = None) -> Any:
     """Preflight an explicitly trusted test fixture without replacing its owners.
@@ -89,12 +108,16 @@ def _fixture_raw_control_admission(model: Any, *, fixture_model: Any | None = No
     )
 
 
-def _build_fixture_weight_plan(model: Any, *, fixture_model: Any | None = None, **kwargs: Any) -> Any:
+def _build_fixture_weight_plan(
+    model: Any, *, fixture_model: Any | None = None, max_array_size: int | None = None, **kwargs: Any
+) -> Any:
     """Analyze a trusted fixture with byte-derived, test-only admission."""
     if "raw_control_admission" in kwargs:
         raise TypeError("Use the production planner directly to test explicit or missing admission")
     admission = _fixture_raw_control_admission(model, fixture_model=fixture_model)
-    return onnx_scanner_module._build_onnx_weight_analysis_plan(model, raw_control_admission=admission, **kwargs)
+    return onnx_scanner_module._build_onnx_weight_analysis_plan(
+        model, onnx=onnx, np=np, max_array_size=max_array_size, raw_control_admission=admission, **kwargs
+    )
 
 
 @pytest.mark.parametrize("reshape_weight", [False, True])
@@ -122,7 +145,7 @@ def test_attention_matmul_distinguishes_shape_sources_from_weights(reshape_weigh
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, ["n", "m"])],
         initializer=initializers,
     )
-    plan = _build_fixture_weight_plan(_checked_onnx_model(graph), onnx=onnx, np=np, max_array_size=100_000)
+    plan = _build_fixture_weight_plan(_checked_onnx_model(graph), max_array_size=100_000)
 
     if reshape_weight:
         assert any(
@@ -5969,7 +5992,7 @@ class TestWeightDistributionSemantics:
                 raise AssertionError("Oversized broadcast must be rejected before preparing a view")
 
             monkeypatch.setattr(np, "broadcast_to", reject_broadcast)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=max_array_size)
+        plan = _build_fixture_weight_plan(model, max_array_size=max_array_size)
 
         assert plan.extraction_failures == 0
         path = _save_onnx_model(model, tmp_path / "expand-weight.onnx")
@@ -6789,11 +6812,8 @@ class TestWeightDistributionSemantics:
                 }
             )
 
-        sys.setprofile(profile)
-        try:
-            _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(None)
+        with _profile_calls(profile):
+            _build_fixture_weight_plan(model)
 
         root_return = next(
             event for event in events if event["graph"] == "loop_scan_exact_shape_only_for_proven_small_counts"
@@ -7641,16 +7661,8 @@ class TestWeightDistributionSemantics:
                     },
                 )
 
-        sys.setprofile(profile)
-        try:
-            plan = _build_fixture_weight_plan(
-                inferred,
-                onnx=onnx,
-                np=np,
-                max_array_size=None,
-            )
-        finally:
-            sys.setprofile(None)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(inferred)
 
         body_call = next(
             event for event in events if event["event"] == "call" and event["graph"] == "scan8_initializer_state_body"
@@ -9779,7 +9791,6 @@ class TestWeightDistributionSemantics:
         model = _checked_onnx_model(graph)
         path = _save_onnx_model(model, tmp_path / "retained-loop-reentry-liveness-chain.onnx")
 
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         retained_snapshot_entries = 0
         live_flag_counts: list[int] = []
 
@@ -9787,7 +9798,7 @@ class TestWeightDistributionSemantics:
             nonlocal retained_snapshot_entries
             if (
                 event != "return"
-                or Path(frame.f_code.co_filename).resolve() != scanner_path
+                or frame.f_globals is not _ONNX_SCANNER_GLOBALS
                 or frame.f_code.co_name != "subgraph_state_input_can_reach_weight_consumer"
             ):
                 return
@@ -9798,11 +9809,8 @@ class TestWeightDistributionSemantics:
             )
             live_flag_counts.append(len(frame.f_locals.get("node_output_is_live_after_node", {})))
 
-        sys.setprofile(profile)
-        try:
+        with _profile_calls(profile):
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.setprofile(None)
 
         coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
         semantics = result.metadata["onnx_weight_distribution_semantics"]
@@ -9860,25 +9868,21 @@ class TestWeightDistributionSemantics:
         model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         path = _save_onnx_model(model, tmp_path / "retained-loop-reentry-oversized-constant.onnx")
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         oversized_returns: list[Any] = []
 
         def profile(frame: Any, event: str, arg: Any) -> None:
             if (
                 event == "return"
                 and frame.f_code.co_name == "resolved_constant_node_tensor"
-                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and frame.f_globals is _ONNX_SCANNER_GLOBALS
             ):
                 node = frame.f_locals.get("node")
                 for attribute in getattr(node, "attribute", ()):
                     if attribute.name == "value_floats" and len(attribute.floats) > value_count - 1:
                         oversized_returns.append(arg)
 
-        sys.setprofile(profile)
-        try:
+        with _profile_calls(profile):
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.setprofile(None)
 
         assert "onnx_weight_distribution_semantics" in result.metadata
         assert oversized_returns
@@ -9941,22 +9945,18 @@ class TestWeightDistributionSemantics:
         )
         model = _checked_onnx_model(graph)
         path = _save_onnx_model(model, tmp_path / "exact-rank-replay-budget.onnx")
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         exact_replay_results: list[Any] = []
 
         def profile(frame: Any, event: str, arg: Any) -> None:
             if (
                 event == "return"
                 and frame.f_code.co_name == "exact_loop_repeated_state_weight_rank_bounds"
-                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and frame.f_globals is _ONNX_SCANNER_GLOBALS
             ):
                 exact_replay_results.append(arg)
 
-        sys.setprofile(profile)
-        try:
+        with _profile_calls(profile):
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.setprofile(None)
 
         coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
         semantics = result.metadata["onnx_weight_distribution_semantics"]
@@ -10128,8 +10128,6 @@ class TestWeightDistributionSemantics:
     def test_repeated_loop_nested_reentry_preserves_clean_context_when_bounding_work(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, promotion_budget: int
     ) -> None:
-        from types import FrameType
-
         # Keep dependency and constant inventories independent of nested replay.
         monkeypatch.setattr(onnx_scanner_module, "_ONNX_NESTED_PROMOTION_WORK_LIMIT", promotion_budget)
         source_names = [f"W{index}" for index in range(40)]
@@ -10205,7 +10203,6 @@ class TestWeightDistributionSemantics:
         onnx.checker.check_model(model, full_check=True)
         path = _save_onnx_model(model, tmp_path / "retained-loop-nested-clean-context.onnx")
 
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         work_by_context: dict[tuple[FrameType, str], int] = {}
         calls_by_context: dict[FrameType, dict[str, list[str]]] = {}
         clean_contexts: dict[FrameType, list[dict[str, tuple[int, ...]]]] = {}
@@ -10214,7 +10211,7 @@ class TestWeightDistributionSemantics:
             if (
                 event != "call"
                 or frame.f_code.co_name != "subgraph_reenters_state_with_rank_promotion"
-                or Path(frame.f_code.co_filename).resolve() != scanner_path
+                or frame.f_globals is not _ONNX_SCANNER_GLOBALS
                 or frame.f_back is None
                 or frame.f_back.f_code.co_name != frame.f_code.co_name
             ):
@@ -10230,11 +10227,8 @@ class TestWeightDistributionSemantics:
             if graph_name == "nested_clean_context_then_branch":
                 clean_contexts.setdefault(owner, []).append(dict(frame.f_locals["trusted_context_shapes"]))
 
-        sys.setprofile(profile)
-        try:
+        with _profile_calls(profile):
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.setprofile(None)
 
         coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
         semantics = result.metadata["onnx_weight_distribution_semantics"]
@@ -10310,7 +10304,6 @@ class TestWeightDistributionSemantics:
         model = _checked_onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         path = _save_onnx_model(model, tmp_path / "retained-loop-nested-dead-output-rank-work.onnx")
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         nested_promotion_calls = 0
 
         def profile(frame: Any, event: str, _arg: Any) -> None:
@@ -10318,16 +10311,13 @@ class TestWeightDistributionSemantics:
             if (
                 event == "call"
                 and frame.f_code.co_name == "subgraph_reenters_state_with_rank_promotion"
-                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and frame.f_globals is _ONNX_SCANNER_GLOBALS
                 and getattr(frame.f_locals.get("subgraph"), "name", "") == "nested_dead_output_branch"
             ):
                 nested_promotion_calls += 1
 
-        sys.setprofile(profile)
-        try:
+        with _profile_calls(profile):
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.setprofile(None)
 
         coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
         semantics = result.metadata["onnx_weight_distribution_semantics"]
@@ -12522,7 +12512,6 @@ class TestWeightDistributionSemantics:
         model.ir_version = 8
         onnx.checker.check_model(model, full_check=True)
         path = _save_onnx_model(model, tmp_path / "output-dead-clean-nested-capture.onnx")
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         clean_capture_reference_calls = 0
 
         def profile(frame: Any, event: str, _arg: Any) -> None:
@@ -12530,16 +12519,13 @@ class TestWeightDistributionSemantics:
             if (
                 event == "return"
                 and frame.f_code.co_name == "graph_external_reference_names"
-                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and frame.f_globals is _ONNX_SCANNER_GLOBALS
                 and getattr(frame.f_locals.get("graph"), "name", "").startswith("nested_clean_capture_")
             ):
                 clean_capture_reference_calls += 1
 
-        sys.setprofile(profile)
-        try:
+        with _profile_calls(profile):
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.setprofile(None)
 
         coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
         semantics = result.metadata["onnx_weight_distribution_semantics"]
@@ -12614,24 +12600,20 @@ class TestWeightDistributionSemantics:
         model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         path = _save_onnx_model(model, tmp_path / "live-producer-dependency-bound.onnx")
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         shared_dependency_results: list[frozenset[str]] = []
 
         def profile(frame: Any, event: str, arg: Any) -> None:
             if (
                 event == "return"
                 and frame.f_code.co_name == "graph_node_direct_dependency_names"
-                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and frame.f_globals is _ONNX_SCANNER_GLOBALS
                 and getattr(frame.f_locals.get("node"), "name", "") == "shared_clean_inputs"
                 and isinstance(arg, frozenset)
             ):
                 shared_dependency_results.append(arg)
 
-        sys.setprofile(profile)
-        try:
+        with _profile_calls(profile):
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.setprofile(None)
 
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert result.success is True
@@ -17388,7 +17370,6 @@ class TestWeightDistributionSemantics:
             distinct_cache_tags=distinct_cache_tags,
             use_cache_tag_value=False,
         )
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         function_node_visits = 0
 
         def profile(frame: Any, event: str, arg: Any) -> None:
@@ -17396,16 +17377,13 @@ class TestWeightDistributionSemantics:
             if (
                 event == "return"
                 and frame.f_code.co_name == "graph_tainted_output_indexes"
-                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and frame.f_globals is _ONNX_SCANNER_GLOBALS
                 and "body_node" in frame.f_locals
             ):
                 function_node_visits += len(frame.f_locals["subgraph"].node)
 
-        try:
-            sys.setprofile(profile)
+        with _profile_calls(profile):
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.setprofile(None)
 
         assert result.success is True
         assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
@@ -17491,7 +17469,6 @@ class TestWeightDistributionSemantics:
     def test_repeated_local_function_alias_taint_is_grouped(self, tmp_path: Path) -> None:
         width = 16
         path = self._write_repeated_local_function_alias_model(tmp_path, width=width, matrix_output=False)
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         fanout_taint_walks = 0
         fanout_taint_node_visits = 0
         fanout_promotion_calls = 0
@@ -17499,7 +17476,7 @@ class TestWeightDistributionSemantics:
 
         def profile(frame: Any, event: str, arg: Any) -> None:
             nonlocal fanout_taint_node_visits, fanout_taint_walks, fanout_promotion_calls
-            if Path(frame.f_code.co_filename).resolve() != scanner_path:
+            if frame.f_globals is not _ONNX_SCANNER_GLOBALS:
                 return
             if getattr(frame.f_locals.get("subgraph"), "name", "") != "Fanout":
                 return
@@ -17512,11 +17489,8 @@ class TestWeightDistributionSemantics:
             elif frame.f_code.co_name == "subgraph_reenters_state_with_rank_promotion" and event == "call":
                 fanout_promotion_calls += 1
 
-        try:
-            sys.setprofile(profile)
+        with _profile_calls(profile):
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.setprofile(None)
 
         assert result.success is True
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
@@ -17582,7 +17556,6 @@ class TestWeightDistributionSemantics:
             matrix_output=False,
             shared_dependency=True,
         )
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         single_output_dependency_calls = 0
         grouped_dependency_calls = 0
         fanout_promotion_calls = 0
@@ -17591,7 +17564,7 @@ class TestWeightDistributionSemantics:
         def profile(frame: Any, event: str, arg: Any) -> None:
             nonlocal single_output_dependency_calls, grouped_dependency_calls, fanout_promotion_calls
             nonlocal producer_index_builds
-            if Path(frame.f_code.co_filename).resolve() != scanner_path:
+            if frame.f_globals is not _ONNX_SCANNER_GLOBALS:
                 return
             if getattr(frame.f_locals.get("subgraph"), "name", "") != "Fanout":
                 return
@@ -17609,11 +17582,8 @@ class TestWeightDistributionSemantics:
             elif frame.f_code.co_name == "subgraph_reenters_state_with_rank_promotion" and event == "call":
                 fanout_promotion_calls += 1
 
-        try:
-            sys.setprofile(profile)
+        with _profile_calls(profile):
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.setprofile(None)
 
         assert result.success is True
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
@@ -17824,7 +17794,7 @@ class TestWeightDistributionSemantics:
             if (
                 event == "return"
                 and isinstance(arg, bool)
-                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and frame.f_globals is _ONNX_SCANNER_GLOBALS
                 and frame.f_code.co_name == "<genexpr>"
                 and frame.f_code.co_firstlineno in generator_lines
             ):
@@ -17835,11 +17805,8 @@ class TestWeightDistributionSemantics:
 
         monkeypatch.setattr(onnx_scanner_module, "_onnx_potential_weight_input", counting_potential_weight_input)
 
-        sys.setprofile(count_dead_input_predicate_work)
-        try:
+        with _profile_calls(count_dead_input_predicate_work):
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.setprofile(None)
 
         assert result.success is True
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
@@ -18337,23 +18304,19 @@ class TestWeightDistributionSemantics:
     def test_trusted_context_shape_keys_are_scoped_to_dependencies(self, tmp_path: Path) -> None:
         width = 32
         path = self._write_context_prefix_loop_model(tmp_path, width=width)
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         shape_key_lengths: list[int] = []
 
         def profile(frame: Any, event: str, arg: Any) -> None:
             if (
                 event == "return"
                 and frame.f_code.co_name == "trusted_context_shape_cache_key"
-                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and frame.f_globals is _ONNX_SCANNER_GLOBALS
                 and isinstance(arg, tuple)
             ):
                 shape_key_lengths.append(len(arg))
 
-        try:
-            sys.setprofile(profile)
+        with _profile_calls(profile):
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.setprofile(None)
 
         assert result.success is True
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
@@ -18370,13 +18333,9 @@ class TestWeightDistributionSemantics:
                 use_cache_tag_value=True,
             )
             observed = _OnnxFingerprintObserver()
-            previous_profile = sys.getprofile()
-            try:
-                sys.setprofile(observed.profile)
+            with _profile_calls(observed.profile):
                 observed.calibrate()
                 result = OnnxScanner().scan(str(path))
-            finally:
-                sys.setprofile(previous_profile)
 
             assert result.success is True, result.metadata
             assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
@@ -18411,9 +18370,7 @@ class TestWeightDistributionSemantics:
         equal_attribute = onnx.AttributeProto()
         equal_attribute.CopyFrom(first_attribute)
         sentinel = _OnnxFingerprintPayloadSentinel(accesses)
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(observed.profile)
+        with _profile_calls(observed.profile):
             observed.calibrate()
             result = OnnxScanner().scan(str(path))
             # Establish nonvacuous PUBLIC-route observation before direct probes.
@@ -18428,8 +18385,6 @@ class TestWeightDistributionSemantics:
             attribute_token = observed.fingerprint(first_attribute, retain_owner=True)
             repeated_attribute_token = observed.fingerprint(first_attribute, retain_owner=True)
             distinct_attribute_token = observed.fingerprint(equal_attribute, retain_owner=True)
-        finally:
-            sys.setprofile(previous_profile)
 
         assert result.success is True
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
@@ -18652,65 +18607,31 @@ class TestWeightDistributionSemantics:
         model = _onnx_model(graph)
         onnx.checker.check_model(model, full_check=True)
         path = _save_onnx_model(model, tmp_path / "dead-wide-reentry.onnx")
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
-        comprehension_fields: dict[int, str] = {}
-        for syntax_node in ast.walk(ast.parse(scanner_path.read_text())):
-            if not isinstance(syntax_node, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
-                continue
-            fields: set[str] = set()
-            for child in ast.walk(syntax_node):
-                if (
-                    isinstance(child, ast.Call)
-                    and isinstance(child.func, ast.Name)
-                    and child.func.id == "getattr"
-                    and len(child.args) > 1
-                    and isinstance(child.args[1], ast.Constant)
-                    and child.args[1].value in {"input", "output"}
-                ):
-                    fields.add(str(child.args[1].value))
-            if len(fields) == 1:
-                comprehension_fields[syntax_node.lineno] = next(iter(fields))
-        traced_helpers = {
+        inspected_helpers = {
             "subgraph_analysis_work_exceeds_limit",
             "subgraph_reenters_state_with_rank_promotion",
             "subgraph_state_input_can_reach_weight_consumer",
         }
-        last_line_by_frame: dict[int, int | None] = {}
-        dead_edge_walks: dict[str, int] = {}
+        reads: set[tuple[str, str]] = set()
 
-        def profile(frame: Any, event: str, arg: Any) -> None:
-            if frame.f_code.co_name not in traced_helpers or Path(frame.f_code.co_filename).resolve() != scanner_path:
-                return
-            frame_id = id(frame)
-            if event == "call":
-                last_line_by_frame[frame_id] = None
-                return
-            if event == "return":
-                last_line_by_frame.pop(frame_id, None)
-                return
-            if (
-                event != "line"
-                or frame.f_lineno not in comprehension_fields
-                or last_line_by_frame.get(frame_id) == frame.f_lineno
-            ):
-                return
-            last_line_by_frame[frame_id] = frame.f_lineno
-            body_node = frame.f_locals.get("body_node", frame.f_locals.get("node"))
-            if not str(getattr(body_node, "name", "")).startswith("dead_"):
-                return
-            field = comprehension_fields[frame.f_lineno]
-            key = f"{frame.f_code.co_name}:{getattr(body_node, 'name', '')}:{field}"
-            dead_edge_walks[key] = dead_edge_walks.get(key, 0) + len(getattr(body_node, field, ()))
+        def observed_getattr(owner: Any, field: str, *default: Any) -> Any:
+            if field in {"input", "output"} and isinstance(owner, onnx.NodeProto):
+                caller = sys._getframe(1)
+                # Attribute the read to the helper running the comprehension.
+                while caller.f_code.co_name in {"<genexpr>", "<listcomp>", "<setcomp>"} and caller.f_back is not None:
+                    caller = caller.f_back
+                if caller.f_code.co_name in inspected_helpers:
+                    reads.add((owner.name, field))
+            return getattr(owner, field, *default)
 
-        try:
-            sys.settrace(profile)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(onnx_scanner_module, "getattr", observed_getattr, raising=False)
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.settrace(None)
 
         assert result.success is True
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
-        assert dead_edge_walks == {}
+        assert {field for _, field in reads} == {"input", "output"}
+        assert not any(name.startswith("dead_") for name, _ in reads), reads
 
     def test_local_function_scan_preserves_proven_input_extent(self, tmp_path: Path) -> None:
         source_names = [f"matrix{index}" for index in range(40)]
@@ -21201,12 +21122,8 @@ class TestOnnxReviewShapeRegressions:
             ):
                 root_shapes.update(frame.f_locals["known_value_shapes"])
 
-        previous_profile = sys.getprofile()
-        sys.setprofile(profile)
-        try:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model)
 
         # Scan-8 pads outputs to the input extent even if its body executes zero times.
         assert root_shapes["padded"] == (1, extent, 1)
@@ -21318,12 +21235,8 @@ class TestOnnxReviewShapeRegressions:
                 replay_node_visits += len(frame.f_locals["current_graph"].node)
                 assert replay_node_visits <= work_limit, (replay_calls, replay_node_visits)
 
-        previous_profile = sys.getprofile()
-        sys.setprofile(profile)
-        try:
-            _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(profile):
+            _build_fixture_weight_plan(model)
 
         # Count complete traversals, including siblings with no live weight edges.
         assert replay_calls <= state_count + work_limit // len(body_nodes)
@@ -21464,8 +21377,6 @@ class TestOnnxFinalReviewRegressions:
     def test_loop_scalar_control_storage_is_bounded_before_to_array(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: str
     ) -> None:
-        from types import FrameType
-
         source_names = [f"W{index}" for index in range(40)]
         body = helper.make_graph(
             [
@@ -21528,12 +21439,8 @@ class TestOnnxFinalReviewRegressions:
                 scalar_proofs.append((value, len(frame.f_locals.get("raw_data", b""))))
 
         monkeypatch.setattr(onnx.numpy_helper, "to_array", track_to_array)
-        previous_profile = sys.getprofile()
-        sys.setprofile(track_scalar_proof)
-        try:
+        with _profile_calls(track_scalar_proof):
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.setprofile(previous_profile)
         assert scalar_materializations == 0
         assert scalar_proofs
         if storage == "valid":
@@ -21619,7 +21526,7 @@ class TestOnnxFinalReviewRegressions:
                     yield child
 
         monkeypatch.setattr(onnx_scanner_module, "_iter_attribute_graphs", counted_attribute_graphs)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert enumerations
         assert enumerations.get("subgraph_analysis_work_exceeds_limit", 0) <= 1, enumerations
         assert sum(enumerations.values()) <= 16, enumerations
@@ -21792,14 +21699,10 @@ class TestOnnxFinalReviewRegressions:
                 and frame.f_code.co_name == "_build_onnx_weight_analysis_plan"
                 and frame.f_code.co_filename == onnx_scanner_module.__file__
             ):
-                record_retained_mappings(frame.f_locals, set())
+                record_retained_mappings(dict(frame.f_locals), set())
 
-        previous_profile = sys.getprofile()
-        sys.setprofile(profile)
-        try:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model)
         assert retained_mapping_sizes
         assert sum(retained_mapping_sizes.values()) <= 4 * (constant_count + 2), retained_mapping_sizes
         assert plan.coverage_gaps == {}
@@ -24249,12 +24152,8 @@ class TestOnnxProofReviewRegressions:
                 if arg is None:
                     binding_work["refusals"] += 1
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(count_work)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(count_work):
+            plan = _build_fixture_weight_plan(model)
         # Permit linear graph setup in addition to one shared recurrence-work budget.
         assert counts["graph_output_dependency_names"] <= 8 * width + 4096, counts
         assert counts["subgraph_state_input_can_reach_weight_consumer"] <= 4096, counts
@@ -24353,12 +24252,8 @@ class TestOnnxProofReviewRegressions:
             ):
                 fallback_node_reads += 1
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(count_fallback_reads)
+        with _profile_calls(count_fallback_reads):
             result = OnnxScanner().scan(str(path))
-        finally:
-            sys.setprofile(previous_profile)
         assert fallback_node_reads <= 2 * len(body.node), fallback_node_reads
         assert result.success is True
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
@@ -24426,7 +24321,7 @@ class TestOnnxTransferReviewRegressions:
         stacked = next(value for value in inferred.graph.value_info if value.name == "stacked")
         assert len(stacked.type.tensor_type.shape.dim) == source_rank + 1
         assert tuple(dim.dim_value for dim in stacked.type.tensor_type.shape.dim[1:]) == weights.shape
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.extraction_failures == 0
         assert plan.coverage_gaps == {}
         assert plan.analyzed_initializer_count == 1
@@ -24445,7 +24340,7 @@ class TestOnnxTransferReviewRegressions:
 
             with monkeypatch.context() as scoped:
                 scoped.setattr(onnx.numpy_helper, "to_array", observe_materialization)
-                limited = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=16)
+                limited = _build_fixture_weight_plan(model, max_array_size=16)
             assert limited.oversized_initializers_skipped == 1
             assert limited.specs == []
             assert "W" not in materialized
@@ -24803,12 +24698,8 @@ class TestOnnxTransferReviewRegressions:
                 if node is not None and node.output and "_dead" in node.output[0]:
                     dead_node_reads += 1
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(count_dead_reads)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(count_dead_reads):
+            plan = _build_fixture_weight_plan(model)
         # Permit a constant number of reads per dead node, independent of sibling count.
         assert dead_node_reads <= 8 * dead_count, dead_node_reads
         assert plan.coverage_gaps == {}
@@ -24938,7 +24829,7 @@ class TestOnnxRecurrenceReviewRegressions:
             body_runtime: Any = ReferenceEvaluator(body, opsets={"": 18})
             slices = [body_runtime.run(None, {"element": np.array(1, dtype=np.float32)})[0] for _ in range(iterations)]
             np.testing.assert_array_equal(np.stack(slices, axis=axis), stacked)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.extraction_failures == 0
         assert plan.coverage_gaps == {}
         assert plan.analyzed_initializer_count == 1
@@ -24956,7 +24847,7 @@ class TestOnnxRecurrenceReviewRegressions:
 
             with monkeypatch.context() as scoped:
                 scoped.setattr(onnx.numpy_helper, "to_array", observe_materialization)
-                limited = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=16)
+                limited = _build_fixture_weight_plan(model, max_array_size=16)
             assert limited.oversized_initializers_skipped == 1
             assert limited.specs == []
             assert "W" not in materialized
@@ -25286,12 +25177,8 @@ class TestOnnxRecurrenceReviewRegressions:
             ):
                 contexts[id(arg)] = arg
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(count_context_entries)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(count_context_entries):
+            plan = _build_fixture_weight_plan(model)
         # Count distinct allocations while permitting reuse of an immutable context.
         returned_entries = sum(len(context) for context in contexts.values())
         assert returned_entries <= 4 * constant_count + 4096, returned_entries
@@ -25495,7 +25382,7 @@ class TestOnnxViewProofReviewRegressions:
         else:
             runtime: Any = ReferenceEvaluator(model).run(None, {"X": x}, intermediate=True)
             np.testing.assert_array_equal(runtime["stack"], expected)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.extraction_failures == 0
         if changing and iterations > 1:
             TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
@@ -25544,7 +25431,7 @@ class TestOnnxViewProofReviewRegressions:
         if overridable:
             TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
         else:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+            plan = _build_fixture_weight_plan(model)
             assert len(plan.specs) == 1
             np.testing.assert_array_equal(plan.specs[0].weights, [[1, 2]] * 3)
             TestOnnxReviewShapeRegressions._assert_clean(path)
@@ -25581,7 +25468,7 @@ class TestOnnxViewProofReviewRegressions:
             None, ...
         ]
         np.testing.assert_array_equal(actual_stack, [[[1, 2]] * 3])
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.extraction_failures == 1
         assert plan.specs == []
         assert plan.coverage_gaps == {}
@@ -25644,12 +25531,8 @@ class TestOnnxViewProofReviewRegressions:
                     len(names) for names in frame.f_locals.get("graph_output_dependency_cache", {}).values()
                 )
 
-        previous = sys.getprofile()
-        sys.setprofile(profile)
-        try:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model)
         assert counts["returned_names"] <= 4096 + width
         assert counts["retained_names"] <= 4096 + width
         assert plan.specs == []
@@ -25690,7 +25573,7 @@ class TestOnnxViewProofReviewRegressions:
             None, {"X": np.ones((1, 200), np.float32), "X2": np.ones((1, 100), np.float32)}
         )
         assert runtime[1][0, 0, 0] == (50 if extreme else 0)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.extraction_failures == 1
         assert plan.analyzed_initializer_count == 1
         assert len(plan.specs) == 1
@@ -25752,7 +25635,7 @@ class TestOnnxViewProofReviewRegressions:
         if changing:
             TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
         else:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+            plan = _build_fixture_weight_plan(model)
             assert len(plan.specs) == 1
             np.testing.assert_array_equal(plan.specs[0].weights, expected.T)
             TestOnnxReviewShapeRegressions._assert_clean(path)
@@ -25799,7 +25682,7 @@ class TestOnnxViewProofReviewRegressions:
         if changes_values:
             TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
         else:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+            plan = _build_fixture_weight_plan(model)
             assert len(plan.specs) == 1
             np.testing.assert_array_equal(plan.specs[0].weights, weights)
             TestOnnxReviewShapeRegressions._assert_clean(path)
@@ -25877,7 +25760,7 @@ class TestOnnxOutputInvarianceReviewRegressions:
         if count > 1 and update in {"transpose", "transpose_expand"}:
             TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
         else:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+            plan = _build_fixture_weight_plan(model)
             assert plan.coverage_gaps == {}
             assert plan.extraction_failures == 0
             assert len(plan.specs) == 1
@@ -25919,7 +25802,7 @@ class TestOnnxOutputInvarianceReviewRegressions:
         )
         actual = np.stack([runtime[0]], axis=axis)
         np.testing.assert_array_equal(actual, np.expand_dims(weights, axis))
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert plan.extraction_failures == 0
         assert len(plan.specs) == 1
@@ -26097,9 +25980,6 @@ class TestOnnxOutputInvarianceReviewRegressions:
         )
         plan = _build_fixture_weight_plan(
             model,
-            onnx=onnx,
-            np=np,
-            max_array_size=None,
             pre_materialization_check=lambda _tensor, name, size: analyzer._tensor_fits_budget(
                 "onnx_initializer_size_limit", name, tensor_nbytes=size
             ),
@@ -26166,7 +26046,7 @@ class TestOnnxOutputInvarianceReviewRegressions:
 
         monkeypatch.setattr(np, "reshape", require_no_copy)
         monkeypatch.setattr(onnx.numpy_helper, "to_array", record_original)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert calls == 1
         assert plan.extraction_failures == 0
         assert len(plan.specs) == 1
@@ -26215,9 +26095,6 @@ class TestOnnxOutputInvarianceReviewRegressions:
         )
         plan = _build_fixture_weight_plan(
             model,
-            onnx=onnx,
-            np=np,
-            max_array_size=None,
             pre_materialization_check=lambda _tensor, name, size: analyzer._tensor_fits_budget(
                 "onnx_initializer_size_limit", name, tensor_nbytes=size
             ),
@@ -26267,8 +26144,6 @@ class TestOnnxPerViewBudgetRegressions:
         analyzer = WeightDistributionScanner({"max_array_size": 20000, "max_weight_distribution_total_bytes": limit})
         plan = _build_fixture_weight_plan(
             model,
-            onnx=onnx,
-            np=np,
             max_array_size=20000,
             pre_materialization_check=lambda _tensor, name, size: analyzer._tensor_fits_budget(
                 "onnx_initializer_size_limit", name, tensor_nbytes=size
@@ -26446,7 +26321,7 @@ class TestOnnxRecurrentConsumerReviewRegressions:
         assert bool(analyzer._analyze_tensor_weight_extremes("later", expected_weights[-1], output_axes=(1,))) is (
             count == 2 and update != "identity"
         )
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         incomplete = count == 2 and update != "identity"
         assert bool(plan.coverage_gaps) is incomplete
         result = OnnxScanner().scan(str(path))
@@ -26517,7 +26392,7 @@ class TestOnnxRecurrentConsumerReviewRegressions:
             actual.reshape(2, 1, 2) if consumer == "body" else actual,
             np.stack([expected] * 2) if consumer == "body" else expected,
         )
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert len(plan.specs) == 1
         np.testing.assert_array_equal(plan.specs[0].weights, weights)
@@ -26565,7 +26440,7 @@ class TestOnnxRecurrentConsumerReviewRegressions:
         expected = np.ones((1, 2), np.float32) @ (weights.T if iterations == 1 else weights)
         if consumer == "final":
             np.testing.assert_array_equal(actual, expected)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert bool(plan.coverage_gaps) is (iterations != 1)
         result = OnnxScanner().scan(str(path))
         assert result.success is (iterations == 1)
@@ -26684,7 +26559,7 @@ class TestOnnxRecurrentConsumerReviewRegressions:
             )
             is changing
         )
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert bool(plan.coverage_gaps) is changing
         result = OnnxScanner().scan(str(path))
         assert result.success is not changing
@@ -26808,7 +26683,7 @@ class TestOnnxScanInputReviewRegressions:
         )
         actual_stack = np.stack([runtime[0]], axis=output_axis)
         assert list(actual_stack.shape) == stacked_shape
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert plan.extraction_failures == 0
         assert len(plan.specs) == 1
@@ -26878,7 +26753,7 @@ class TestOnnxScanInputReviewRegressions:
         assert actual[0][-1, 0, 0] == (50 if changing and count == 2 else 10)
         assert WeightDistributionScanner()._analyze_tensor_weight_extremes("later", weights.T, output_axes=(1,))
         incomplete = changing and count == 2
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert bool(plan.coverage_gaps) is incomplete
         result = OnnxScanner().scan(str(path))
         assert result.success is not incomplete
@@ -26919,12 +26794,8 @@ class TestOnnxScanInputReviewRegressions:
                 shape_calls += 1
                 assert shape_calls <= 8 * count
 
-        previous_profile = sys.getprofile()
-        sys.setprofile(count_shapes)
-        try:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(count_shapes):
+            plan = _build_fixture_weight_plan(model)
         assert 0 < shape_calls <= 8 * count
         assert plan.coverage_gaps == {}
 
@@ -26975,7 +26846,7 @@ class TestOnnxScan8BudgetReviewRegressions:
         actual = actual_stack.transpose(0, 1, 3, 2) if consumer == "Transpose" else actual_stack.reshape(8, 3)
         assert actual.nbytes == 96
         assert actual.shape == ((1, 4, 3, 2) if consumer == "Transpose" else (8, 3))
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=24)
+        plan = _build_fixture_weight_plan(model, max_array_size=24)
         assert plan.specs == []
         assert plan.extraction_failures or plan.oversized_initializers_skipped or plan.coverage_gaps
         result = OnnxScanner({"max_array_size": 24}).scan(str(path))
@@ -27017,7 +26888,7 @@ class TestOnnxScan8BudgetReviewRegressions:
         analyzer = WeightDistributionScanner()
         expected_anomalies = analyzer._analyze_tensor_weight_extremes("actual", actual, output_axes=(0, 2))
         assert bool(expected_anomalies) is not transpose
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         if plan.specs:
             assert bool(analyzer._analyze_onnx_weight_specs(plan.specs)) is not transpose
         else:
@@ -27118,7 +26989,7 @@ class TestOnnxScan8BudgetReviewRegressions:
             np.testing.assert_array_equal(actual[1], np.broadcast_to(weights.sum(axis=0), (2, 1, 4)))
         if matrix_consumer:
             np.testing.assert_array_equal(actual[-1], np.stack([weights.sum(axis=0), weights.sum(axis=1)])[:, None, :])
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert bool(plan.coverage_gaps) is matrix_consumer
         result = OnnxScanner().scan(str(path))
         assert result.success is not matrix_consumer
@@ -27153,7 +27024,7 @@ class TestOnnxScan8BudgetReviewRegressions:
         actual = np.stack([actual_body[0]] * 4)[None, ...].reshape(12, 2)
         np.testing.assert_array_equal(actual, np.tile(weights.T, (4, 1)))
         monkeypatch.setattr(onnx_scanner_module, "_ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT", limit)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.specs == []
         assert plan.coverage_gaps or plan.extraction_failures
         result = OnnxScanner().scan(str(path))
@@ -27194,7 +27065,7 @@ class TestOnnxFinalShapeReviewRegressions:
             return original(weights, *args, **kwargs)
 
         monkeypatch.setattr(np.linalg, "norm", bounded_norm)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=1024)
+        plan = _build_fixture_weight_plan(model, max_array_size=1024)
         result = OnnxScanner({"max_array_size": 1024, "max_weight_distribution_total_bytes": 1024}).scan(str(path))
         assert reduced == []
         assert all(spec.weights.size > 0 for spec in plan.specs)
@@ -27379,7 +27250,7 @@ class TestOnnxFinalShapeReviewRegressions:
         else:
             actual = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 64), np.float32)})
             np.testing.assert_array_equal(actual[0], np.ones((1, 64), np.float32) @ weights)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert plan.specs
         result = OnnxScanner().scan(str(path))
@@ -27433,12 +27304,8 @@ class TestOnnxFinalShapeReviewRegressions:
             ):
                 visits += 1
 
-        previous_profile = sys.getprofile()
-        sys.setprofile(count_visits)
-        try:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(count_visits):
+            plan = _build_fixture_weight_plan(model)
         assert 0 < visits <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
         assert plan.specs
         assert not WeightDistributionScanner()._analyze_onnx_weight_specs(plan.specs)
@@ -27686,7 +27553,7 @@ class TestOnnxSiblingClosureReviewRegressions:
             "actual", actual, output_axes=(0, 2)
         )
         assert bool(expected_anomalies) is extreme
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         if transposes == 31:
             assert plan.specs == []
@@ -27776,12 +27643,8 @@ class TestOnnxInferredShapeBounds:
             if event == "return" and frame.f_code.co_name == "walk_graph":
                 shapes.update(frame.f_locals.get("known_value_shapes", {}))
 
-        previous = sys.getprofile()
-        sys.setprofile(profile)
-        try:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=1024)
-        finally:
-            sys.setprofile(previous)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model, max_array_size=1024)
         return plan, shapes
 
     @pytest.mark.parametrize("literal", [False, True])
@@ -28150,12 +28013,8 @@ class TestOnnxShapeContinuity:
             if event == "return" and frame.f_code.co_name == "walk_graph":
                 observed_ranks.extend(frame.f_locals.get("known_value_ranks", {}).values())
 
-        prior = sys.getprofile()
-        sys.setprofile(profile)
-        try:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=1024)
-        finally:
-            sys.setprofile(prior)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model, max_array_size=1024)
         assert max(observed_ranks, default=0) <= 64
         assert max(range_sizes, default=0) <= 64
         result = OnnxScanner().scan(str(path))
@@ -28272,7 +28131,7 @@ class TestOnnxShapeContinuity:
         )
         path, model = TestOnnxInferredShapeBounds._save(graph, tmp_path)
         monkeypatch.setattr(onnx_scanner_module, "_ONNX_INFERRED_SHAPE_DIMENSION_LIMIT", 128)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=1024)
+        plan = _build_fixture_weight_plan(model, max_array_size=1024)
         assert "inferred_shape_dimension_limit" in plan.coverage_gaps
         result = OnnxScanner().scan(str(path))
         assert result.success is False
@@ -28401,12 +28260,8 @@ class TestOnnxRankCacheBounds:
                 if arg is None:
                     observed["refusals"] += 1
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(count_binding_work)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(count_binding_work):
+            plan = _build_fixture_weight_plan(model)
         assert observed["fingerprint_calls"] <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
         admitted_binding_work = observed["lookups"] + observed["fingerprints"]
         assert admitted_binding_work <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
@@ -28487,7 +28342,7 @@ class TestOnnxRankCacheBounds:
             {"runtime": np.ones([4] * rank, np.float32), "X": np.ones((1, contracted_extent), np.float32)},
         )
         np.testing.assert_array_equal(actual[0], np.full((1, 4) if final_rank == 2 else (1,), 2 * contracted_extent))
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert bool(plan.coverage_gaps) is (final_rank == 2)
         result = OnnxScanner().scan(str(path))
         assert result.success is (final_rank == 1)
@@ -28527,7 +28382,7 @@ class TestOnnxRelevantBindingBudgets:
         actual: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 2), np.float32)})
         np.testing.assert_array_equal(actual[0], [1, 2])
         with cProfile.Profile() as profile:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+            plan = _build_fixture_weight_plan(model)
         fingerprint_calls = sum(
             entry.callcount
             for entry in profile.getstats()
@@ -28620,7 +28475,7 @@ class TestOnnxBindingAndTerminationProofs:
             )
             assert bool(body_result[0]) is False
             np.testing.assert_array_equal(body_result[2], weights)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         if overridable:
             assert plan.coverage_gaps
@@ -28721,7 +28576,7 @@ class TestOnnxBindingAndTerminationProofs:
         if work_limit is not None:
             monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", work_limit)
         with cProfile.Profile() as profile:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+            plan = _build_fixture_weight_plan(model)
         calls = sum(
             entry.callcount
             for entry in profile.getstats()
@@ -28742,9 +28597,6 @@ class TestOnnxBindingAndTerminationProofs:
     def test_exhausted_attribute_proofs_stop_work_and_keep_independent_findings(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, width: int
     ) -> None:
-        import sys
-        from types import FrameType
-
         from onnx.reference import ReferenceEvaluator
 
         model = self._attribute_loop_model(width, 16, 16)
@@ -28774,12 +28626,8 @@ class TestOnnxBindingAndTerminationProofs:
             ):
                 node_visits += len(frame.f_locals["graph"].node)
 
-        prior_profile = sys.getprofile()
-        sys.setprofile(profile)
-        try:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(prior_profile)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model)
         assert node_visits <= 4 * (width + 16)
         assert plan.coverage_gaps["attribute_binding_work_limit"] == 1
         assert len(plan.specs) == 1
@@ -28906,7 +28754,7 @@ class TestOnnxLoopControlProofs:
             None, {"X": np.ones((1, expected.shape[0]), np.float32)}
         )
         np.testing.assert_array_equal(actual[1], expected)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         if stop:
             # Repeated transposes need a value proof, not a single-body view.
@@ -28983,7 +28831,7 @@ class TestOnnxLoopControlProofs:
             None, {"X": np.ones((1, 64), np.float32)}
         )
         np.testing.assert_array_equal(actual[0], expected)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         assert bool(plan.coverage_gaps) is overloaded
         assert result.success is (not overloaded)
@@ -29059,7 +28907,7 @@ class TestOnnxLoopControlProofs:
         np.testing.assert_array_equal(
             np.stack(emitted), np.stack([weights, weights if condition == "loop" else weights.T])
         )
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         if condition == "loop":
             assert plan.coverage_gaps == {}
@@ -29118,7 +28966,7 @@ class TestOnnxLoopControlProofs:
             return original(initializer, *args, **kwargs)
 
         monkeypatch.setattr(onnx.numpy_helper, "to_array", decode)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert calls <= (0 if kind == "rank" else 1)
         if kind == "rank":
             assert plan.coverage_gaps["inferred_shape_rank_limit"] == 1
@@ -29167,7 +29015,7 @@ class TestOnnxLoopControlProofs:
             return original(initializer, *args, **kwargs)
 
         monkeypatch.setattr(onnx.numpy_helper, "to_array", decode)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert calls <= 8
         assert plan.coverage_gaps["control_value_work_limit"] == 1
         assert len(plan.specs) == 1
@@ -29281,7 +29129,7 @@ class TestOnnxCanonicalControlConstants:
         output: Any = ReferenceEvaluator(runtime).run(None, {"X": np.ones((1, 64), np.float32)})
         expected = anomalous if overloaded else weights
         np.testing.assert_array_equal(output[0], np.ones((1, 64), np.float32) @ expected)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         if overloaded:
             assert any(np.array_equal(spec.weights, anomalous) for spec in plan.specs) or plan.coverage_gaps
@@ -29382,12 +29230,8 @@ class TestOnnxCanonicalControlConstants:
                         active["index_queries"].append(row)
                     caller = caller.f_back
 
-        previous = sys.getprofile()
-        try:
-            sys.setprofile(collect_indexes)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous)
+        with _profile_calls(collect_indexes):
+            plan = _build_fixture_weight_plan(model)
         assert not active_proofs
         completed_queries = [row for row in proof_rows if isinstance(row["result"], bool)]
         proven_queries = [row for row in completed_queries if row["result"] is True]
@@ -29485,12 +29329,8 @@ class TestOnnxCanonicalControlConstants:
             ):
                 proofs.append(bool(arg))
 
-        previous = sys.getprofile()
-        try:
-            sys.setprofile(collect_proofs)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous)
+        with _profile_calls(collect_proofs):
+            plan = _build_fixture_weight_plan(model)
         assert proofs and not any(proofs)
         assert plan.coverage_gaps
         result = OnnxScanner().scan(str(path))
@@ -29566,7 +29406,7 @@ class TestOnnxBuiltinOperatorIdentity:
         expected = np.eye(64, dtype=np.float32) if matched else weights
         np.testing.assert_array_equal(actual, np.ones((1, 64), np.float32) @ expected)
         path = TestOnnxLoopControlProofs._save(model, tmp_path)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert len(plan.specs) == 1
         np.testing.assert_array_equal(plan.specs[0].weights, expected)
@@ -29627,7 +29467,7 @@ class TestOnnxBuiltinOperatorIdentity:
         result = OnnxScanner().scan(str(path))
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps["unresolved_initializer_lineage"] > 0
         if operator == "Relu":
             model.graph.node[0].overload = "other"
@@ -29665,7 +29505,7 @@ class TestOnnxBuiltinOperatorIdentity:
             [function],
         )
         np.testing.assert_array_equal(self._inlined_runtime(model, {"X": np.ones((1, 64), np.float32)})[0], 0)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert len(plan.specs) == 1
         np.testing.assert_array_equal(plan.specs[0].weights, np.zeros((64, 64), np.float32))
@@ -29705,7 +29545,7 @@ class TestOnnxBuiltinOperatorIdentity:
         result = OnnxScanner().scan(str(path))
         assert result.success is True
         assert not result.metadata.get("anomalies_found")
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert len(plan.specs) == 1
         assert plan.coverage_gaps == {}
 
@@ -29773,7 +29613,7 @@ class TestOnnxBuiltinOperatorIdentity:
             actual = ReferenceEvaluator(model).run(None, feeds)
             np.testing.assert_array_equal(actual[1], weights)
         path = TestOnnxLoopControlProofs._save(model, tmp_path)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps
         if capped:
             assert plan.coverage_gaps.get("lineages_per_value_limit", 0) > 0
@@ -29802,7 +29642,7 @@ class TestOnnxBuiltinOperatorIdentity:
         path = TestOnnxLoopControlProofs._save(model, tmp_path)
         result = OnnxScanner().scan(str(path))
         assert result.success is not matrix
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert bool(plan.coverage_gaps) is matrix
 
 
@@ -29874,7 +29714,7 @@ class TestOnnxProvenShapesAndScanExtents:
         actual: Any = ReferenceEvaluator(model).run(None, feeds)
         np.testing.assert_array_equal(actual[0], feeds["X"] @ weights)
         path = _save_onnx_model(model, tmp_path / "unproven-gathernd-dimensions.onnx")
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps
         if capped:
             assert plan.coverage_gaps.get("lineages_per_value_limit", 0) > 0
@@ -29935,12 +29775,8 @@ class TestOnnxProvenShapesAndScanExtents:
                 decoded += 1
                 assert decoded <= 2 * width
 
-        previous = sys.getprofile()
-        try:
-            sys.setprofile(count_decoding)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous)
+        with _profile_calls(count_decoding):
+            plan = _build_fixture_weight_plan(model)
         assert decoded == (2 * width if explicit_axes else 0)
         assert plan.coverage_gaps == {}
         assert plan.specs == []
@@ -29986,12 +29822,8 @@ class TestOnnxProvenShapesAndScanExtents:
                 if caller is not None and caller.f_code.co_name == "resolved_int_sequence_attribute":
                     decoded += 1
 
-        previous = sys.getprofile()
-        try:
-            sys.setprofile(count_decoding)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous)
+        with _profile_calls(count_decoding):
+            plan = _build_fixture_weight_plan(model)
         assert decoded == 0
         assert plan.coverage_gaps["scan_axis_decode_work_limit"] == 1
         path = _save_onnx_model(model, tmp_path / "oversized-axes.onnx")
@@ -30048,7 +29880,7 @@ class TestOnnxProvenShapesAndScanExtents:
         )
         onnx.checker.check_model(model, full_check=True)
         monkeypatch.setattr(onnx_scanner_module, "_ONNX_SCAN_AXIS_DECODE_WORK_LIMIT", budget)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == ({"scan_axis_decode_work_limit": 1} if budget == 3 else {})
 
     @pytest.mark.parametrize("route", ["direct", "Identity", "function"])
@@ -30095,7 +29927,7 @@ class TestOnnxProvenShapesAndScanExtents:
         actual = TestOnnxBuiltinOperatorIdentity._inlined_runtime(model, feeds)
         np.testing.assert_array_equal(actual[0], feeds["X"] @ expected_weight)
         path = TestOnnxLoopControlProofs._save(model, tmp_path)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         if steps == 1:
             assert plan.coverage_gaps == {}
             assert len(plan.specs) == 1
@@ -30150,7 +29982,7 @@ class TestOnnxProvenShapesAndScanExtents:
             state = body_outputs[0]
         np.testing.assert_array_equal(state, weights)
         path = TestOnnxLoopControlProofs._save(model, tmp_path)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps
         assert all(np.array_equal(spec.weights, state) for spec in plan.specs)
         result = OnnxScanner().scan(str(path))
@@ -30203,7 +30035,7 @@ class TestOnnxProvenShapesAndScanExtents:
                 state = body_outputs[0]
             np.testing.assert_array_equal(state, weights.T if axis == 0 else weights)
         path = TestOnnxLoopControlProofs._save(model, tmp_path)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps
         assert len(plan.specs) == 1
         np.testing.assert_array_equal(plan.specs[0].weights, weights.T)
@@ -30293,7 +30125,7 @@ class TestOnnxControlExtentProofs:
         path = self._save(model, tmp_path)
         runtime: Any = ReferenceEvaluator(model).run(None, feeds)
         np.testing.assert_array_equal(runtime[1], weights if slot == 0 else weights.T)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         if slot == 0:
             assert plan.specs == []
             TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
@@ -30316,7 +30148,7 @@ class TestOnnxControlExtentProofs:
         runtime: Any = ReferenceEvaluator(model).run(None, feeds)
         steps = runtime[2].shape[0]
         np.testing.assert_array_equal(runtime[1], weights.T if steps == 1 else weights)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert OnnxScanner().scan(str(path)).success is (steps == 1)
         if steps == 1:
             assert plan.coverage_gaps == {}
@@ -30339,7 +30171,7 @@ class TestOnnxControlExtentProofs:
         if slot == missing:
             TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
         else:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+            plan = _build_fixture_weight_plan(model)
             assert plan.coverage_gaps == {}
             np.testing.assert_array_equal(plan.specs[0].weights, runtime[1])
             assert OnnxScanner().scan(str(path)).success is True
@@ -30405,7 +30237,7 @@ class TestOnnxControlExtentProofs:
         # Reference Loop concatenates this singleton output axis; its values
         # still expose the second iteration's independently executed weight.
         assert float(runtime[1].sum()) == (50 if empty else 0)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert {spec.context["initializer"] for spec in plan.specs} == ({"Bad", "Good"} if empty else {"Good"})
         result = OnnxScanner().scan(str(path))
@@ -30460,7 +30292,7 @@ class TestOnnxControlExtentProofs:
         if trip > 1:
             TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
         else:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+            plan = _build_fixture_weight_plan(model)
             assert plan.coverage_gaps == {}
             # An immutable zero trip count makes the body consumer unreachable,
             # even when the entry condition is supplied at runtime.
@@ -30570,7 +30402,7 @@ class TestOnnxControlExtentProofs:
         if mode in {"unknown", "two", "mismatch", "unproven"}:
             TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
         else:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+            plan = _build_fixture_weight_plan(model)
             assert plan.coverage_gaps == {}
             assert len(plan.specs) == 1
             np.testing.assert_array_equal(plan.specs[0].weights, weights)
@@ -30609,7 +30441,7 @@ class TestOnnxControlExtentProofs:
             None, {"X": np.ones((1, 64), np.float32)}
         )
         assert float(runtime[1].sum()) == (50 if empty else 0)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert {spec.context["initializer"] for spec in plan.specs} == ({"Bad", "Good"} if empty else {"Good"})
         result = OnnxScanner().scan(str(path))
@@ -30651,7 +30483,7 @@ class TestOnnxControlExtentProofs:
         for index, output in enumerate(runtime):
             np.testing.assert_array_equal(output, feeds[f"x{index}"])
         with cProfile.Profile() as profile:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+            plan = _build_fixture_weight_plan(model)
         calls = {
             name: sum(
                 entry.callcount
@@ -30692,7 +30524,7 @@ class TestOnnxControlExtentProofs:
         if identity == "matching":
             TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
         else:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+            plan = _build_fixture_weight_plan(model)
             assert plan.coverage_gaps == {}
             np.testing.assert_array_equal(plan.specs[0].weights, actual[1])
             assert OnnxScanner().scan(str(path)).success is True
@@ -30814,7 +30646,7 @@ class TestOnnxNestedScanBindings:
         bad_reached = trip == 2 and not captured
         assert runtime[0].shape == ((1,) if captured else (0,))
         assert float(runtime[1].sum()) == (50 if bad_reached else 0)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert {spec.context["initializer"] for spec in plan.specs} == ({"Bad", "Good"} if bad_reached else {"Good"})
         result = OnnxScanner().scan(str(path))
@@ -30839,7 +30671,7 @@ class TestOnnxNestedScanBindings:
             None, {"X": np.ones((1, 64), np.float32)}
         )
         assert float(runtime[1].sum()) == (0 if captured else 50)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert {spec.context["initializer"] for spec in plan.specs} == ({"Good"} if captured else {"Good", "Bad"})
         result = OnnxScanner().scan(str(path))
@@ -30886,7 +30718,7 @@ class TestOnnxNestedScanBindings:
                 super().__init__(values)
 
         monkeypatch.setattr(onnx_scanner_module, "set", CountedSet, raising=False)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert copied_entries == 0
         assert plan.coverage_gaps == {}
         assert len(plan.specs) == 1
@@ -30918,7 +30750,7 @@ class TestOnnxNestedScanBindings:
         )
         changed = identity != "matching"
         assert float(runtime[1].sum()) == (50 if changed else 0)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert {spec.context["initializer"] for spec in plan.specs} == ({"Good", "Bad"} if changed else {"Good"})
         result = OnnxScanner().scan(str(path))
@@ -30940,7 +30772,7 @@ class TestOnnxNestedScanBindings:
             attribute.ref_attr_name = "missing"
         with pytest.raises((onnx.checker.ValidationError, onnx.shape_inference.InferenceError)):
             onnx.checker.check_model(model, full_check=True)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps or any(spec.context["initializer"] == "Bad" for spec in plan.specs)
 
     @pytest.mark.parametrize("sources", [1, 33])
@@ -30980,7 +30812,7 @@ class TestOnnxNestedScanBindings:
             state = np.stack([result[0]])
         assert state.shape == (1, 0)
         assert list(state[0]) == []
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         report = OnnxScanner().scan(str(path))
         if plan.coverage_gaps:
             assert report.success is False
@@ -31081,7 +30913,7 @@ class TestOnnxScan8Boundaries:
             assert produced.shape[1] == (1 if mode == "nonempty" else 0)
         # Legacy Scan8 skips an empty sequence; a one-element sequence replaces
         # the state with its only slice. The runtime above proves that extent.
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert len(plan.specs) == 1
         np.testing.assert_array_equal(plan.specs[0].weights.reshape(expected.shape), expected)
@@ -31161,7 +30993,7 @@ class TestOnnxScan8Boundaries:
         expected_hot = mode != "unchanged" and any(count == hot + 1 for count in actual_lengths)
         assert bool(actual.any()) is expected_hot
         complete = mode == "unchanged" or (mode == "replace" and not any(lengths))
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         assert result.success is complete
         if complete:
@@ -31254,7 +31086,7 @@ class TestOnnxScan8Boundaries:
         actual = runtime_values[0]
         used = mode in {"used", "default", "override"}
         np.testing.assert_array_equal(actual, np.eye(2, dtype=np.float32) if used else np.ones((1, 1, 2), np.float32))
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         if used:
             assert any(spec.context["initializer"] == "W" for spec in plan.specs)
@@ -31342,14 +31174,10 @@ class TestOnnxLoopReplacementProofs:
                 if event == "return" and frame.f_code.co_name == "walk_graph":
                     stack_shape = frame.f_locals.get("known_value_shapes", {}).get("stack", stack_shape)
 
-        prior_profile = sys.getprofile()
-        sys.setprofile(profile)
-        try:
+        with _profile_calls(profile):
             plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
                 model, onnx=onnx, np=np, max_array_size=None, raw_control_admission=admission
             )
-        finally:
-            sys.setprofile(prior_profile)
         # Metadata proof must not replay a large immutable iteration count.
         assert calls < 2048
         expected_extent = 1 if count == 1 else -1
@@ -31494,7 +31322,7 @@ class TestOnnxLoopReplacementProofs:
         runtime_values: Any = ReferenceEvaluator(runtime).run(["scores"], {"X": np.ones((1, 64), np.float32)})
         expected_score = 0 if mode in {"vector", "override_vector", "if_vector"} else 500
         np.testing.assert_array_equal(runtime_values[0].reshape(-1), np.array([0] + [expected_score] * (count - 1)))
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         complete = count == 1 or mode in {"vector", "override_vector"}
         assert result.success is complete
@@ -31617,7 +31445,7 @@ class TestOnnxScanFeedbackPartition:
             if kind == "Loop":
                 expected = np.stack([expected] * count)
         np.testing.assert_array_equal(actual[states + 1].reshape(expected.shape), expected)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         assert result.success is not feedback
         if feedback:
@@ -31852,7 +31680,7 @@ class TestOnnxRecurrentActivationProof:
             # The installed Loop evaluator concatenates scan outputs; compare
             # the actual per-iteration matrices with their explicit dimensions.
             np.testing.assert_array_equal(actual[2 if siblings else 1].reshape(expected.shape), expected)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         assert result.success is (gap_count == 0)
         assert plan.coverage_gaps == ({"unresolved_initializer_lineage": gap_count} if gap_count else {})
@@ -31885,7 +31713,7 @@ class TestOnnxRecurrentActivationProof:
         model, _feeds, stored_weight = self._model("reported")
         path = TestOnnxLoopControlProofs._save(model, tmp_path)
         monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 16)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
@@ -32054,7 +31882,7 @@ class TestOnnxScopedConsumerCertificates:
         path = TestOnnxLoopControlProofs._save(model, tmp_path)
         actual: Any = ReferenceEvaluator(TestOnnxLoopControlProofs._inline_with_defaults(model)).run(None, feeds)
         np.testing.assert_allclose(actual[0], expected, rtol=1e-6, atol=1e-7)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         negative = case == "nested-if-later-weight"
         assert result.success is not negative
@@ -32104,7 +31932,7 @@ class TestOnnxScopedConsumerCertificates:
         # This evaluator concatenates Loop scan outputs instead of adding the
         # schema's sequence axis; only compare its values after explicit reshape.
         np.testing.assert_allclose(actual[2].reshape(3, 4, 4), np.stack(uses), rtol=1e-6, atol=1e-7)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         assert result.success is False
         assert plan.coverage_gaps == {"unresolved_initializer_lineage": 2}
@@ -32132,12 +31960,8 @@ class TestOnnxScopedConsumerCertificates:
                 if pool is not None:
                     observations.append((len(pool), sum(len(key) for key in pool)))
 
-        previous = sys.getprofile()
-        sys.setprofile(profile)
-        try:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model)
         assert observations
         assert all(entries <= limit and key_cells <= limit for entries, key_cells in observations)
         assert plan.coverage_gaps
@@ -32212,7 +32036,7 @@ class TestOnnxScopedConsumerCertificates:
             for index in range(length) if direction == 0 else range(length - 1, -1, -1):
                 actual: Any = runtime.run(None, {"X": np.ones((1, 64), np.float32), "slice": weights[batch, index]})
                 np.testing.assert_array_equal(actual[0], np.ones((1, 64), np.float32) @ weights[batch, index])
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         assert result.success is (extent == 1)
         if extent == 1:
@@ -32495,7 +32319,7 @@ class TestOnnxInvariantControlFlowStateProofs:
         if mode not in {"nested-loop", "nested-changing"}:
             actual = TestOnnxBuiltinOperatorIdentity._inlined_runtime(model, feeds)[0]
             np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=0)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         gap_count = (
             1
@@ -32559,7 +32383,7 @@ class TestOnnxInvariantControlFlowStateProofs:
             if mode == "loop":
                 actual = actual.reshape(expected.shape)
             np.testing.assert_array_equal(actual, expected)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         unresolved = mode in {"changing", "sequence", "overloaded-identity", "runtime-shape"}
         assert result.success is not unresolved
@@ -32665,7 +32489,7 @@ class TestOnnxInvariantControlFlowStateProofs:
                         None, {"state": state, "slice": np.take(sequence, index, axis=normalized_axis)}
                     )[0]
                 np.testing.assert_array_equal(state, expected)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         result = OnnxScanner().scan(str(path))
         assert result.success is not overridable
         assert plan.coverage_gaps == ({"unresolved_initializer_lineage": 1} if overridable else {})
@@ -32793,7 +32617,7 @@ class TestOnnxEmptyScanTransformShapes:
         if not legacy and axis == 0:
             whole: Any = ReferenceEvaluator(runtime_model).run(None, feeds)
             np.testing.assert_array_equal(whole[0], np.stack(expected_outputs))
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         incomplete = mode == "override" or (extent > 1 and width > 0)
         assert plan.coverage_gaps == ({"unresolved_initializer_lineage": 1} if incomplete else {})
         if width and not incomplete:
@@ -32944,7 +32768,7 @@ class TestOnnxSiblingOutputRank:
         actual: Any = ReferenceEvaluator(model).run(None, feeds)
         np.testing.assert_array_equal(actual[1], expected)
         np.testing.assert_array_equal(actual[0], activation @ expected)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == gaps
         assert plan.specs == []
         result = OnnxScanner().scan(str(path))
@@ -32966,7 +32790,7 @@ class TestOnnxSiblingOutputRank:
                 opset_imports=[helper.make_opsetid("", 18)],
                 ir_version=10,
             )
-            direct_plan = _build_fixture_weight_plan(direct, onnx=onnx, np=np, max_array_size=None)
+            direct_plan = _build_fixture_weight_plan(direct)
             assert direct_plan.coverage_gaps == {}
             assert len(direct_plan.specs) == 1
             np.testing.assert_array_equal(direct_plan.specs[0].weights, expected)
@@ -33171,7 +32995,7 @@ class TestOnnxEmptyScanShapeCertificates:
             actual: Any = ReferenceEvaluator(model).run(None, feeds)
             np.testing.assert_array_equal(actual[0], expected)
         path = TestOnnxLoopControlProofs._save(model, tmp_path)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         incomplete = case in {"symbolic-default", "stack-override", "second-varying"}
         gap_count = 2 if case == "second-varying" else 1
         assert plan.coverage_gaps == ({"unresolved_initializer_lineage": gap_count} if incomplete else {})
@@ -33378,7 +33202,7 @@ class TestOnnxStackFunctionDependencies:
         # The installed Loop evaluator concatenates scan outputs; execute the
         # actual body and apply the schema's stacking rule independently.
         np.testing.assert_array_equal(np.stack(slices), expected)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         path = _save_onnx_model(model, tmp_path / "function-stack.onnx")
         result = OnnxScanner().scan(str(path))
         if changes or case == "deep_ignored":
@@ -33525,7 +33349,7 @@ class TestOnnxCapturedFunctionGaps:
         for output, reference in zip(actual, expected, strict=True):
             np.testing.assert_array_equal(output, reference)
         path = _save_onnx_model(model, tmp_path / "captured-gaps.onnx")
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         incomplete = 40 in counts
         # Each If alternative returns the eight deferred lineages.
         assert plan.coverage_gaps == ({"lineages_per_value_limit": 16} if incomplete else {})
@@ -33574,7 +33398,7 @@ class TestOnnxCapturedFunctionGaps:
         onnx.checker.check_model(inlined, full_check=True)
         actual: Any = ReferenceEvaluator(inlined).run(None, feeds)
         np.testing.assert_array_equal(actual[0], expected[0])
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert len(plan.specs) == 1
         result = OnnxScanner().scan(str(_save_onnx_model(model, tmp_path / "shadowed-gaps.onnx")))
@@ -33659,7 +33483,7 @@ class TestOnnxUnusedFunctionGraphs:
             np.testing.assert_array_equal(
                 state, seed if proof == "shape" else seed.reshape((1,) * (iteration + 1) + (2,))
             )
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert len(plan.specs) == (0 if proof == "shape" else 1)
         if proof == "reachability":
@@ -34178,7 +34002,7 @@ class TestOnnxFunctionCaptureReachability:
             )
             np.testing.assert_array_equal(actual[1], np.ones(64, np.float32))
             np.testing.assert_array_equal(actual[2], np.array([64], np.float32))
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert bool(plan.coverage_gaps.get("function_capture_work_limit")) is (mode == "used")
         self._assert_contract(model, tmp_path, mode == "used")
 
@@ -34376,7 +34200,7 @@ class TestOnnxFunctionCaptureReachability:
         np.testing.assert_array_equal(np.stack(rows), expected)
         actual_output: Any = ReferenceEvaluator(inlined).run(None, {"X": np.ones((1, 2), np.float32)})
         np.testing.assert_array_equal(actual_output[0], np.ones((1, 2), np.float32) @ expected)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         if varying:
             # Separate constant declarations have no equality certificate in identifier taint.
             assert not plan.specs
@@ -34456,7 +34280,7 @@ class TestOnnxControlAndNumericProofGaps:
         actual: Any = ReferenceEvaluator(inlined).run(None, {"X": left})
         np.testing.assert_array_equal(actual[0], left @ expected)
         np.testing.assert_array_equal(actual[1], expected)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         if control == "invariant":
             assert plan.specs
             for spec in plan.specs:
@@ -35052,7 +34876,7 @@ class TestOnnxReviewedExitAndTrainingSemantics:
         np.testing.assert_array_equal(actual[0], expected)
         incomplete = mode != "unused" if family == "unproven" else count == 32 and mode in {"matrix", "identity"}
         if family == "demotion" and count == 31:
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+            plan = _build_fixture_weight_plan(model)
             assert len(plan.specs) == 1
         if family == "unproven" and mode in {"misleading", "unused"}:
             path = _save_onnx_model(model, tmp_path / "unproven-exit.onnx")
@@ -35724,7 +35548,7 @@ class TestOnnxEmptyScan8StackedProvenance:
     def test_empty_outputs_keep_dimension_provenance(self, tmp_path: Path, mode: str) -> None:
         model = self._model(mode)
         incomplete = mode in {"dimensions", "constant_dimensions"}
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         if incomplete:
             assert plan.coverage_gaps["unresolved_initializer_lineage"] == 1
             assert plan.unresolved_lineage_samples[0]["reason"] == "shape_dimensions_lineage"
@@ -35805,7 +35629,7 @@ class TestOnnxUnreachableScanWeightConsumers:
         self, tmp_path: Path, nested: bool, reachable_call: bool, scanner_type: Any
     ) -> None:
         model = self._model(nested, reachable_call)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert len(plan.specs) == int(reachable_call)
         if reachable_call:
@@ -35898,7 +35722,7 @@ class TestOnnxPrimaryConstantBudgets:
     def test_primary_limit_precedes_repeated_field_copy(self, monkeypatch: pytest.MonkeyPatch, ints: bool) -> None:
         model = self._outputs([16], ints=ints)
         copied = self._record_copies(monkeypatch)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=32)
+        plan = _build_fixture_weight_plan(model, max_array_size=32)
         assert copied == []
         assert plan.coverage_gaps["constant_attribute_decode_limit"] == 1
         assert plan.oversized_initializers_skipped == 1
@@ -35929,12 +35753,7 @@ class TestOnnxPrimaryConstantBudgets:
 
         monkeypatch.setattr(onnx_scanner_module, "_ONNX_CONSTANT_ATTRIBUTE_FALLBACK_BYTE_LIMIT", 24)
         plan = _build_fixture_weight_plan(
-            model,
-            onnx=onnx,
-            np=np,
-            max_array_size=None,
-            pre_materialization_check=preflight,
-            retain_array_check=reserve if callback_budget else None,
+            model, pre_materialization_check=preflight, retain_array_check=reserve if callback_budget else None
         )
         assert [tensor.name for tensor in copied] == ["value_0"]
         assert preflight_names == ["value_0", "value_1"]
@@ -35953,9 +35772,7 @@ class TestOnnxPrimaryConstantBudgets:
             reservations.append((name, size))
             return size <= budget
 
-        plan = _build_fixture_weight_plan(
-            self._aliases(), onnx=onnx, np=np, max_array_size=None, retain_array_check=reserve
-        )
+        plan = _build_fixture_weight_plan(self._aliases(), retain_array_check=reserve)
         assert reservations == [("first", 16)]
         assert len(copied) == int(budget == 16)
         if budget == 16:
@@ -35970,7 +35787,7 @@ class TestOnnxPrimaryConstantBudgets:
         self, monkeypatch: pytest.MonkeyPatch, array_limit: int | None
     ) -> None:
         copied = self._record_copies(monkeypatch)
-        plan = _build_fixture_weight_plan(self._outputs([5000]), onnx=onnx, np=np, max_array_size=array_limit)
+        plan = _build_fixture_weight_plan(self._outputs([5000]), max_array_size=array_limit)
         assert plan.coverage_gaps == {}
         assert len(copied) == 1
         np.testing.assert_array_equal(onnx.numpy_helper.to_array(copied[0]), np.arange(5000, dtype=np.float32))
@@ -35992,9 +35809,6 @@ class TestOnnxPrimaryConstantBudgets:
         analyzer = WeightDistributionScanner(config={"max_array_size": 0, "max_weight_distribution_total_bytes": 32})
         plan = _build_fixture_weight_plan(
             model,
-            onnx=onnx,
-            np=np,
-            max_array_size=None,
             pre_materialization_check=lambda _tensor, name, size: analyzer._tensor_fits_budget(
                 "onnx_initializer_size_limit", name, tensor_nbytes=size
             ),
@@ -36013,7 +35827,7 @@ class TestOnnxPrimaryConstantBudgets:
         path = create_many_local_function_weight_overrides_model(tmp_path, call_count=3)
         model = onnx.load(str(path))
         copied = self._record_copies(monkeypatch)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=1024 * 1024)
+        plan = _build_fixture_weight_plan(model, max_array_size=1024 * 1024)
         assert plan.coverage_gaps == {}
         assert sum(tensor.data_type == TensorProto.FLOAT for tensor in copied) == 3
         assert sum(tensor.data_type == TensorProto.INT64 for tensor in copied) == 1
@@ -36180,7 +35994,7 @@ class TestOnnxBoundWeightTransformAttributes:
             )
             for binding in ("literal", mode)
         ]
-        plans = [_build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=4096) for model in models]
+        plans = [_build_fixture_weight_plan(model, max_array_size=4096) for model in models]
         assert [plan.coverage_gaps for plan in plans] == [{}, {}]
         assert [len(plan.specs) for plan in plans] == [1, 1]
         expected = np.arange(math.prod(input_shape), dtype=np.float32).reshape(input_shape)
@@ -36201,7 +36015,7 @@ class TestOnnxBoundWeightTransformAttributes:
         model.graph.node.append(helper.make_node("MatMul", ["X", "other_view"], ["other_Y"]))
         model.graph.output.append(helper.make_tensor_value_info("other_Y", TensorProto.FLOAT, [1, 2]))
         onnx.checker.check_model(model, full_check=True)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=4096)
+        plan = _build_fixture_weight_plan(model, max_array_size=4096)
         assert plan.coverage_gaps == {}
         assert len(plan.specs) == 2
         weights = np.arange(4, dtype=np.float32).reshape(2, 2)
@@ -36230,7 +36044,7 @@ class TestOnnxBoundWeightTransformAttributes:
         model.graph.node.insert(0, helper.make_node("MatMul", ["A", "prior"], ["prior_Y"]))
         model.graph.output.append(helper.make_tensor_value_info("prior_Y", TensorProto.FLOAT, [1, 64]))
         # Deliberately malformed bindings bypass schema validation to exercise the planner's fail-closed guard.
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=32768)
+        plan = _build_fixture_weight_plan(model, max_array_size=32768)
         assert plan.coverage_gaps.get("unresolved_initializer_lineage", 0) > 0
         assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
 
@@ -36347,12 +36161,8 @@ class TestOnnxOpsetEnvironmentWork:
                 if caller is not None and caller.f_code.co_name == "function_opset_versions":
                     observations["function_builds"].append(caller.f_locals["function"])
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(observe)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=max_array_size)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(observe):
+            plan = _build_fixture_weight_plan(model, max_array_size=max_array_size)
         return plan, observations
 
     def test_shared_environments_use_bounded_keys_and_one_function_map_build(self) -> None:
@@ -36625,7 +36435,7 @@ class TestOnnxFullPrCoverageReview:
             )
             bound_attribute.CopyFrom(malformed)
         # The standalone route intentionally reaches the planner without schema checking.
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         incomplete = binding_kind not in {"valid", "int64"}
         assert bool(plan.coverage_gaps.get("unresolved_initializer_lineage", 0)) is incomplete
         assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
@@ -36709,7 +36519,7 @@ class TestOnnxFullPrCoverageReview:
             pool = next(node for node in model.graph.node if node.op_type == "AveragePool")
             next(attribute for attribute in pool.attribute if attribute.name == malformed.name).CopyFrom(malformed)
         incomplete = mode.startswith("bad_") or mode == "padded_include"
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert bool(plan.coverage_gaps) is incomplete
         assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
         path = _save_onnx_model(model, tmp_path / "pooling-proof-attributes.onnx")
@@ -36733,7 +36543,7 @@ class TestOnnxFinalReviewBindingAndSqueeze:
         *,
         coverage_reason: str = "unresolved_initializer_lineage",
     ) -> Any:
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert bool(plan.coverage_gaps.get(coverage_reason, 0)) is incomplete
         assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
         path = _save_onnx_model(model, tmp_path / "review-binding-shape.onnx")
@@ -37171,7 +36981,7 @@ class TestOnnxRejectedCastAndPoolingProofs:
                 helper.make_attribute("dilations", [1.0])
             )
         incomplete = mode in {"empty_dilated", "bad_dilation_type"}
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert bool(plan.coverage_gaps) is incomplete
         assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
         path = _save_onnx_model(model, tmp_path / "pooling-nonempty-samples.onnx")
@@ -37287,7 +37097,7 @@ class TestOnnxFiniteReplayUnusedFunctionGraphs:
             np.testing.assert_array_equal(actual[2], activation)
             state = actual[1]
         assert slope_ranks == list(range(trip_count))
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert bool(plan.coverage_gaps.get("lineages_per_value_limit", 0)) is incomplete
         assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
         path = _save_onnx_model(model, tmp_path / "finite-replay-unused-graph.onnx")
@@ -37722,14 +37532,10 @@ class TestOnnxLoopConsumerProofAdmission:
                     observed["target_retained"] |= result is True
                     observed["unexpected_target_result"] |= result is not True
 
-        previous = sys.getprofile()
-        try:
-            sys.setprofile(observe)
+        with _profile_calls(observe):
             TestOnnxFinalReviewBindingAndSqueeze._assert_standalone_contract(
                 model, tmp_path, consume_state, prior_weights, coverage_reason="lineages_per_value_limit"
             )
-        finally:
-            sys.setprofile(previous)
         assert observed["warmup_exhausted"] and observed["target_exhausted"], observed
         assert reachability_results and all(result is consume_state for result in reachability_results)
         assert not exhausted_calls
@@ -37897,7 +37703,6 @@ class TestOnnxEinsumEquationBudgets:
     @staticmethod
     def _scan_profiled(model: Any, tmp_path: Path) -> tuple[Any, dict[str, Any]]:
         path = _save_onnx_model(model, tmp_path / "equation-profile.onnx")
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         observations: dict[str, Any] = {
             "queries": 0,
             "materialized": [],
@@ -37910,7 +37715,7 @@ class TestOnnxEinsumEquationBudgets:
             name = frame.f_code.co_name
             if name not in {"parsed_einsum_equation", "einsum_output_shape"}:
                 return
-            if Path(frame.f_code.co_filename).resolve() != scanner_path or event != "return":
+            if frame.f_globals is not _ONNX_SCANNER_GLOBALS or event != "return":
                 return
             if name == "einsum_output_shape":
                 if isinstance(arg, tuple):
@@ -37926,12 +37731,8 @@ class TestOnnxEinsumEquationBudgets:
             cache = frame.f_locals.get("einsum_equation_cache", {})
             observations["cache_peak"] = max(observations["cache_peak"], len(cache))
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(profile)
+        with _profile_calls(profile):
             result = WeightDistributionScanner().scan(str(path))
-        finally:
-            sys.setprofile(previous_profile)
         assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
         return result, observations
 
@@ -38332,7 +38133,7 @@ class TestOnnxScan8MutableDefaultBatchProofs:
             actual_weight = np.empty((0, 64, 64) if output_kind == "state" else (0, 1, 64, 64), np.float32)
             assert (np.ones((1, 64), np.float32) @ actual_weight).size == 0
 
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
         if incomplete:
             assert plan.exclusion_counts.get("empty_weight_view", 0) == 0
@@ -38509,7 +38310,6 @@ class TestOnnxFiniteReplayConstantAdmission:
     def test_replay_constant_budget_refuses_repeated_copy_before_allocation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import sys
 
         model, constant, prior_weights = self._model("ints", False, False)
         constant.attribute[0].ints[:] = [64, *([1] * 127)]
@@ -38532,12 +38332,8 @@ class TestOnnxFiniteReplayConstantAdmission:
                         break
                     parent = parent.f_back
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(profile)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert denials and all(work == 128 and 0 <= remaining < work for work, remaining in denials)
         assert replay_copies == 0
         assert plan.coverage_gaps.get("lineages_per_value_limit", 0) > 0
@@ -38615,7 +38411,6 @@ class TestOnnxPrimaryEinsumEquationBudgets:
         if incomplete:
             monkeypatch.setattr(onnx_scanner_module, "_ONNX_EINSUM_EQUATION_MAX_BYTES", 64)
         path = _save_onnx_model(model, tmp_path / "primary-equation.onnx")
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         observed: dict[str, Any] = {
             "queries": 0,
             "materialized": [],
@@ -38629,7 +38424,7 @@ class TestOnnxPrimaryEinsumEquationBudgets:
             name = frame.f_code.co_name
             if name not in {"parsed_einsum_equation", "_onnx_weight_output_axes", "_onnx_text_attribute"}:
                 return
-            if event != "return" or Path(frame.f_code.co_filename).resolve() != scanner_path:
+            if event != "return" or frame.f_globals is not _ONNX_SCANNER_GLOBALS:
                 return
             if name == "_onnx_text_attribute":
                 observed["raw_decodes"] += 1
@@ -38648,12 +38443,8 @@ class TestOnnxPrimaryEinsumEquationBudgets:
                 observed["payload_sizes"].append(payload_size)
             observed["cache_peak"] = max(observed["cache_peak"], len(frame.f_locals.get("einsum_equation_cache", {})))
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(profile)
+        with _profile_calls(profile):
             result = WeightDistributionScanner().scan(str(path))
-        finally:
-            sys.setprofile(previous_profile)
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert result.success is not incomplete, semantics
         assert len(TestWeightDistributionSemantics._extreme_checks(result)) == 1
@@ -38762,14 +38553,13 @@ class TestOnnxVectorControlBudgets:
             monkeypatch.setattr(onnx_scanner_module, "_ONNX_VECTOR_CONTROL_WORK_LIMIT", 6)
             coverage_reason = "vector_control_work_limit"
         path = _save_onnx_model(model, tmp_path / "vector-controls.onnx")
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         observed: dict[str, Any] = {"queries": 0, "payload_reads": [], "owners": 0, "legacy_reads": 0, "values": []}
 
         def profile(frame: Any, event: str, arg: Any) -> None:
             if event == "c_call":
                 if (
                     frame.f_code.co_name == "constant_int64_vector_values"
-                    and Path(frame.f_code.co_filename).resolve() == scanner_path
+                    and frame.f_globals is _ONNX_SCANNER_GLOBALS
                     and getattr(arg, "__name__", "") in {"ByteSize", "SerializeToString", "SerializePartialToString"}
                 ):
                     observed["legacy_reads"] += 1
@@ -38782,11 +38572,11 @@ class TestOnnxVectorControlBudgets:
                 if (
                     caller is not None
                     and caller.f_code.co_name == "constant_int64_vector_values"
-                    and Path(caller.f_code.co_filename).resolve() == scanner_path
+                    and caller.f_globals is _ONNX_SCANNER_GLOBALS
                 ):
                     observed["legacy_reads"] += 1
                 return
-            if name != "constant_int64_vector_values" or Path(frame.f_code.co_filename).resolve() != scanner_path:
+            if name != "constant_int64_vector_values" or frame.f_globals is not _ONNX_SCANNER_GLOBALS:
                 return
             if frame.f_locals.get("initializer") is None:
                 return
@@ -38797,12 +38587,8 @@ class TestOnnxVectorControlBudgets:
                 observed["values"].append(frame.f_locals["values"])
             observed["owners"] = max(observed["owners"], len(frame.f_locals.get("vector_control_cache", {})))
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(profile)
+        with _profile_calls(profile):
             result = WeightDistributionScanner().scan(str(path))
-        finally:
-            sys.setprofile(previous_profile)
         incomplete = control_mode not in {"valid", "typed", "empty_vector"}
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert result.success is not incomplete, semantics
@@ -38931,7 +38717,6 @@ class TestOnnxReentryVectorControlCaching:
             control.int64_data.extend(control_values)
         elif storage == "oversized":
             control.raw_data += b"x" * 640
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         observed: dict[str, Any] = {"queries": 0, "reentry_queries": 0, "payload_reads": [], "legacy_reads": 0}
 
         def profile(frame: Any, event: str, arg: Any) -> None:
@@ -38946,7 +38731,7 @@ class TestOnnxReentryVectorControlCaching:
                 }:
                     observed["legacy_reads"] += 1
                 return
-            if name != "constant_int64_vector_values" or Path(frame.f_code.co_filename).resolve() != scanner_path:
+            if name != "constant_int64_vector_values" or frame.f_globals is not _ONNX_SCANNER_GLOBALS:
                 return
             owner = frame.f_locals.get("initializer")
             if owner is None or str(owner.name) != "control":
@@ -38961,12 +38746,8 @@ class TestOnnxReentryVectorControlCaching:
                     break
                 ancestor = ancestor.f_back
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(profile)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model)
         assert observed["queries"] >= 2, observed
         assert observed["reentry_queries"] >= 2, observed
         assert observed["legacy_reads"] == 0, observed
@@ -39031,7 +38812,7 @@ class TestOnnxReentryVectorControlCaching:
         actual: Any = ReferenceEvaluator(model).run(None, feeds)
         for index, shape in enumerate(shapes):
             np.testing.assert_array_equal(actual[index], feeds[f"X{index}"] @ arrays[index].reshape(shape))
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert len(plan.specs) == 3
         assert sorted(spec.weights.shape for spec in plan.specs) == sorted(shapes)
@@ -39275,12 +39056,8 @@ class TestOnnxBoundGraphConstantCaptures:
             ):
                 refusals.append(frame.f_locals["exact_loop_replay_work_remaining"])
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(profile)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert refusals and all(0 <= remaining <= 64 for remaining in refusals)
         assert plan.coverage_gaps.get("lineages_per_value_limit", 0) > 0
         assert any(np.array_equal(spec.weights, prior_weights) for spec in plan.specs)
@@ -39690,7 +39467,7 @@ class TestOnnxCallAttributeWork:
         previous = sys.gettrace()
         try:
             sys.settrace(trace_binding)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+            plan = _build_fixture_weight_plan(model)
         finally:
             sys.settrace(previous)
         # Count actual raw-list visits in the new recurrent helper, independently
@@ -39760,8 +39537,6 @@ class TestOnnxConstantAdmissionOrder:
         copied = TestOnnxPrimaryConstantBudgets._record_copies(monkeypatch)
         plan = _build_fixture_weight_plan(
             model,
-            onnx=onnx,
-            np=np,
             max_array_size=32768,
             pre_materialization_check=lambda _tensor, name, size: analyzer._tensor_fits_budget(
                 "onnx_initializer_size_limit", name, tensor_nbytes=size
@@ -40046,25 +39821,20 @@ class TestOnnxDeferredConstantProofIdentity:
             expected = feeds[f"X{index}"] @ np.arange(4, dtype=np.float32).reshape(shape)
             for offset in (1, 2):
                 np.testing.assert_array_equal(actual[2 * index + offset], expected)
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         fingerprints: dict[int, set[Any]] = {}
 
         def profile(frame: Any, event: str, arg: Any) -> None:
             if (
                 event == "return"
                 and frame.f_code.co_name == "semantic_cache_fingerprint_with_owner"
-                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and frame.f_globals is _ONNX_SCANNER_GLOBALS
             ):
                 owner = frame.f_locals.get("value")
                 if getattr(owner, "name", None) == "shape":
                     fingerprints.setdefault(id(owner), set()).add(arg)
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(profile)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model)
         assert len(fingerprints) == 2, fingerprints
         assert all(len(keys) == 1 for keys in fingerprints.values())
         assert len(set().union(*fingerprints.values())) == 2
@@ -40132,12 +39902,8 @@ class TestOnnxRepeatedProofAdmission:
             if names == frozenset(runtime) and arg is None:
                 observed["refusals"] += 1
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(profile)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert observed["empty_admissions"] > 0
         assert observed["lookups"] <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
         assert bool(observed["refusals"]) is (captures == 512)
@@ -40172,12 +39938,8 @@ class TestOnnxRepeatedProofAdmission:
             else:
                 observed["refusals"] += 1
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(profile)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert observed["admissions"] > 0
         assert observed["attribute_visits"] <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
         assert bool(observed["refusals"]) is bool(padding)
@@ -40254,7 +40016,7 @@ class TestOnnxRepeatedProofAdmission:
         previous_trace = sys.gettrace()
         try:
             sys.settrace(trace)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+            plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         finally:
             sys.settrace(previous_trace)
         assert 0 < observed["producer_visits"] <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
@@ -40434,12 +40196,8 @@ class TestOnnxReentryAttributeAdmission:
             elif frame.f_code.co_name == reentry.name and frame.f_lineno == refusal_line and arg is True:
                 observed["refusals"] += 1
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(profile)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert 0 < observed["attribute_visits"] <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
         assert bool(observed["refusals"]) is bool(padding)
         if padding:
@@ -40794,7 +40552,7 @@ class TestOnnxReachabilityAttributeAdmission:
         previous_trace = sys.gettrace()
         try:
             sys.settrace(trace)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+            plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         finally:
             sys.settrace(previous_trace)
         return plan, observed
@@ -40979,7 +40737,6 @@ class TestOnnxFiniteReplayPlanAdmission:
             np.testing.assert_array_equal(output, values)
 
         path = _save_onnx_model(model, tmp_path / "replay-invocations.onnx")
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         admitted_traversal_work: list[int] = []
         replay_results: list[Any] = []
         replay_exhausted: list[bool] = []
@@ -40995,7 +40752,7 @@ class TestOnnxFiniteReplayPlanAdmission:
                 "exact_loop_repeated_state_weight_rank_bounds",
             }:
                 return
-            if Path(frame.f_code.co_filename).resolve() != scanner_path:
+            if frame.f_globals is not _ONNX_SCANNER_GLOBALS:
                 return
             if name == "_build_onnx_weight_analysis_plan":
                 planner_calls += 1
@@ -41012,12 +40769,8 @@ class TestOnnxFiniteReplayPlanAdmission:
                 replay_results.append(arg)
                 replay_exhausted.append(frame.f_locals["exact_loop_replay_work_exhausted"])
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(profile)
+        with _profile_calls(profile):
             result = scanner_type().scan(str(path))
-        finally:
-            sys.setprofile(previous_profile)
 
         assert planner_calls == 1
         # These are successful traversal/context reservations across both calls,
@@ -41346,7 +41099,7 @@ def test_fixture_preflight_keeps_original_analysis_model_and_owner(monkeypatch: 
         return raw_control_admission
 
     monkeypatch.setattr(onnx_scanner_module, "_build_onnx_weight_analysis_plan", capture_plan)
-    admission = _build_fixture_weight_plan(model, fixture_model=fixture, onnx=onnx, np=np, max_array_size=None)
+    admission = _build_fixture_weight_plan(model, fixture_model=fixture)
     assert observed == [(model, admission)]
     assert admission.model is model
     assert model.graph.initializer[-1] is sentinel
@@ -41900,7 +41653,7 @@ class TestOnnxFiniteReplayFlatten:
     def _assert_public_contract(model: Any, tmp_path: Path, prior_weights: Any | None, incomplete: bool) -> None:
         path = _save_onnx_model(model, tmp_path / "finite-flatten-replay.onnx")
         onnx.checker.check_model(str(path))
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert bool(plan.coverage_gaps.get("lineages_per_value_limit", 0)) is incomplete
         if not incomplete:
             assert plan.coverage_gaps == {}
@@ -42005,7 +41758,7 @@ class TestOnnxFiniteReplayFlatten:
         model, _activation, _prior = self._matmul_model("benign", local_function)
         coefficient = next(value for value in model.graph.initializer if value.name == "coefficient")
         coefficient.CopyFrom(onnx.numpy_helper.from_array(np.array([1, 2, 3], np.float32), name="coefficient"))
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert plan.coverage_gaps.get("unresolved_initializer_lineage", 0) > 0
         assert not plan.specs
         assert {sample["initializer"] for sample in plan.unresolved_lineage_samples} == {
@@ -42235,12 +41988,8 @@ class TestOnnxFiniteReplayFlatten:
             ):
                 outcomes.append(result)
 
-        previous = sys.getprofile()
-        try:
-            sys.setprofile(observe)
+        with _profile_calls(observe):
             self._assert_public_contract(model, tmp_path, prior_weights, incomplete)
-        finally:
-            sys.setprofile(previous)
         assert outcomes
         expected = None if unknown_operand else (later_matrix, True, (1, 4))
         assert all(outcome == expected for outcome in outcomes), outcomes
@@ -42361,12 +42110,8 @@ class TestOnnxRecurrentConstantCopyAdmission:
         with monkeypatch.context() as patch:
             patch.setattr(onnx_scanner_module, "_copy_onnx_repeated_constant_values", record_copy)
             patch.setattr(onnx.helper, "make_tensor", record_scalar)
-            previous = sys.getprofile()
-            try:
-                sys.setprofile(profile)
+            with _profile_calls(profile):
                 result = run()
-            finally:
-                sys.setprofile(previous)
         assert not replay_entries
         assert all(not allocated for _owner, _count, allocated in observed["denials"])
         assert all(copy["owner"] != "other" for copy in observed["copies"])
@@ -42533,9 +42278,7 @@ class TestOnnxRecurrentConstantCopyAdmission:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, local_function: bool, form: str
     ) -> None:
         model, _constant, prior = TestOnnxFiniteReplayConstantAdmission._model(form, local_function, False)
-        plan, observed = self._observe(
-            monkeypatch, lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
-        )
+        plan, observed = self._observe(monkeypatch, lambda: _build_fixture_weight_plan(model, max_array_size=64 * 1024))
         admitted = [debit for debit in observed["finite_debits"] if debit["accepted"]]
         assert admitted
         assert all(
@@ -42586,9 +42329,7 @@ class TestOnnxRecurrentConstantCopyAdmission:
             assert len(actual) == 17
             for index, output in enumerate(actual[1:]):
                 np.testing.assert_array_equal(output, feeds[f"state{index}"])
-        plan, observed = self._observe(
-            monkeypatch, lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
-        )
+        plan, observed = self._observe(monkeypatch, lambda: _build_fixture_weight_plan(model, max_array_size=64 * 1024))
         target_owner = "taint" if proof == "output_taint" else "reachability"
         assert target_owner in observed["requests"]
         target_copies = [copy for copy in observed["copies"] if copy["owner"] == target_owner]
@@ -42614,9 +42355,7 @@ class TestOnnxRecurrentConstantCopyAdmission:
             # Reuse the exact existing finite-refusal setup; the accepted small
             # control keeps default quotas and its independent runtime oracle.
             monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 200)
-        plan, observed = self._observe(
-            monkeypatch, lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
-        )
+        plan, observed = self._observe(monkeypatch, lambda: _build_fixture_weight_plan(model, max_array_size=64 * 1024))
         incomplete = count == 128
         finite = [copy for copy in observed["copies"] if copy["owner"] == "finite"]
         assert bool(finite) is not incomplete
@@ -42828,7 +42567,7 @@ class TestOnnxScanStackAttributeAdmission:
                             offsets.add(instruction.offset)
                     assert len(offsets) == 1, name
                     iterator_offsets[frame.f_code] = offsets
-                frame.f_trace_opcodes = True
+                _enable_opcode_events(frame, trace)
             kind = None
             if event == "opcode" and frame.f_lasti in iterator_offsets[frame.f_code]:
                 kind = "iterators"
@@ -42913,7 +42652,7 @@ class TestOnnxScanStackAttributeAdmission:
         assert len(actual) == len(expected)
         for output, wanted in zip(actual, expected, strict=True):
             np.testing.assert_array_equal(output, wanted)
-        plan, observed = self._observe(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None))
+        plan, observed = self._observe(lambda: _build_fixture_weight_plan(model))
         self._assert_work(observed, width=2, oversized=False, padded=False)
         assert plan.coverage_gaps == {}
         assert any(np.array_equal(spec.weights, prior) for spec in plan.specs)
@@ -42947,7 +42686,7 @@ class TestOnnxScanStackAttributeAdmission:
         attribute_count = self._pad(model, padding, late)
         with pytest.raises(onnx.checker.ValidationError):
             onnx.checker.check_model(model)
-        plan, observed = self._observe(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None))
+        plan, observed = self._observe(lambda: _build_fixture_weight_plan(model))
         self._assert_work(
             observed,
             width=width,
@@ -43105,12 +42844,8 @@ class TestOnnxScan8ProducerAttributeAdmission:
                 if parent_record is not None:
                     parent_record["boundary_calls" if name == "scan_stacked_output_start" else "extent_calls"] += 1
 
-        previous = sys.getprofile()
-        try:
-            sys.setprofile(profile)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
-        finally:
-            sys.setprofile(previous)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model)
         assert attempts
         assert not active
         for attempt in attempts:
@@ -43139,11 +42874,26 @@ class TestOnnxScan8ProducerAttributeAdmission:
             assert any(check.details.get("coverage_gap") == "unresolved_initializer_lineage" for check in report.checks)
 
 
+_PROTOBUF_SERIALIZATION_NAMES = frozenset({"ByteSize", "SerializeToString", "SerializePartialToString"})
+
+
+def _protobuf_serialization_call(frame: FrameType, event: str, argument: Any) -> tuple[Message, str] | None:
+    if event == "c_call":
+        name = str(getattr(argument, "__name__", ""))
+    elif event == "call":
+        name = frame.f_code.co_name
+    else:
+        return None
+    if name not in _PROTOBUF_SERIALIZATION_NAMES:
+        return None
+    receiver = getattr(argument, "__self__", None) if event == "c_call" else frame.f_locals.get("self")
+    return (receiver, name) if isinstance(receiver, Message) else None
+
+
 class _OnnxFingerprintObserver:
     """Observe real protobuf calls, scoped to the production fingerprint stack."""
 
     _helper_names = frozenset({"semantic_cache_fingerprint", "semantic_cache_fingerprint_with_owner"})
-    _serialization_names = frozenset({"ByteSize", "SerializeToString", "SerializePartialToString"})
 
     def __init__(self) -> None:
         self.scanner_filename = onnx_scanner_module._build_onnx_weight_analysis_plan.__code__.co_filename
@@ -43163,7 +42913,7 @@ class _OnnxFingerprintObserver:
 
     def profile(self, frame: Any, event: str, arg: Any) -> None:
         function_name = frame.f_code.co_name
-        helper_frame = frame.f_code.co_filename == self.scanner_filename and function_name in self._helper_names
+        helper_frame = function_name in self._helper_names and frame.f_code.co_filename == self.scanner_filename
         if event == "call" and helper_frame:
             self.active_frames.add(id(frame))
             if function_name == "semantic_cache_fingerprint":
@@ -43171,21 +42921,14 @@ class _OnnxFingerprintObserver:
             else:
                 self.helper_entries += 1
 
-        method_name = ""
-        receiver: Any = None
-        if event == "c_call":
-            method_name = str(getattr(arg, "__name__", ""))
-            receiver = getattr(arg, "__self__", None)
-        elif event == "call":
-            method_name = function_name
-            receiver = frame.f_locals.get("self")
-        if method_name in self._serialization_names and isinstance(receiver, Message):
+        if (self.calibrating or self.active_frames) and (call := _protobuf_serialization_call(frame, event, arg)):
+            receiver, method_name = call
             descriptor_name = str(receiver.DESCRIPTOR.full_name)
             if self.calibrating:
                 # Calibration is intentionally outside the fingerprint helper.
                 assert not self.active_frames
                 self.calibration_calls.add((descriptor_name, method_name))
-            elif self.active_frames:
+            else:
                 self.serialization_calls.append((descriptor_name, method_name))
 
         if event == "return" and helper_frame:
@@ -43239,7 +42982,7 @@ class _OnnxFingerprintObserver:
         expected = {
             (descriptor_name, name)
             for descriptor_name in ("onnx.TensorProto", "onnx.AttributeProto")
-            for name in self._serialization_names
+            for name in _PROTOBUF_SERIALIZATION_NAMES
         }
         assert self.calibration_calls >= expected
         assert self.helper_entries == 0
@@ -43393,13 +43136,9 @@ class TestOnnxFingerprintPrecopyAdmission:
         config = {"max_array_size": 64 * 1024} if payload_kind == "captured_tensor" else {}
         scanner = OnnxScanner(config) if route == "onnx" else WeightDistributionScanner(config)
         observed = _OnnxFingerprintObserver()
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(observed.profile)
+        with _profile_calls(observed.profile):
             observed.calibrate()
             result = scanner.scan(str(path))
-        finally:
-            sys.setprofile(previous_profile)
 
         assert result.success is True, result.metadata
         semantics = result.metadata["onnx_weight_distribution_semantics"]
@@ -43622,7 +43361,7 @@ class TestOnnxNoopSqueezeLineageRegressions:
         model, weights = self._model(noop_count)
         assert sum(node.op_type == "Squeeze" for node in model.graph.node) == noop_count
         self._assert_reference_identity(model, weights)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=weights.nbytes)
+        plan = _build_fixture_weight_plan(model, max_array_size=weights.nbytes)
         self._assert_single_view(plan, weights, consumer_count=1)
         self._assert_public_contract(model, tmp_path, weights, consumer_count=1, total_limit=24576)
 
@@ -43668,8 +43407,6 @@ class TestOnnxNoopSqueezeLineageRegressions:
             patch.setattr(onnx.numpy_helper, "to_array", record_load)
             plan = _build_fixture_weight_plan(
                 model,
-                onnx=onnx,
-                np=np,
                 max_array_size=weights.nbytes,
                 pre_materialization_check=lambda _tensor, name, size: analyzer._tensor_fits_budget(
                     "onnx_initializer_size_limit", name, tensor_nbytes=size
@@ -43689,8 +43426,6 @@ class TestOnnxNoopSqueezeLineageRegressions:
 
 class _OnnxEquationPrecopyObserver:
     """Observe protobuf calls and the equation helper's actual payload-read site."""
-
-    _serialization_names = frozenset({"ByteSize", "SerializeToString", "SerializePartialToString"})
 
     def __init__(self) -> None:
         self.scanner_filename = onnx_scanner_module._build_onnx_weight_analysis_plan.__code__.co_filename
@@ -43723,23 +43458,18 @@ class _OnnxEquationPrecopyObserver:
 
     def profile(self, frame: Any, event: str, argument: Any) -> None:
         protected = (
-            frame.f_code.co_filename == self.scanner_filename and frame.f_code.co_name == "parsed_einsum_equation"
+            frame.f_code.co_name == "parsed_einsum_equation" and frame.f_code.co_filename == self.scanner_filename
         )
         if protected and event == "call":
             self.active_profile_frames.add(id(frame))
-        method_name = ""
-        receiver: Any = None
-        if event == "c_call":
-            method_name = str(getattr(argument, "__name__", ""))
-            receiver = getattr(argument, "__self__", None)
-        elif event == "call":
-            method_name = frame.f_code.co_name
-            receiver = frame.f_locals.get("self")
-        if method_name in self._serialization_names and isinstance(receiver, Message):
+        if (self.calibrating or self.active_profile_frames) and (
+            call := _protobuf_serialization_call(frame, event, argument)
+        ):
+            _, method_name = call
             if self.calibrating:
                 assert not self.active_profile_frames
                 self.calibration_calls.add(method_name)
-            elif self.active_profile_frames:
+            else:
                 self.serialization_calls.append(method_name)
         if protected and event == "return":
             self.active_profile_frames.remove(id(frame))
@@ -43765,7 +43495,7 @@ class _OnnxEquationPrecopyObserver:
                         offsets.add(instruction.offset)
                 assert len(offsets) == 1
                 self.offsets[frame.f_code] = offsets
-            frame.f_trace_opcodes = True
+            _enable_opcode_events(frame, self.trace)
             if protected:
                 node = frame.f_locals["node"]
                 record: dict[str, Any] = {
@@ -43832,7 +43562,7 @@ class _OnnxEquationPrecopyObserver:
             finally:
                 self.calibrating = False
             assert self.calibration_getters == 1
-            assert self.calibration_calls == self._serialization_names
+            assert self.calibration_calls == _PROTOBUF_SERIALIZATION_NAMES
             assert not self.queries and not self.serialization_calls
             return run()
         finally:
@@ -44145,7 +43875,6 @@ class _OnnxPaddingReadObserver:
     """Observe real padding reads without treating native getter silence as proof."""
 
     _protected = frozenset({"parsed_padding_mode", "has_no_padding", "pooling_has_nonempty_samples"})
-    _serializers = frozenset({"ByteSize", "SerializeToString", "SerializePartialToString"})
 
     def __init__(self) -> None:
         self.filename = onnx_scanner_module._build_onnx_weight_analysis_plan.__code__.co_filename
@@ -44176,7 +43905,7 @@ class _OnnxPaddingReadObserver:
         if not calibration and not protected:
             return None
         if event == "call":
-            frame.f_trace_opcodes = True
+            _enable_opcode_events(frame, self.trace)
         elif event == "opcode":
             if code not in self.instructions:
                 self.instructions[code] = {
@@ -44192,13 +43921,21 @@ class _OnnxPaddingReadObserver:
         return self.trace
 
     def profile(self, frame: Any, event: str, arg: Any) -> None:
+        if (self.calibrating or self.active_frames) and (call := _protobuf_serialization_call(frame, event, arg)):
+            _, method_name = call
+            if self.calibrating:
+                self.calibration_serializers.add(method_name)
+            else:
+                self.serializers.append(method_name)
+
+        if event not in {"call", "return"} or frame.f_code.co_filename != self.filename:
+            return
         name = frame.f_code.co_name
-        local = frame.f_locals
-        production = frame.f_code.co_filename == self.filename
-        protected = production and name in self._protected
+        protected = name in self._protected
         if event == "call" and protected:
             self.active_frames.add(id(frame))
-        if production and name == "reserve_function_default_work":
+        if name == "reserve_function_default_work":
+            local = frame.f_locals
             if event == "call":
                 caller = frame.f_back.f_code.co_name if frame.f_back is not None else ""
                 self.reservation_entries[id(frame)] = (caller, local["work"], local["function_default_work_remaining"])
@@ -44206,10 +43943,9 @@ class _OnnxPaddingReadObserver:
                 entry = self.reservation_entries.pop(id(frame))
                 self.reservations.append((*entry, local["function_default_work_remaining"], bool(arg)))
         if (
-            production
-            and name == "default_function_attribute_maps"
+            name == "default_function_attribute_maps"
             and event == "return"
-            and getattr(local.get("function"), "name", "") == "SpendDefaultWork"
+            and getattr(frame.f_locals.get("function"), "name", "") == "SpendDefaultWork"
         ):
             attributes, source_keys = arg
             target = attributes.get("tag0")
@@ -44223,19 +43959,8 @@ class _OnnxPaddingReadObserver:
                 )
             )
 
-        method_name = ""
-        receiver: Any = None
-        if event == "c_call":
-            method_name, receiver = str(getattr(arg, "__name__", "")), getattr(arg, "__self__", None)
-        elif event == "call":
-            method_name, receiver = name, local.get("self")
-        if method_name in self._serializers and isinstance(receiver, Message):
-            if self.calibrating:
-                self.calibration_serializers.add(method_name)
-            elif self.active_frames:
-                self.serializers.append(method_name)
-
         if event == "return" and protected:
+            local = frame.f_locals
             if name == "parsed_padding_mode":
                 owner = local["attribute"]
                 cache = local["padding_mode_cache"]
@@ -44272,7 +43997,7 @@ class _OnnxPaddingReadObserver:
 
     def assert_observation_available(self) -> None:
         assert self.calibration_getters == 1
-        assert self.calibration_serializers == self._serializers
+        assert self.calibration_serializers == _PROTOBUF_SERIALIZATION_NAMES
         assert not self.active_frames and not self.reservation_entries
         assert self.parses
         assert self.serializers == []
@@ -44368,7 +44093,7 @@ class TestOnnxPaddingStringAdmission:
     @staticmethod
     def _observe_plan(model: Any) -> tuple[Any, _OnnxPaddingReadObserver]:
         observer = _OnnxPaddingReadObserver()
-        plan = observer.run(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024))
+        plan = observer.run(lambda: _build_fixture_weight_plan(model, max_array_size=64 * 1024))
         observer.assert_observation_available()
         return plan, observer
 
@@ -45355,14 +45080,13 @@ class TestOnnxFiniteReplaySelectedFunctionResults:
     ) -> None:
         model, prior_weights = self._model(trip_count, dead_kind, live_index, mode)
         self._assert_runtime_ranks(model, trip_count, mode == "internal_consumer")
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
         function_results: list[tuple[Any, tuple[int, ...], set[str]]] = []
 
         def profile(frame: Any, event: str, arg: Any) -> None:
             if (
                 event != "return"
                 or frame.f_code.co_name != "function_input_consumes_weight_rank_at_or_above_two"
-                or Path(frame.f_code.co_filename).resolve() != scanner_path
+                or frame.f_globals is not _ONNX_SCANNER_GLOBALS
                 or getattr(frame.f_locals.get("function_graph"), "name", None) != "SelectedResultUpdate"
             ):
                 return
@@ -45370,12 +45094,8 @@ class TestOnnxFiniteReplaySelectedFunctionResults:
             if published is not None:
                 function_results.append((arg, frame.f_locals["requested_output_indexes"], set(published)))
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(profile)
-            plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
-        finally:
-            sys.setprofile(previous_profile)
+        with _profile_calls(profile):
+            plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert function_results
         requested = (0, 1) if mode == "required_independent_control" else (live_index,)
         assert all(indexes == requested for _, indexes, _ in function_results)
@@ -46609,7 +46329,7 @@ class TestOnnxFunctionReferenceAdmission:
         )
         onnx.checker.check_model(model)
         observer = _OnnxFunctionReferenceAdmissionObserver()
-        plan = observer.run(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None))
+        plan = observer.run(lambda: _build_fixture_weight_plan(model))
         assert plan.coverage_gaps == {} and plan.specs == []
         references, defaults = observer.caches()
         assert references == defaults == {}
@@ -47448,7 +47168,7 @@ class TestOnnxBindingNameAdmission:
         )
         onnx.checker.check_model(model)
         observed = _OnnxBindingNameObserver()
-        plan = observed.run(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None))
+        plan = observed.run(lambda: _build_fixture_weight_plan(model))
         assert plan.coverage_gaps == {} and plan.specs == []
         assert observed.environment["attribute_binding_keys"] == {}
         return model.functions[0], observed
@@ -47824,12 +47544,8 @@ class _OnnxOperatorIdentifierObserver:
                 observed["remaining"] = local["operator_identifier_work_remaining"]
                 observed["cache"] = local["operator_identifier_cache"]
 
-        previous = sys.getprofile()
-        try:
-            sys.setprofile(profile)
+        with _profile_calls(profile):
             result = run(observed)
-        finally:
-            sys.setprofile(previous)
         assert not active
         return result, observed
 
@@ -48292,7 +48008,7 @@ class TestOnnxSiblingAttributeAdmission:
         )
         onnx.checker.check_model(model, full_check=True)
         observed = _SiblingAttributeWalkObserver()
-        plan = observed.run(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None))
+        plan = observed.run(lambda: _build_fixture_weight_plan(model))
         assert plan.coverage_gaps == {} and plan.specs == []
         assert callable(observed.environment["helper"])
         return observed
@@ -48462,7 +48178,7 @@ class TestOnnxSiblingAttributeAdmission:
         # attributes intentionally test conservative handling of malformed data.
         incomplete = bool(padding)
         observed = _SiblingAttributeWalkObserver()
-        plan = observed.run(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None))
+        plan = observed.run(lambda: _build_fixture_weight_plan(model))
         self._assert_observed(observed, padding)
         assert bool(plan.coverage_gaps.get("lineages_per_value_limit", 0)) is incomplete
         if not incomplete:
@@ -48613,12 +48329,8 @@ class TestOnnxFiniteReplayValueNameWork:
             ):
                 replay_results.append(result)
 
-        previous_profile = sys.getprofile()
-        try:
-            sys.setprofile(profile)
+        with _profile_calls(profile):
             result = run()
-        finally:
-            sys.setprofile(previous_profile)
 
         assert not active and not active_names
         return result, {
@@ -49003,7 +48715,7 @@ class TestOnnxFiniteReplayValueNamePreparation:
     def test_real_cold_inventories_preserve_zero_completion_cache_and_cleanup(self) -> None:
         observed = _OnnxReplayPreparationObserver()
         model = self._model("formal", 64)
-        plan = observed.run(lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None))
+        plan = observed.run(lambda: _build_fixture_weight_plan(model))
         assert plan.coverage_gaps == {} and len(plan.specs) == 1
         reserve = observed.replay_helpers["reserve_exact_loop_replay_name_work"]
         nested = observed.replay_helpers["bounded_nested_external_reference_names"]
@@ -49180,12 +48892,8 @@ class TestOnnxRepeatedOutputSlotAdmission:
 
         with monkeypatch.context() as patch:
             patch.setattr(onnx_scanner_module, "getattr", counted_getattr, raising=False)
-            previous = sys.getprofile()
-            try:
-                sys.setprofile(profile)
+            with _profile_calls(profile):
                 result = run(observed)
-            finally:
-                sys.setprofile(previous)
         return result, observed
 
     @pytest.mark.parametrize("scanner_type", [OnnxScanner, WeightDistributionScanner])
@@ -49231,7 +48939,7 @@ class TestOnnxRepeatedOutputSlotAdmission:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         def run(observed: dict[str, Any]) -> None:
-            plan = _build_fixture_weight_plan(self._model(8), onnx=onnx, np=np, max_array_size=None)
+            plan = _build_fixture_weight_plan(self._model(8))
             assert plan.coverage_gaps == {} and observed["rank"]
             helpers = observed["helpers"]
             value = TestOnnxShapeContinuity._v
@@ -49336,7 +49044,7 @@ class TestOnnxRepeatedOutputSlotAdmission:
         )
         onnx.checker.check_model(model, full_check=True)
         plan, observed = TestOnnxRecurrentConstantCopyAdmission._observe(
-            monkeypatch, lambda: _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+            monkeypatch, lambda: _build_fixture_weight_plan(model)
         )
         rank_copies = [copy for copy in observed["copies"] if copy["owner"] == "rank"]
         assert [(copy["yielded"], copy["appended"]) for copy in rank_copies] == [(count, count)]
@@ -49510,7 +49218,6 @@ class TestOnnxDroppedShapeControlConversion:
 class TestOnnxShapeControlGapSummary:
     @staticmethod
     def _capture() -> tuple[dict[str, Any], list[Any], dict[str, tuple[int, Any]]]:
-        import sys
 
         names = {
             "empty_weight_gap_summary",
@@ -49555,12 +49262,8 @@ class TestOnnxShapeControlGapSummary:
                     transported[graph_name] = (counts.get(value_name, 0), summaries.get(value_name))
 
         model, _prior = TestOnnxDroppedShapeControlConversion._model("runtime", "converted", False)
-        previous = sys.getprofile()
-        try:
-            sys.setprofile(observe)
-            _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
-        finally:
-            sys.setprofile(previous)
+        with _profile_calls(observe):
+            _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert set(captured) == names
         assert capped
         assert set(transported) == {"dropped_shape_control_conversion", "dropped_shape_control_body"}
@@ -49877,7 +49580,7 @@ class TestOnnxFiniteReplayBoundFunctionAttributes:
         else:
             attribute.ClearField("i")
             attribute.ref_attr_name = "missing_parameter"
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert plan.coverage_gaps.get("lineages_per_value_limit", 0)
         assert any(np.array_equal(spec.weights, prior) for spec in plan.specs)
 
@@ -50251,7 +49954,7 @@ class TestOnnxScan8ZeroBatchConsistency:
         incomplete = mode not in {"declared_zero", "immutable_zero", "declared_one"}
         if not incomplete:
             onnx.checker.check_model(model)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert bool(plan.coverage_gaps) is incomplete, plan.coverage_gaps
         assert bool(plan.exclusion_counts.get("empty_weight_view")) is (not incomplete and mode != "declared_one")
         path = _save_onnx_model(model, tmp_path / "scan8-zero-batch-consistency.onnx")
@@ -50353,7 +50056,7 @@ class TestOnnxScan8SingleInvocationMaterialization:
             )
             expected = actual[1][None, None, ...]
             assert expected.shape == (1, 1, 64, 64)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=64 * 1024)
+        plan = _build_fixture_weight_plan(model, max_array_size=64 * 1024)
         assert bool(plan.coverage_gaps or plan.extraction_failures) is incomplete
         assert any(spec.context["initializer"] == "prior" for spec in plan.specs)
         if not incomplete:
@@ -50644,7 +50347,7 @@ class TestOnnxFixedCarriedReshape:
             onnx.numpy_helper.from_array(initial, name="W")
         )
         expected = self._assert_runtime(model, initial, prior, {"target": (64, 64)})[0]
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         assert plan.coverage_gaps == {}
         assert any(spec.context["initializer"] == "W" and np.array_equal(spec.weights, expected) for spec in plan.specs)
         path = _save_onnx_model(model, tmp_path / "recovered-reshape-weight.onnx")
@@ -51002,7 +50705,7 @@ class TestOnnxDirectLoopBoundAxes:
         own_anomaly: bool = False,
     ) -> Any:
         tmp_path.mkdir(parents=True, exist_ok=True)
-        plan = _build_fixture_weight_plan(model, onnx=onnx, np=np, max_array_size=None)
+        plan = _build_fixture_weight_plan(model)
         if incomplete:
             assert plan.coverage_gaps.get("lineages_per_value_limit", 0) > 0
         else:

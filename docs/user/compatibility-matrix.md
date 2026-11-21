@@ -4,7 +4,7 @@ This page shows which model formats work in base install and which require optio
 
 ## Installation profiles
 
-- Broad portable coverage: `pip install "modelaudit[all]"` (ONNX installs on Python 3.10-3.12; on Python 3.11-3.12, add `tensorflow` only for TensorFlow-dependent checkpoint/weight analysis)
+- Use `pip install "modelaudit[all]"` for broad portable coverage, including ONNX. On Python 3.11-3.12, add `tensorflow` only for TensorFlow-dependent checkpoint or weight analysis.
 - Minimal base install: `pip install modelaudit`
 - Targeted extras: install only the extras you need (examples below)
 
@@ -19,7 +19,7 @@ This page shows which model formats work in base install and which require optio
 | R serialized                    | `.rds`, `.rda`, `.rdata`, signature-valid renamed workspace files                           | Yes (static analysis only)                                | None                                                                                             |
 | TensorFlow SavedModel/MetaGraph | `.pb`, `.meta`, SavedModel directories                                                      | Yes (vendored protos)                                     | `modelaudit[tensorflow]` on Python 3.11-3.12 for TensorFlow-dependent checkpoint/weight analysis |
 | Keras H5                        | `.h5`, `.hdf5`                                                                              | No                                                        | `modelaudit[h5]` (required)                                                                      |
-| ONNX                            | `.onnx`                                                                                     | No                                                        | `modelaudit[onnx]` on Python 3.10-3.12 (required)                                                |
+| ONNX                            | `.onnx`                                                                                     | No                                                        | `modelaudit[onnx]` (required)                                                                    |
 | CoreML                          | `.mlmodel`, validated or bounded-candidate renamed artifacts                                | Yes (static protobuf/metadata checks)                     | None                                                                                             |
 | NeMo                            | `.nemo`, renamed archives with root config                                                  | Yes (static tar/config analysis, Hydra `_target_` checks) | None                                                                                             |
 | CNTK native                     | `.dnn`, `.cmf`, signature-valid renamed artifacts                                           | Yes (static signature and string analysis)                | None                                                                                             |
@@ -67,4 +67,3 @@ Renamed RKNN and standalone ExecuTorch routing does not override `.pb` or `.meta
 - Standalone Jinja2 templates exceeding the configured template-analysis size limit or failing UTF-8 text decoding are reported as incomplete coverage instead of clean results.
 - JAX content routing recognizes renamed JSON metadata when top-level identity fields contain JAX-family signals; candidates too large for complete bounded classification are reported as incomplete coverage, while observable security patterns in the bounded inspected prefix may still be reported conservatively. Near matches and arbitrary JSON conclusively classified within the routing budget remain outside this route.
 - `modelaudit doctor --show-failed` shows unavailable scanners and missing dependencies in your environment.
-- If you need predictable CI behavior across many formats, prefer `modelaudit[all]`; ONNX is included on Python 3.10-3.12, and TensorFlow runtime-dependent paths require adding `modelaudit[tensorflow]` on Python 3.11-3.12.
