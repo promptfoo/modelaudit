@@ -19,7 +19,7 @@ pub(crate) const BASE64_DANGEROUS_SEEDS: &[&str] = &[
 // alignment. Case-folding these fragments keeps the prefilter in parity with
 // the case-insensitive dangerous-call classifier.
 pub(crate) const BASE64_CASEFOLD_DANGEROUS_SEEDS: &[&[u8]] = &[
-    b"os.s", b"eval", b"exec", b"__im", b"subp", b"syst", b"geta",
+    b"os.s", b"eval", b"exec", b"__im", b"__la", b"subp", b"syst", b"geta",
 ];
 
 pub(crate) struct ModuleAttrPattern {
@@ -34,6 +34,7 @@ pub(crate) const CALL_LIKE_PATTERNS: &[(&str, &str)] = &[
     ("compile", "compile("),
     ("eval", "eval("),
     ("exec", "exec("),
+    ("__lazy_import__", "__lazy_import__("),
 ];
 
 pub(crate) const MODULE_ATTR_PATTERNS: &[ModuleAttrPattern] = &[

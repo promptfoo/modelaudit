@@ -845,6 +845,7 @@ fn decoded_dangerous_string_matches(decoded: &[u8]) -> Vec<String> {
             "eval(" | "getattr eval" => "base64 eval(",
             "exec(" | "getattr exec" => "base64 exec(",
             "__import__(" => "base64 __import__",
+            "__lazy_import__(" => "base64 __lazy_import__",
             "subprocess call" | "getattr process call" | "getattr popen" => "base64 subprocess",
             URL_SCAN_LIMIT_SENTINEL | URL_CONTEXT_INCOMPLETE_SENTINEL => pattern.as_str(),
             _ => continue,
@@ -858,6 +859,7 @@ fn decoded_dangerous_string_matches(decoded: &[u8]) -> Vec<String> {
         ("eval", "base64 eval("),
         ("exec", "base64 exec("),
         ("__import__", "base64 __import__"),
+        ("__lazy_import__", "base64 __lazy_import__"),
     ] {
         if contains_dangerous_callable_invocation(&lower, name) {
             push_unique(&mut matches, label);

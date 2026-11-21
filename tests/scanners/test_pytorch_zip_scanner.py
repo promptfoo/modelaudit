@@ -5801,6 +5801,8 @@ def test_pytorch_zip_base64_literal_text_route_scans_middle_windows_without_size
     [
         (b"OS . system('id')", "suspicious", True),
         (b"__import__", "suspicious", True),
+        (b"__lazy_import__('example').resolve()", "suspicious", True),
+        (base64.b64encode(b"__lazy_import__('example').resolve()"), "suspicious", True),
         (b'importlib.import_module("os")', "suspicious", True),
         (b"getattr(obj, 'system')", "malicious", False),
         (b"getattr(getattr(obj, key), arg)", "malicious", True),
@@ -5819,6 +5821,8 @@ def test_pytorch_zip_base64_literal_text_route_scans_middle_windows_without_size
     ids=[
         "spaced-os-system",
         "dunder-import",
+        "lazy-import",
+        "base64-lazy-import",
         "importlib-import-module",
         "getattr-system",
         "nested-getattr",

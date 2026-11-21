@@ -30,6 +30,7 @@ _ROUTE_PATTERNS = tuple(
     for pattern in (
         r"(?:compile|eval|exec)\(",
         r"__import__\(",
+        r"(?a:\b__lazy_import__\b)",
         r"import\s+[\w.]+",
         r"from\s+[\w.]+\s+import\s*(?:\(|\*|[\w.,\s]+)",
         r"importlib\.(?:import_module|__import__)\(",
