@@ -30,13 +30,13 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 
 `pyyaml`, `msgpack`, and cloud storage dependencies (`fsspec`, `s3fs`, `gcsfs`) are core dependencies in the base install. Keep ONNX docs aligned with the `python_version < "3.13"` package marker until that gate is removed.
 
-XGBoost 3.4 requires Python 3.12+, so Python 3.10-3.11 use XGBoost 3.2 while Python 3.12-3.14 use XGBoost 3.4.
+Python 3.10–3.11 use XGBoost 3.2. Python 3.12 and later use XGBoost 3.4.
 
-Standard CPython 3.14 uses the broad root test profile alongside Python 3.11; it is not added to the reduced-lane allowlist. PR CI also smoke-tests native pickle and H5 scanning on macOS and Windows. Python 3.10, 3.12, and 3.13 retain their existing reduced profiles.
+Standard CPython 3.11, 3.14 and 3.15 use the broad root test profile. Python 3.10, 3.12 and 3.13 use the reduced profiles. See the [workflow matrix](../../.github/workflows/README.md) for native smoke tests.
 
-The H5 extras require h5py 3.15+ on Python 3.14 for upstream wheel support; older Python versions keep their existing h5py floor and locked h5py 3.14.0. The Python 3.14 lock selects h5py 3.16.0 with bundled HDF5 2.0; regression tests cover benign and malicious Keras metadata with both earliest and latest HDF5 format bounds. TensorFlow and ONNX retain the version markers above. Free-threaded Python is not supported.
+The `h5` extra requires h5py 3.15+ on Python 3.14 and later. On Python 3.15, the locked h5py release has no wheels. The `all`, `all-ci` and `numpy1` bundles omit h5py there. Add `--extra h5` to `uv sync` with HDF5 development libraries and a C compiler installed. Some 7z and UBJSON dependencies also build from source.
 
-Python 3.14 Dill function/class bytecode can resemble a truncated embedded pickle. These files retain fail-closed S213 incomplete-analysis findings alongside the normal dynamic-code findings. Do not exempt executable bytecode from nested inspection; the regression test requires this conservative result on 3.14 and completed analysis on older interpreters.
+Dill 0.4.1 cannot serialize functions on Python 3.15 because `code.co_lnotab` was removed. Use existing Dill fixtures to test scanning. Python 3.14 bytecode can resemble a truncated embedded pickle and produce S213 incomplete-analysis findings alongside dynamic-code findings. Keep nested inspection enabled for executable bytecode.
 
 ## TensorFlow SavedModel Scanning (No TensorFlow Required)
 

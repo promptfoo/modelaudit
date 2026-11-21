@@ -28,8 +28,8 @@ ModelAudit is a static security scanner for model artifacts. It analyzes files a
 Hugging Face Hub coordinates downloads with `filelock`, which ModelAudit pins to
 `3.20.3` on Python 3.10. On Unix, if another account can place a file at a lock
 path, acquiring the lock can truncate the file and change its permissions. On Windows,
-lock files can inherit overly broad permissions. Python 3.11–3.14 installations
-require `filelock>=4.2.9`, which includes both fixes. [Unix advisory](https://github.com/advisories/GHSA-69hj-f68j-2879) · [Windows advisory](https://github.com/advisories/GHSA-8mx5-7m5m-r77g)
+lock files can inherit overly broad permissions. On Python 3.11 and later, ModelAudit
+requires `filelock>=4.2.9`, which includes both fixes. [Unix advisory](https://github.com/advisories/GHSA-69hj-f68j-2879) · [Windows advisory](https://github.com/advisories/GHSA-8mx5-7m5m-r77g)
 
 For Python 3.10 scans, point `--cache-dir` and `HF_HUB_CACHE` to fresh directories
 under the scanning account's private home directory. Create them with mode `0700` on

@@ -88,5 +88,4 @@ are required.
 ## Removing Dependencies
 
 Prefer removing unused or redundant dependencies over keeping them. Open a PR with a note on
-what broke the dependency's usefulness and verify CI passes across the full Python matrix
-(3.10–3.14) before merging.
+what broke the dependency's usefulness and verify CI passes across the full [supported Python matrix](../../SUPPORT.md) before merging.
