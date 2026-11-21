@@ -3107,7 +3107,7 @@ wheels = [
 
 [[package]]
 name = "modelaudit"
-version = "0.2.58"
+version = "0.2.59"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
