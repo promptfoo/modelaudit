@@ -16,8 +16,6 @@ from contextlib import ExitStack, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from importlib.machinery import (
-    BYTECODE_SUFFIXES,
-    EXTENSION_SUFFIXES,
     SOURCE_SUFFIXES,
     ModuleSpec,
 )
@@ -40,11 +38,8 @@ _CAPTURE_REPOSITORY_SCAN_ROOT: ContextVar[Path | None] = ContextVar(
 )
 
 _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY = "call_graph_source_fingerprints"
-_CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES = 1024 * 1024
-_CALL_GRAPH_REGULAR_FILE_FINGERPRINT = "regular-file"
-_CALL_GRAPH_READ_FINGERPRINT_MAX_BYTES = 4 * _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES
+_CALL_GRAPH_READ_FINGERPRINT_MAX_BYTES = 4 * 1024 * 1024
 _MAX_SOURCE_FINGERPRINT_CANDIDATES = 4096
-_MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES = 256
 _MAX_SOURCE_MODULE_NAME_CHARS = 4096
 _PICKLE_CALL_GRAPH_INPUT_KEYS = frozenset({"import_references", "callable_invocations"})
 _PICKLE_RESULT_METADATA_KEYS = frozenset({"pickle_report_status", "pickle_verdict", "pickle_source"})
@@ -54,18 +49,6 @@ _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT = (
 )
 
 
-def _file_stat_identity(file_stat: os.stat_result) -> tuple[int, ...]:
-    """Capture all same-view file identity fields in their original read order."""
-    return (
-        file_stat.st_dev,
-        file_stat.st_ino,
-        file_stat.st_mode,
-        file_stat.st_size,
-        file_stat.st_mtime_ns,
-        file_stat.st_ctime_ns,
-    )
-
-
 # Older independent picklescan releases must fail closed as a group instead of
 # binding an earlier, incomplete subset of the resolution helpers.
 _PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE = all(
@@ -73,6 +56,8 @@ _PICKLESCAN_RESOLUTION_HELPERS_AVAILABLE = all(
     for name in (
         "_current_module_source_path",
         "_path_importer_resolution_context",
+        "_read_candidate_fingerprint",
+        "_resolution_candidate_fingerprint",
         "_resolution_context_allows_trusted_cache_population",
         "_search_path_has_untrusted_importer",
         "_source_resolution_context",
@@ -1866,136 +1851,22 @@ class ScanResultsCache:
         return [str(Path(entry or os.getcwd()).absolute()) for entry in sys.path]
 
     @staticmethod
-    def _regular_file_identity_fingerprint(file_stat: os.stat_result) -> str:
-        identity = "\0".join(str(value) for value in _file_stat_identity(file_stat))
-        digest = hashlib.sha256(identity.encode()).hexdigest()
-        return f"{_CALL_GRAPH_REGULAR_FILE_FINGERPRINT}:{digest}"
-
-    @staticmethod
-    def _cross_view_file_stat_identity(file_stat: os.stat_result) -> tuple[int, ...]:
-        """Compare path and descriptor views without Windows-only stat differences."""
-        identity = (
-            file_stat.st_dev,
-            file_stat.st_ino,
-            stat.S_IFMT(file_stat.st_mode),
-            file_stat.st_size,
-            file_stat.st_mtime_ns,
-        )
-        if os.name == "nt":
-            return identity
-        return (*identity, file_stat.st_ctime_ns)
-
-    @staticmethod
-    def _read_fingerprint_bytes(file_descriptor: int, remaining: int) -> bytes:
-        chunks: list[bytes] = []
-        while remaining > 0:
-            chunk = os.read(file_descriptor, min(64 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-
-    @staticmethod
     def _bounded_source_fingerprint(path: Path) -> str | None:
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
-        try:
-            file_descriptor = os.open(path, flags)
-        except (FileNotFoundError, NotADirectoryError):
-            return None
-        try:
-            before = os.fstat(file_descriptor)
-            if not stat.S_ISREG(before.st_mode):
-                raise ValueError("source fingerprint candidate is not a regular file")
-            is_extension = str(path).endswith(tuple(EXTENSION_SUFFIXES))
-            max_bytes = 0
-            if not is_extension:
-                max_bytes = (
-                    _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES * 2
-                    if str(path).endswith(tuple(BYTECODE_SUFFIXES))
-                    else _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES
-                )
-            if not is_extension and before.st_size > max_bytes:
-                raise ValueError("source fingerprint budget exceeded")
-            source = ScanResultsCache._read_fingerprint_bytes(file_descriptor, 0 if is_extension else max_bytes + 1)
-            after = os.fstat(file_descriptor)
-            before_identity = _file_stat_identity(before)
-            after_identity = _file_stat_identity(after)
-            try:
-                path_stat = path.stat()
-            except OSError as error:
-                raise ValueError("source fingerprint candidate path changed while being read") from error
-            if before_identity != after_identity or ScanResultsCache._cross_view_file_stat_identity(
-                after
-            ) != ScanResultsCache._cross_view_file_stat_identity(path_stat):
-                raise ValueError("source fingerprint candidate changed while being read")
-            if is_extension:
-                return ScanResultsCache._regular_file_identity_fingerprint(after)
-            if len(source) > max_bytes:
-                raise ValueError("source fingerprint budget exceeded")
-            return hashlib.sha256(source).hexdigest()
-        finally:
-            os.close(file_descriptor)
+        reusable, fingerprint = _picklescan_call_graph._resolution_candidate_fingerprint(path)
+        if not reusable:
+            raise ValueError("source fingerprint unavailable or candidate changed while being read")
+        return fingerprint.hex() if isinstance(fingerprint, bytes) else fingerprint
 
     @staticmethod
     def _bounded_read_fingerprint(path: Path, read_limit: int, require_complete: bool) -> str | None:
         if read_limit < 0 or read_limit > _CALL_GRAPH_READ_FINGERPRINT_MAX_BYTES:
             raise ValueError("read fingerprint budget is invalid")
-        try:
-            path_before = path.stat()
-            if stat.S_ISDIR(path_before.st_mode):
-                entries: list[bytes] = []
-                total_bytes = 0
-                for index, entry in enumerate(path.iterdir()):
-                    if index >= _MAX_BYTECODE_CACHE_DIRECTORY_ENTRIES:
-                        raise ValueError("read fingerprint directory entry budget exceeded")
-                    entry_name = os.fsencode(entry.name)
-                    total_bytes += len(entry_name) + 1
-                    if require_complete and total_bytes > read_limit:
-                        raise ValueError("read fingerprint directory budget exceeded")
-                    entries.append(entry_name)
-                path_after = path.stat()
-                before_identity = _file_stat_identity(path_before)
-                after_identity = _file_stat_identity(path_after)
-                if before_identity != after_identity:
-                    raise ValueError("read fingerprint directory changed while being read")
-                return hashlib.sha256(b"directory\0" + b"\0".join(sorted(entries))).hexdigest()
-        except (FileNotFoundError, NotADirectoryError):
-            return None
-        except OSError as error:
-            raise ValueError("read fingerprint directory is unavailable") from error
-
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
-        try:
-            file_descriptor = os.open(path, flags)
-        except (FileNotFoundError, NotADirectoryError):
-            return None
-        try:
-            before = os.fstat(file_descriptor)
-            if not stat.S_ISREG(before.st_mode):
-                return None
-            source = ScanResultsCache._read_fingerprint_bytes(file_descriptor, read_limit + int(require_complete))
-            after = os.fstat(file_descriptor)
-            before_identity = _file_stat_identity(before)
-            after_identity = _file_stat_identity(after)
-            try:
-                path_stat = path.stat()
-            except OSError as error:
-                raise ValueError("read fingerprint candidate path changed while being read") from error
-            path_identity = _file_stat_identity(path_stat)
-            initial_path_identity = _file_stat_identity(path_before)
-            if (
-                before_identity != after_identity
-                or initial_path_identity != path_identity
-                or ScanResultsCache._cross_view_file_stat_identity(after)
-                != ScanResultsCache._cross_view_file_stat_identity(path_stat)
-            ):
-                raise ValueError("read fingerprint candidate changed while being read")
-            if require_complete and len(source) > read_limit:
-                raise ValueError("read fingerprint budget exceeded")
-            return hashlib.sha256(b"file\0" + source).hexdigest()
-        finally:
-            os.close(file_descriptor)
+        reusable, fingerprint = _picklescan_call_graph._read_candidate_fingerprint(
+            path, read_limit=read_limit, require_complete=require_complete
+        )
+        if not reusable:
+            raise ValueError("read fingerprint unavailable or candidate changed while being read")
+        return fingerprint.hex() if fingerprint is not None else None
 
     def _call_graph_source_fingerprints_are_valid(self, cache_entry: dict[str, Any]) -> bool:
         scan_result = cache_entry.get("scan_result")

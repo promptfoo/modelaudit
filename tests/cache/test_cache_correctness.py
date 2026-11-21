@@ -51,7 +51,6 @@ from modelaudit.cache.optimized_config import (
     normalize_material_scan_config,
 )
 from modelaudit.cache.scan_results_cache import (
-    _CALL_GRAPH_REGULAR_FILE_FINGERPRINT,
     _MAX_IDENTITY_BARRIER_ATTEMPTS,
     _MAX_IDENTITY_CAPTURE_ATTEMPTS,
     AncestorIdentity,
@@ -4161,7 +4160,7 @@ def test_scan_cache_invalidates_replaced_large_extension_candidate(tmp_path: Pat
     assert reusable is True
     assert picklescan_fingerprint == extension_fingerprint
     assert isinstance(extension_fingerprint, str)
-    assert extension_fingerprint.startswith(f"{_CALL_GRAPH_REGULAR_FILE_FINGERPRINT}:")
+    assert extension_fingerprint.startswith("regular-file:")
     scan_result = _private_fingerprint_result(
         _call_graph_fingerprint_metadata({str(extension_path.absolute()): extension_fingerprint})
     )
@@ -4333,6 +4332,19 @@ def test_extension_fingerprint_rejects_path_replacement_during_validation(
 
     with pytest.raises(ValueError, match="changed while being read"):
         ScanResultsCache._bounded_source_fingerprint(extension_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="Requires POSIX FIFOs")
+def test_scan_cache_rejects_fifo_in_place_of_missing_bytecode(tmp_path: Path) -> None:
+    bytecode = tmp_path / "helper.pyc"
+    file_path, cache, version_context = _pickle_cache_context(tmp_path)
+    read = {"read_limit": 65536, "require_complete": True, "fingerprint": None}
+    result = _private_fingerprint_result(_call_graph_fingerprint_metadata(read_fingerprints={str(bytecode): read}))
+    assert _store_and_lookup(cache, file_path, result, version_context) is not None
+
+    os.mkfifo(bytecode)  # type: ignore[attr-defined]
+
+    assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
 def test_scan_cache_invalidates_when_read_fingerprint_directory_changes(tmp_path: Path) -> None:
