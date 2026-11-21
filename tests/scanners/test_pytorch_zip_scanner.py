@@ -23348,7 +23348,8 @@ def test_pytorch_zip_native8_header_inst_manifest_outcomes(
     tmp_path: Path, label: str, storage: bytes, digest: str, expected_exit: int
 ) -> None:
     assert hashlib.sha256(storage).hexdigest() == digest
-    for value in (storage, storage + b" " * (-len(storage) % 4)):
+    aligned_storage = storage + b" " * (-len(storage) % 4)
+    for value in (storage, aligned_storage):
         remaining = [65536]
         assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
             value, sample_is_prefix=False, work_budget_remaining=remaining
@@ -23356,10 +23357,15 @@ def test_pytorch_zip_native8_header_inst_manifest_outcomes(
         assert remaining[0] >= 0
 
     path = tmp_path / f"{label}.pt"
-    result = _scan_referenced_float_storage_blob(tmp_path, path.name, storage)
+    # A protocol-0 persistent ID references the storage without resolving an installed torch module.
+    metadata = _pytorch_storage_protocol0_persistent_id_payload(
+        "0", size=_float_storage_element_count_for_bytes(aligned_storage)
+    )
+    _write_referenced_float_storage(path, aligned_storage, metadata=metadata)
+    result = PyTorchZipScanner().scan(str(path))
     expected_verdict = "suspicious" if expected_exit == 1 else "clean"
     expected_files = ["archive/data.pkl"] + (["archive/data/0"] if expected_exit == 1 else [])
-    assert result.success is (expected_exit == 0)
+    assert result.success is (expected_exit == 0), result.issues
     assert result.metadata["pickle_verdict"] == expected_verdict
     assert result.metadata["pickle_files"] == expected_files
     assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is (expected_exit == 0)
@@ -23372,7 +23378,7 @@ def test_pytorch_zip_native8_header_inst_manifest_outcomes(
         assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
 
     aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
-    assert aggregate.success is (expected_exit == 0)
+    assert aggregate.success is (expected_exit == 0), aggregate.issues
     assert aggregate.file_metadata[str(path)]["pickle_verdict"] == expected_verdict
     assert aggregate.file_metadata[str(path)]["pickle_files"] == expected_files
     assert determine_exit_code(aggregate) == expected_exit
