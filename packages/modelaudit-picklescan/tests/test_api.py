@@ -9440,48 +9440,36 @@ def test_scan_bytes_warns_on_functools_partial_without_marking_benign_partial_ma
     assert not any(finding.severity.value == "critical" for finding in report.findings)
 
 
-def test_scan_bytes_detects_pathlib_mutating_dotted_method_reduce(tmp_path: Path) -> None:
-    target = tmp_path / "pickle_touch_bypass_marker"
-    expected_reference = f"pathlib.{_concrete_pathlib_class_name()}.touch"
-    payload = _pathlib_method_reduce_payload(target, "touch")
+@pytest.mark.parametrize(
+    ("method", "expected"),
+    [
+        pytest.param("touch", None, id="touch"),
+        pytest.param("read_text", "modelaudit-secret-8\n", id="read-text"),
+        pytest.param("read_bytes", b"\x00modelaudit-secret-8\xff", id="read-bytes"),
+    ],
+)
+def test_scan_bytes_detects_pathlib_dotted_method_reduce(
+    tmp_path: Path, method: str, expected: str | bytes | None
+) -> None:
+    target = tmp_path / "marker"
+    if isinstance(expected, str):
+        target.write_text(expected, encoding="utf-8")
+    elif isinstance(expected, bytes):
+        target.write_bytes(expected)
+    expected_reference = f"pathlib.{_concrete_pathlib_class_name()}.{method}"
+    payload = _pathlib_method_reduce_payload(target, method)
 
-    report = scan_bytes(payload, source="pathlib-touch.pkl")
+    report = scan_bytes(payload, source=f"pathlib-{method}.pkl")
 
     _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    assert target.exists() is False
     _assert_critical_dangerous_call(report, expected_reference)
     assert any(
         ref["import_reference"] == expected_reference and ref["is_dangerous"] is False
         for ref in report.metadata["import_references"]
     )
-    pickle.loads(payload)
-    assert target.exists() is True
-
-
-def test_scan_bytes_detects_pathlib_read_text_dotted_method_reduce(tmp_path: Path) -> None:
-    secret = tmp_path / "secret.txt"
-    secret.write_text("modelaudit-secret-8\n", encoding="utf-8")
-    expected_reference = f"pathlib.{_concrete_pathlib_class_name()}.read_text"
-    payload = _pathlib_method_reduce_payload(secret, "read_text")
-
-    report = scan_bytes(payload, source="pathlib-read-text.pkl")
-
-    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    _assert_critical_dangerous_call(report, expected_reference)
-    assert pickle.loads(payload) == "modelaudit-secret-8\n"
-
-
-def test_scan_bytes_detects_pathlib_read_bytes_dotted_method_reduce(tmp_path: Path) -> None:
-    secret = tmp_path / "secret.bin"
-    secret.write_bytes(b"\x00modelaudit-secret-8\xff")
-    expected_reference = f"pathlib.{_concrete_pathlib_class_name()}.read_bytes"
-    payload = _pathlib_method_reduce_payload(secret, "read_bytes")
-
-    report = scan_bytes(payload, source="pathlib-read-bytes.pkl")
-
-    _assert_report_state(report, ScanStatus.COMPLETE, SafetyVerdict.MALICIOUS)
-    _assert_critical_dangerous_call(report, expected_reference)
-    assert pickle.loads(payload) == b"\x00modelaudit-secret-8\xff"
+    assert target.exists() is (expected is not None)
+    assert pickle.loads(payload) == expected
+    assert target.exists()
 
 
 @pytest.mark.parametrize(
@@ -16999,5 +16987,5 @@ def test_scan_file_deferred_probe_budget_retains_exact_skipped_order(
 
 
 def _assert_report_state(report: PickleReport, status: ScanStatus, verdict: SafetyVerdict) -> None:
-    assert report.status == status
+    assert report.status == status, report.errors
     assert report.verdict == verdict
