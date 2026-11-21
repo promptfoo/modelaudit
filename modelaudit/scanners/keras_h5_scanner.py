@@ -11,10 +11,6 @@ from collections.abc import Callable
 from contextlib import suppress
 from typing import Any, ClassVar
 
-from modelaudit.detectors.suspicious_symbols import (
-    SUSPICIOUS_CONFIG_PROPERTIES,
-    SUSPICIOUS_LAYER_TYPES,
-)
 from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
@@ -22,7 +18,6 @@ from modelaudit.utils.helpers.code_validation import (
 
 from ..config.explanations import (
     get_cve_2024_3660_explanation,
-    get_cve_2025_1550_explanation,
     get_cve_2025_9905_explanation,
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
@@ -34,12 +29,10 @@ from ._evidence_redaction import (
     redact_evidence_value,
     redact_untrusted_error_message,
 )
-from .base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from .base import DEFAULT_MAX_FILE_READ_SIZE, IssueSeverity, ScanResult
 from .keras_utils import (
-    DANGEROUS_CONFIG_MODULE_ROOTS,
-    _keras_exact_module_policy,
-    check_custom_loss_config,
-    check_custom_metric_config,
+    BaseKerasScanner,
+    KerasConfigScope,
     check_lambda_dict_function,
     check_lambda_list_function,
     check_subclassed_model,
@@ -251,60 +244,8 @@ _KERAS_POST_OR_LOCAL_SUFFIX_PATTERN = re.compile(
     rf"{_KERAS_POST_SUFFIX}(?:{_KERAS_DEV_SUFFIX})?(?:{_KERAS_LOCAL_VERSION_SUFFIX})?)$"
 )
 
-# CVE-2025-1550: Keras safe_mode bypass via arbitrary module references.
-_SAFE_KERAS_MODULE_ROOTS: frozenset[str] = frozenset({"keras", "tensorflow", "tf_keras", "tf", "numpy", "math"})
-_DANGEROUS_EXACT_MODULE_SYMBOLS, _DANGEROUS_EXACT_MODULE_SYMBOL_PREFIXES = _keras_exact_module_policy()
-_NESTED_SERIALIZED_OBJECT_KEYS = frozenset(
-    {
-        "activation",
-        "activity_regularizer",
-        "backward_layer",
-        "beta_initializer",
-        "bias_constraint",
-        "bias_initializer",
-        "bias_regularizer",
-        "callable",
-        "cell",
-        "cells",
-        "depthwise_constraint",
-        "depthwise_initializer",
-        "depthwise_regularizer",
-        "embeddings_constraint",
-        "embeddings_initializer",
-        "embeddings_regularizer",
-        "fn",
-        "forward_layer",
-        "function",
-        "gamma_initializer",
-        "kernel_constraint",
-        "kernel_initializer",
-        "kernel_regularizer",
-        "layer",
-        "layers",
-        "learning_rate",
-        "loss",
-        "losses",
-        "metric",
-        "metrics",
-        "moving_mean_initializer",
-        "moving_variance_initializer",
-        "optimizer",
-        "output_activation",
-        "pointwise_constraint",
-        "pointwise_initializer",
-        "pointwise_regularizer",
-        "preprocessor",
-        "recurrent_activation",
-        "recurrent_constraint",
-        "recurrent_initializer",
-        "recurrent_regularizer",
-        "schedule",
-        "weighted_metrics",
-    }
-)
 
-
-class KerasH5Scanner(BaseScanner):
+class KerasH5Scanner(BaseKerasScanner):
     """Scanner for Keras H5 model files"""
 
     name = "keras_h5"
@@ -493,16 +434,7 @@ class KerasH5Scanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
-        # Additional scanner-specific configuration
-        self.suspicious_layer_types = dict(SUSPICIOUS_LAYER_TYPES)
-        if config and "suspicious_layer_types" in config:
-            self.suspicious_layer_types.update(config["suspicious_layer_types"])
-
-        self.suspicious_config_props = list(SUSPICIOUS_CONFIG_PROPERTIES)
-        if config and "suspicious_config_properties" in config:
-            self.suspicious_config_props.extend(config["suspicious_config_properties"])
         self._current_h5_keras_version: str | None = None
-        self._checked_config_module_references: set[tuple[int, str, str]] = set()
         self.max_hdf5_json_attribute_bytes = self._normalize_positive_int_config(
             self.config.get("max_hdf5_json_attribute_bytes"),
             self._MAX_HDF5_JSON_ATTRIBUTE_BYTES,
@@ -755,27 +687,6 @@ class KerasH5Scanner(BaseScanner):
 
         self._finish_scan_result(result)
         return result
-
-    @staticmethod
-    def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
-        """Mark the scan as incomplete without converting it into a security finding."""
-        BaseScanner._mark_inconclusive_reason_first(result, reason, INCONCLUSIVE_SCAN_OUTCOME)
-
-    @staticmethod
-    def _scan_result_has_security_findings(result: ScanResult) -> bool:
-        """Return True when the scan found warning or critical security risk."""
-        return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
-
-    @classmethod
-    def _finish_scan_result(cls, result: ScanResult) -> None:
-        """Fail closed on incomplete/no-finding scans while preserving security precedence."""
-        is_inconclusive = result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-        has_security_findings = cls._scan_result_has_security_findings(result)
-        if is_inconclusive and not has_security_findings:
-            result.finish(success=False)
-            return
-
-        result.finish(success=not result.has_errors)
 
     def _add_file_backed_hdf5_inspection_check(
         self,
@@ -2188,28 +2099,7 @@ class KerasH5Scanner(BaseScanner):
             )
             return
 
-        self._check_custom_metric_config(training_config.get("metrics"), result, "training_config.metrics")
-        self._check_custom_metric_config(
-            training_config.get("weighted_metrics"),
-            result,
-            "training_config.weighted_metrics",
-        )
-        self._check_custom_loss_config(training_config.get("loss"), result, "training_config.loss")
-        for key in ("optimizer_config", "loss", "metrics", "weighted_metrics"):
-            self._check_nested_serialized_module_references(
-                training_config.get(key),
-                result,
-                f"training_config.{key}",
-                trusted_container=True,
-            )
-
-    def _check_custom_metric_config(self, metrics_config: Any, result: ScanResult, context: str) -> None:
-        """Flag custom metrics embedded anywhere in a serialized metric tree."""
-        check_custom_metric_config(metrics_config, result, f"{self.current_file_path} ({context})")
-
-    def _check_custom_loss_config(self, loss_config: Any, result: ScanResult, context: str) -> None:
-        """Flag custom losses embedded anywhere in a serialized loss tree."""
-        check_custom_loss_config(loss_config, result, f"{self.current_file_path} ({context})")
+        self._check_training_objects(training_config, result, "training_config", "optimizer_config")
 
     def _scan_model_config(
         self,
@@ -2240,13 +2130,7 @@ class KerasH5Scanner(BaseScanner):
                 location=self.current_file_path,
                 details={"actual_type": type(model_class).__name__, "expected_type": "str"},
             )
-        self._check_layer_module_references(
-            model_config,
-            result,
-            "model_config",
-            config_fields=(),
-            check_nested=False,
-        )
+        self._check_layer_module_references(model_config, result, "model_config", scope=None)
 
         # Collect all layers
         layers = []
@@ -2376,23 +2260,11 @@ class KerasH5Scanner(BaseScanner):
                     ),
                     f"layer_{index}",
                 )
-            nested_suppress_root_reference_keys: frozenset[str] = frozenset()
-            if is_lambda_layer:
-                handled_callback_fields = {"function"}
-                for callback_field in ("mask", "output_shape"):
-                    callback_value = layer_config.get(callback_field)
-                    callback_type = layer_config.get(f"{callback_field}_type")
-                    if callback_type in {"function", "lambda"} or (
-                        isinstance(callback_value, dict) and callback_value.get("class_name") == "__lambda__"
-                    ):
-                        handled_callback_fields.add(callback_field)
-                nested_suppress_root_reference_keys = frozenset(handled_callback_fields)
             self._check_layer_module_references(
                 layer,
                 result,
                 layer_reference_name,
-                config_fields=("fn_module",) if is_lambda_layer else ("module", "fn_module"),
-                nested_suppress_root_reference_keys=nested_suppress_root_reference_keys,
+                scope=KerasConfigScope.LEGACY_LAMBDA if is_lambda_layer else KerasConfigScope.CONFIG,
             )
 
             # Update layer count
@@ -2643,136 +2515,28 @@ class KerasH5Scanner(BaseScanner):
             details={"actual_type": type(nested_layer).__name__, "expected_type": "dict"},
         )
 
-    @staticmethod
-    def _config_reference_symbols(source: dict[str, Any], object_class: str) -> set[str]:
-        symbols = {object_class}
-        for key in ("config", "registered_name", "function", "function_name"):
-            value = source.get(key)
-            if isinstance(value, str) and value.strip():
-                symbols.add(value.strip())
-        return symbols
+    _CONFIG_SYMBOL_FIELDS = ("config", "registered_name", "function", "function_name")
 
     @classmethod
-    def _is_dangerous_exact_module_reference(
-        cls,
-        source: dict[str, Any],
-        module_value: str,
-        object_class: str,
-    ) -> bool:
-        symbols = cls._config_reference_symbols(source, object_class)
-        dangerous_symbols = _DANGEROUS_EXACT_MODULE_SYMBOLS.get(module_value, frozenset())
-        if symbols & dangerous_symbols:
-            return True
-        prefixes = _DANGEROUS_EXACT_MODULE_SYMBOL_PREFIXES.get(module_value, ())
-        return any(symbol.startswith(prefixes) for symbol in symbols) if prefixes else False
-
-    @classmethod
-    def _config_reference_symbol_tokens(cls, source: dict[str, Any], object_class: str) -> set[str]:
-        return {
-            token.lower()
-            for symbol in cls._config_reference_symbols(source, object_class)
+    def _has_dangerous_config_symbol(cls, module: str, symbols: set[str]) -> bool:
+        return super()._has_dangerous_config_symbol(module, symbols) or any(
+            token.lower() in cls._ALWAYS_DANGEROUS_LAMBDA_FUNCTION_NAMES
+            for symbol in symbols
             for token in re.split(r"[^0-9A-Za-z_]+", symbol)
-            if token
-        }
+        )
 
     @classmethod
-    def _is_allowlisted_config_callable(
-        cls,
-        source: dict[str, Any],
-        module_value: str,
-    ) -> bool:
-        symbols = {
-            value.strip()
-            for key in ("config", "registered_name", "function", "function_name")
-            if isinstance((value := source.get(key)), str) and value.strip()
-        }
-        return bool(symbols) and all(
-            cls._is_lambda_module_reference_allowlisted(module_value, symbol) for symbol in symbols
-        )
+    def _is_allowlisted_config_callable(cls, module: str, symbols: set[str]) -> bool:
+        return bool(symbols) and all(cls._is_lambda_module_reference_allowlisted(module, symbol) for symbol in symbols)
 
-    def _check_config_module_reference(
-        self,
-        source: dict[str, Any],
-        key: str,
-        module_value: str,
-        object_class: str,
-        result: ScanResult,
-        layer_name: str,
-    ) -> None:
-        reference_key = (id(source), key, module_value)
-        if reference_key in self._checked_config_module_references:
-            return
-        self._checked_config_module_references.add(reference_key)
-
-        redacted_module_value = redact_evidence_string(module_value.split(".", 1)[0])
-        redacted_object_class = redact_evidence_string(object_class)
-        redacted_layer_name = redact_evidence_string(layer_name)
-        top_module = module_value.split(".")[0]
-        symbol_tokens = self._config_reference_symbol_tokens(source, object_class)
-        is_callable_reference = key == "fn_module" or object_class == "function"
-        is_dangerous = (
-            self._is_dangerous_exact_module_reference(source, module_value, object_class)
-            or bool(symbol_tokens & self._ALWAYS_DANGEROUS_LAMBDA_FUNCTION_NAMES)
-            or top_module in DANGEROUS_CONFIG_MODULE_ROOTS
+    @staticmethod
+    def _has_dedicated_callback_check(config: dict[str, Any], key: str) -> bool:
+        if key not in ("mask", "output_shape"):
+            return key == "function"
+        value = config.get(key)
+        return config.get(f"{key}_type") in ("function", "lambda") or (
+            isinstance(value, dict) and value.get("class_name") == "__lambda__"
         )
-        is_outside_allowlist = top_module not in _SAFE_KERAS_MODULE_ROOTS
-        is_untrusted_callable = is_callable_reference and not self._is_allowlisted_config_callable(
-            source,
-            module_value,
-        )
-
-        if is_dangerous:
-            result.add_check(
-                name="CVE-2025-1550: Dangerous Module in Config",
-                passed=False,
-                message=(
-                    f"CVE-2025-1550: Layer '{redacted_layer_name}' references dangerous module "
-                    f"'{redacted_module_value}' in {key} field - arbitrary code execution via safe_mode bypass"
-                ),
-                severity=IssueSeverity.CRITICAL,
-                location=f"{self.current_file_path} (layer: {redacted_layer_name})",
-                details={
-                    "layer_name": redacted_layer_name,
-                    "layer_class": redacted_object_class,
-                    "key": key,
-                    "module": redacted_module_value,
-                    "cve_id": "CVE-2025-1550",
-                    "cvss": 7.3,
-                    "cwe": "CWE-94",
-                    "description": (
-                        "Arbitrary dangerous module references in Keras H5 metadata can bypass safe_mode "
-                        "and execute attacker-controlled code during model loading."
-                    ),
-                    "remediation": "Upgrade Keras to >= 3.9.0 or remove untrusted module references",
-                },
-                why=get_cve_2025_1550_explanation("dangerous_module"),
-            )
-        elif is_untrusted_callable or (is_outside_allowlist and self._is_lambda_layer_class(object_class)):
-            result.add_check(
-                name="CVE-2025-1550: Untrusted Module in Config",
-                passed=False,
-                message=(
-                    f"CVE-2025-1550: Layer '{redacted_layer_name}' references non-allowlisted module "
-                    f"'{redacted_module_value}' in {key} field - potential safe_mode bypass"
-                ),
-                severity=IssueSeverity.WARNING,
-                location=f"{self.current_file_path} (layer: {redacted_layer_name})",
-                details={
-                    "layer_name": redacted_layer_name,
-                    "layer_class": redacted_object_class,
-                    "key": key,
-                    "module": redacted_module_value,
-                    "cve_id": "CVE-2025-1550",
-                    "cvss": 7.3,
-                    "cwe": "CWE-94",
-                    "description": (
-                        "Non-allowlisted callable module references may indicate safe_mode bypass "
-                        "paths in untrusted Keras H5 metadata."
-                    ),
-                    "remediation": "Upgrade Keras to >= 3.9.0 or verify this module is safe",
-                },
-                why=get_cve_2025_1550_explanation("untrusted_module"),
-            )
 
     def _check_nested_serialized_module_references(
         self,
@@ -2780,18 +2544,17 @@ class KerasH5Scanner(BaseScanner):
         result: ScanResult,
         layer_name: str,
         *,
-        trusted_container: bool = False,
-        suppress_root_reference_keys: frozenset[str] = frozenset(),
+        scope: KerasConfigScope = KerasConfigScope.CONFIG,
     ) -> None:
         """Inspect nested Keras object configs without recursing on attacker-controlled depth."""
-        pending: list[tuple[Any, str | None, bool, bool, bool]] = [(config_value, None, trusted_container, True, False)]
+        pending: list[tuple[Any, KerasConfigScope, bool]] = [(config_value, scope, False)]
         traversal_truncated = False
         while pending:
             if self._remaining_serialized_config_nodes <= 0:
                 traversal_truncated = True
                 break
 
-            node, parent_key, container_is_trusted, is_root, suppress_reference_check = pending.pop()
+            node, scope, suppress_reference_check = pending.pop()
             self._remaining_serialized_config_nodes -= 1
             child_capacity = max(self._remaining_serialized_config_nodes - len(pending), 0)
             if isinstance(node, list):
@@ -2799,39 +2562,19 @@ class KerasH5Scanner(BaseScanner):
                 if len(children) > child_capacity:
                     traversal_truncated = True
                     children.pop()
-                pending.extend((item, parent_key, container_is_trusted, False, False) for item in reversed(children))
+                pending.extend((item, scope, False) for item in reversed(children))
                 continue
             if not isinstance(node, dict):
                 continue
 
-            object_class = node.get("class_name")
-            serialized_shape = isinstance(object_class, str) and "config" in node
-            is_serialized_object = serialized_shape and (
-                container_is_trusted
-                or parent_key in _NESTED_SERIALIZED_OBJECT_KEYS
-                or "registered_name" in node
-                or object_class == "function"
-                or self._is_lambda_layer_class(object_class)
+            object_class = self._check_serialized_module_node(
+                node, scope, result, layer_name, skip_reference=suppress_reference_check
             )
-            if is_serialized_object and not suppress_reference_check:
-                assert isinstance(object_class, str)
-                for key in ("module", "fn_module"):
-                    module_value = node.get(key)
-                    if isinstance(module_value, str) and module_value.strip():
-                        self._check_config_module_reference(
-                            node,
-                            key,
-                            module_value.strip(),
-                            object_class,
-                            result,
-                            layer_name,
-                        )
-
-            next_container_is_trusted = container_is_trusted and not is_serialized_object
             children = []
             for key, value in node.items():
                 normalized_key = str(key).lower()
-                if normalized_key in {"module", "fn_module", "class_name", "registered_name"}:
+                child_scope = scope.child(normalized_key, value, object_class)
+                if child_scope is None:
                     continue
                 if len(children) >= child_capacity:
                     traversal_truncated = True
@@ -2839,10 +2582,9 @@ class KerasH5Scanner(BaseScanner):
                 children.append(
                     (
                         value,
-                        normalized_key,
-                        next_container_is_trusted,
-                        False,
-                        is_root and normalized_key in suppress_root_reference_keys,
+                        child_scope,
+                        scope is KerasConfigScope.LEGACY_LAMBDA
+                        and self._has_dedicated_callback_check(node, normalized_key),
                     )
                 )
             pending.extend(reversed(children))
@@ -2863,78 +2605,6 @@ class KerasH5Scanner(BaseScanner):
                     "scan_outcome_reason": reason,
                     "max_nodes": self._MAX_SERIALIZED_CONFIG_NODES,
                 },
-            )
-
-    def _check_layer_module_references(
-        self,
-        layer: dict[str, Any],
-        result: ScanResult,
-        layer_name: str,
-        *,
-        config_fields: tuple[str, ...] = ("module", "fn_module"),
-        check_nested: bool = True,
-        nested_suppress_root_reference_keys: frozenset[str] = frozenset(),
-    ) -> None:
-        """Check H5 layer config for CVE-2025-1550 module references."""
-        layer_class = layer.get("class_name")
-        if not isinstance(layer_class, str) or "config" not in layer:
-            return
-
-        for key in ("module", "fn_module"):
-            layer_value = layer.get(key)
-            if isinstance(layer_value, str) and layer_value.strip():
-                self._check_config_module_reference(
-                    layer,
-                    key,
-                    layer_value.strip(),
-                    layer_class,
-                    result,
-                    layer_name,
-                )
-
-        layer_config = layer.get("config")
-        if not isinstance(layer_config, dict):
-            return
-
-        for key in config_fields:
-            config_value = layer_config.get(key)
-            if isinstance(config_value, str) and config_value.strip():
-                self._check_config_module_reference(
-                    layer_config,
-                    key,
-                    config_value.strip(),
-                    layer_class,
-                    result,
-                    layer_name,
-                )
-
-        if layer_class == "FlaxLayer":
-            self._check_nested_serialized_module_references(
-                layer_config.get("module"),
-                result,
-                layer_name,
-                trusted_container=True,
-            )
-
-        inbound_nodes = layer.get("inbound_nodes")
-        if isinstance(inbound_nodes, list):
-            for inbound_node in inbound_nodes:
-                if not isinstance(inbound_node, dict):
-                    continue
-                for key in ("args", "kwargs"):
-                    self._check_nested_serialized_module_references(
-                        inbound_node.get(key),
-                        result,
-                        layer_name,
-                        trusted_container=True,
-                    )
-
-        if check_nested:
-            self._check_nested_serialized_module_references(
-                layer_config,
-                result,
-                layer_name,
-                suppress_root_reference_keys=nested_suppress_root_reference_keys,
             )
 
     def _check_lambda_layer(

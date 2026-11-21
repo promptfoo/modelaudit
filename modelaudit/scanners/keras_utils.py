@@ -2,18 +2,23 @@
 
 import base64
 import re
+from abc import abstractmethod
 from collections.abc import Callable, Iterable, Iterator
-from typing import Any
+from enum import Enum, auto
+from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import (
     KNOWN_SAFE_KERAS_LAYER_CLASSES,
     KNOWN_SAFE_KERAS_LOSSES,
     KNOWN_SAFE_KERAS_METRICS,
     KNOWN_SAFE_MODEL_CLASSES,
+    SUSPICIOUS_CONFIG_PROPERTIES,
+    SUSPICIOUS_LAYER_TYPES,
 )
 
+from ..config.explanations import get_cve_2025_1550_explanation
 from ._evidence_redaction import redact_evidence_string, redact_evidence_value
-from .base import IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 # Importable module roots that are explicitly dangerous when referenced in config.json.
 DANGEROUS_CONFIG_MODULE_ROOTS = frozenset(
@@ -47,6 +52,77 @@ DANGEROUS_CONFIG_MODULE_ROOTS = frozenset(
         "pip",
         "setuptools",
         "distutils",
+    }
+)
+
+_SAFE_KERAS_MODULE_ROOTS: frozenset[str] = frozenset({"keras", "tensorflow", "tf_keras", "tf", "numpy", "math"})
+
+# Native modules expose both safe and executable symbols. Match individual symbols.
+_DANGEROUS_EXACT_MODULE_SYMBOLS = {
+    "_ctypes": frozenset({"dlopen"}),
+    "_frozen_importlib": frozenset({"__import__", "_find_and_load", "_find_and_load_unlocked"}),
+    "_imp": frozenset({"create_builtin", "create_dynamic", "exec_builtin", "exec_dynamic", "load_dynamic"}),
+    "_interpreters": frozenset({"call", "exec"}),
+    "_io": frozenset({"open"}),
+    "_operator": frozenset({"attrgetter", "methodcaller"}),
+    "_pickle": frozenset({"load", "loads"}),
+    "_posixsubprocess": frozenset({"fork_exec"}),
+    "_socket": frozenset({"socket"}),
+    "_thread": frozenset({"start_new", "start_new_thread"}),
+    "_winapi": frozenset({"CreateProcess", "ShellExecute"}),
+    "_xxsubinterpreters": frozenset({"run_string"}),
+    "io": frozenset({"open"}),
+    "nt": frozenset({"popen", "startfile", "system"}),
+    "operator": frozenset({"attrgetter", "methodcaller"}),
+    "posix": frozenset({"popen", "system"}),
+}
+
+_NESTED_SERIALIZED_OBJECT_KEYS = frozenset(
+    {
+        "activation",
+        "activity_regularizer",
+        "backward_layer",
+        "beta_initializer",
+        "bias_constraint",
+        "bias_initializer",
+        "bias_regularizer",
+        "callable",
+        "cell",
+        "cells",
+        "depthwise_constraint",
+        "depthwise_initializer",
+        "depthwise_regularizer",
+        "embeddings_constraint",
+        "embeddings_initializer",
+        "embeddings_regularizer",
+        "fn",
+        "forward_layer",
+        "function",
+        "gamma_initializer",
+        "kernel_constraint",
+        "kernel_initializer",
+        "kernel_regularizer",
+        "layer",
+        "layers",
+        "learning_rate",
+        "loss",
+        "losses",
+        "metric",
+        "metrics",
+        "moving_mean_initializer",
+        "moving_variance_initializer",
+        "optimizer",
+        "output_activation",
+        "pointwise_constraint",
+        "pointwise_initializer",
+        "pointwise_regularizer",
+        "preprocessor",
+        "recurrent_activation",
+        "recurrent_constraint",
+        "recurrent_initializer",
+        "recurrent_regularizer",
+        "schedule",
+        "weighted_metrics",
     }
 )
 
@@ -629,29 +705,265 @@ def check_subclassed_model(
         )
 
 
-def _keras_exact_module_policy() -> tuple[dict[str, frozenset[str]], dict[str, tuple[str, ...]]]:
-    """Create independent exact-module symbol tables for a Keras scanner."""
-    return (
-        {
-            "_ctypes": frozenset({"dlopen"}),
-            "_frozen_importlib": frozenset({"__import__", "_find_and_load", "_find_and_load_unlocked"}),
-            "_imp": frozenset({"create_builtin", "create_dynamic", "exec_builtin", "exec_dynamic", "load_dynamic"}),
-            "_interpreters": frozenset({"call", "exec"}),
-            "_io": frozenset({"open"}),
-            "_operator": frozenset({"attrgetter", "methodcaller"}),
-            "_pickle": frozenset({"load", "loads"}),
-            "_posixsubprocess": frozenset({"fork_exec"}),
-            "_socket": frozenset({"socket"}),
-            "_thread": frozenset({"start_new", "start_new_thread"}),
-            "_winapi": frozenset({"CreateProcess", "ShellExecute"}),
-            "_xxsubinterpreters": frozenset({"run_string"}),
-            "io": frozenset({"open"}),
-            "nt": frozenset({"popen", "startfile", "system"}),
-            "operator": frozenset({"attrgetter", "methodcaller"}),
-            "posix": frozenset({"popen", "system"}),
-        },
-        {
-            "nt": ("exec", "spawn"),
-            "posix": ("exec", "spawn"),
-        },
-    )
+def _is_feature_space(node: dict[str, Any]) -> bool:
+    # Keras also looks up registered_name when the module does not export class_name.
+    return node.get("class_name") == "FeatureSpace" or node.get("registered_name") == "FeatureSpace"
+
+
+class KerasConfigScope(Enum):
+    """How Keras interprets the next object in a serialized config."""
+
+    CONFIG = auto()
+    OBJECT_FIELD = auto()  # A named field such as "activation" or "layer".
+    OBJECT_TREE = auto()  # A collection of objects, e.g. metrics grouped by output.
+    FEATURE_SPACE = auto()
+    FEATURE_MAP = auto()
+    LEGACY_LAMBDA = auto()
+
+    def child(self, key: str, value: Any, object_class: str | None) -> "KerasConfigScope | None":
+        if self is KerasConfigScope.FEATURE_MAP:
+            # Feature names are user-supplied, including names such as "module".
+            return KerasConfigScope.OBJECT_TREE
+        if key in {"module", "fn_module", "class_name", "registered_name"}:
+            return None
+        if object_class == "FeatureSpace" and key == "config":
+            return KerasConfigScope.FEATURE_SPACE
+        if self is KerasConfigScope.FEATURE_SPACE:
+            if key == "features" and isinstance(value, dict):
+                return KerasConfigScope.FEATURE_MAP
+            if key == "crosses":
+                return KerasConfigScope.OBJECT_TREE
+        if self is KerasConfigScope.OBJECT_TREE and object_class is None:
+            return KerasConfigScope.OBJECT_TREE
+        if key.lower() in _NESTED_SERIALIZED_OBJECT_KEYS:
+            return KerasConfigScope.OBJECT_FIELD
+        return KerasConfigScope.CONFIG
+
+
+class BaseKerasScanner(BaseScanner):
+    """Security checks on serialized Keras configuration in H5 and ZIP containers."""
+
+    _CONFIG_SYMBOL_FIELDS: ClassVar[tuple[str, ...]] = ("config", "registered_name", "function_name")
+
+    def __init__(self, config: dict[str, Any] | None = None):
+        super().__init__(config)
+        # Additional scanner-specific configuration
+        self.suspicious_layer_types = dict(SUSPICIOUS_LAYER_TYPES)
+        if config and "suspicious_layer_types" in config:
+            self.suspicious_layer_types.update(config["suspicious_layer_types"])
+
+        self.suspicious_config_props = list(SUSPICIOUS_CONFIG_PROPERTIES)
+        if config and "suspicious_config_properties" in config:
+            self.suspicious_config_props.extend(config["suspicious_config_properties"])
+        self._checked_config_module_references: set[tuple[int, str, str]] = set()
+
+    @staticmethod
+    def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
+        """Mark the scan as incomplete without converting it into a security finding."""
+        BaseScanner._mark_inconclusive_reason_first(result, reason, INCONCLUSIVE_SCAN_OUTCOME)
+
+    @staticmethod
+    def _finish_scan_result(result: ScanResult) -> None:
+        """Fail closed on incomplete scans while preserving security precedence."""
+        is_inconclusive = result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        success = result.success and not result.has_errors and (not is_inconclusive or result.has_warnings)
+        result.finish(success=success)
+
+    @staticmethod
+    @abstractmethod
+    def _is_lambda_layer_class(layer_class: Any) -> bool:
+        """Recognize the Lambda layer names supported by this format."""
+
+    @abstractmethod
+    def _check_nested_serialized_module_references(
+        self,
+        config_value: Any,
+        result: ScanResult,
+        layer_name: str,
+        *,
+        scope: KerasConfigScope = KerasConfigScope.CONFIG,
+    ) -> None:
+        """Inspect nested objects within the container's traversal budget."""
+
+    def _check_training_objects(
+        self, config: dict[str, Any], result: ScanResult, context: str, optimizer_key: str
+    ) -> None:
+        for key in ("metrics", "weighted_metrics"):
+            check_custom_metric_config(config.get(key), result, f"{self.current_file_path} ({context}.{key})")
+        check_custom_loss_config(config.get("loss"), result, f"{self.current_file_path} ({context}.loss)")
+        for key in (optimizer_key, "loss", "metrics", "weighted_metrics"):
+            self._check_nested_serialized_module_references(
+                config.get(key), result, f"{context}.{key}", scope=KerasConfigScope.OBJECT_TREE
+            )
+
+    def _check_serialized_module_node(
+        self,
+        node: dict[str, Any],
+        scope: KerasConfigScope,
+        result: ScanResult,
+        layer_name: str,
+        *,
+        skip_reference: bool = False,
+    ) -> str | None:
+        """Check references in deserialized objects, returning their class for traversal."""
+        object_class = node.get("class_name")
+        if not isinstance(object_class, str) or "config" not in node:
+            return None
+        if (
+            scope in (KerasConfigScope.OBJECT_FIELD, KerasConfigScope.OBJECT_TREE)
+            or "registered_name" in node
+            or object_class == "function"
+            or self._is_lambda_layer_class(object_class)
+        ):
+            if not skip_reference:
+                self._check_module_fields(node, object_class, result, layer_name)
+            return "FeatureSpace" if _is_feature_space(node) else object_class
+        return None
+
+    @classmethod
+    def _has_dangerous_config_symbol(cls, module: str, symbols: set[str]) -> bool:
+        if not symbols.isdisjoint(_DANGEROUS_EXACT_MODULE_SYMBOLS.get(module, ())):
+            return True
+        return module in {"nt", "posix"} and any(symbol.startswith(("exec", "spawn")) for symbol in symbols)
+
+    @classmethod
+    def _is_allowlisted_config_callable(cls, module: str, symbols: set[str]) -> bool:
+        return module.partition(".")[0] in _SAFE_KERAS_MODULE_ROOTS
+
+    def _check_module_fields(
+        self,
+        source: dict[str, Any],
+        object_class: str,
+        result: ScanResult,
+        layer_name: str,
+        fields: tuple[str, ...] = ("module", "fn_module"),
+    ) -> None:
+        for key in fields:
+            module_value = source.get(key)
+            if not isinstance(module_value, str) or not (module := module_value.strip()):
+                continue
+            reference = (id(source), key, module)
+            if reference in self._checked_config_module_references:
+                continue
+            self._checked_config_module_references.add(reference)
+
+            symbols = {
+                value.strip()
+                for field in self._CONFIG_SYMBOL_FIELDS
+                if isinstance((value := source.get(field)), str) and value.strip()
+            }
+            root = module.partition(".")[0]
+            is_callable = key == "fn_module" or object_class == "function"
+            if root in DANGEROUS_CONFIG_MODULE_ROOTS or self._has_dangerous_config_symbol(
+                module, symbols | {object_class}
+            ):
+                severity = IssueSeverity.CRITICAL
+            elif (is_callable and not self._is_allowlisted_config_callable(module, symbols)) or (
+                root not in _SAFE_KERAS_MODULE_ROOTS and self._is_lambda_layer_class(object_class)
+            ):
+                severity = IssueSeverity.WARNING
+            else:
+                continue
+            self._report_config_module_reference(module, object_class, key, result, layer_name, severity)
+
+    def _report_config_module_reference(
+        self, module: str, object_class: str, key: str, result: ScanResult, layer_name: str, severity: IssueSeverity
+    ) -> None:
+        h5 = self.name == "keras_h5"
+        module = redact_evidence_string(module.partition(".")[0] if h5 else module)
+        if h5:
+            layer_name = redact_evidence_string(layer_name)
+        separator = "-" if h5 else "—"
+        if severity == IssueSeverity.CRITICAL:
+            name = "Dangerous Module in Config"
+            module_type = "dangerous"
+            risk = "arbitrary code execution via safe_mode bypass"
+            context = "Keras H5 metadata" if h5 else ".keras config"
+            description = (
+                f"Arbitrary dangerous module references in {context} can bypass safe_mode "
+                "and execute attacker-controlled code during model loading."
+            )
+            remediation = "Upgrade Keras to >= 3.9.0 or remove untrusted module references"
+            why = get_cve_2025_1550_explanation("dangerous_module")
+        else:
+            name = "Untrusted Module in Config"
+            module_type = "non-allowlisted"
+            risk = "potential safe_mode bypass"
+            context = "Keras H5 metadata" if h5 else ".keras config content"
+            description = (
+                "Non-allowlisted callable module references may indicate safe_mode bypass "
+                f"paths in untrusted {context}."
+            )
+            remediation = "Upgrade Keras to >= 3.9.0 or verify this module is safe"
+            why = get_cve_2025_1550_explanation("untrusted_module")
+
+        result.add_check(
+            name=f"CVE-2025-1550: {name}",
+            passed=False,
+            message=(
+                f"CVE-2025-1550: Layer '{layer_name}' references {module_type} module "
+                f"'{module}' in {key} field {separator} {risk}"
+            ),
+            severity=severity,
+            location=f"{self.current_file_path} (layer: {layer_name})",
+            details={
+                "layer_name": layer_name,
+                "layer_class": redact_evidence_string(object_class),
+                "key": key,
+                "module": module,
+                "cve_id": "CVE-2025-1550",
+                "cvss": 7.3,
+                "cwe": "CWE-94",
+                "description": description,
+                "remediation": remediation,
+            },
+            why=why,
+        )
+
+    def _check_layer_module_references(
+        self,
+        layer: dict[str, Any],
+        result: ScanResult,
+        layer_name: str,
+        *,
+        scope: KerasConfigScope | None = KerasConfigScope.CONFIG,
+    ) -> None:
+        """Check a layer or a model root (scope=None) for importable modules."""
+        layer_class = layer.get("class_name")
+        if not isinstance(layer_class, str) or "config" not in layer:
+            return
+        self._check_module_fields(layer, layer_class, result, layer_name)
+
+        layer_config = layer.get("config")
+        if not isinstance(layer_config, dict):
+            return
+        if scope is not None:
+            config_fields = ("fn_module",) if scope is KerasConfigScope.LEGACY_LAMBDA else ("module", "fn_module")
+            self._check_module_fields(layer_config, layer_class, result, layer_name, config_fields)
+
+        if layer_class == "FlaxLayer":
+            self._check_nested_serialized_module_references(
+                layer_config.get("module"),
+                result,
+                layer_name,
+                scope=KerasConfigScope.OBJECT_TREE,
+            )
+
+        inbound_nodes = layer.get("inbound_nodes")
+        if isinstance(inbound_nodes, list):
+            for inbound_node in inbound_nodes:
+                if not isinstance(inbound_node, dict):
+                    continue
+                for key in ("args", "kwargs"):
+                    self._check_nested_serialized_module_references(
+                        inbound_node.get(key),
+                        result,
+                        layer_name,
+                        scope=KerasConfigScope.OBJECT_TREE,
+                    )
+
+        if _is_feature_space(layer):
+            # FeatureSpace.save() serializes the object at the model root without a layers array.
+            scope = KerasConfigScope.FEATURE_SPACE
+        if scope is not None:
+            self._check_nested_serialized_module_references(layer_config, result, layer_name, scope=scope)
