@@ -182,6 +182,11 @@ class StorageLiteralMatcher:
         for window in _windows(token, start, end, _BASE64_WINDOW_BYTES, _BASE64_OVERLAP_BYTES):
             if window is None:
                 return True
+            # A separator or surplus padding can end a native candidate inside
+            # this wider discovery token. Keep all decodable prefix bytes.
+            window = window.rstrip(b"=")
+            if len(window) % 4 == 1:
+                window = window[:-1]
             try:
                 decoded = base64.b64decode(window + b"=" * (-len(window) % 4), validate=True)
             except (binascii.Error, ValueError):

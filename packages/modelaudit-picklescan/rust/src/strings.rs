@@ -1162,7 +1162,9 @@ fn contains_lazy_import(lower: &str) -> bool {
     lower.match_indices("__lazy_import__").any(|(start, name)| {
         let prefix = &lower[..start];
         let rest = &lower[start + name.len()..];
-        if prefix.ends_with(is_python_word_char) || rest.starts_with(is_python_word_char) {
+        if prefix.ends_with(is_suffix_identifier_continue)
+            || rest.starts_with(is_suffix_identifier_continue)
+        {
             return false;
         }
         let prefix = prefix
@@ -1199,26 +1201,26 @@ fn contains_dangerous_callable_invocation(lower: &str, name: &str) -> bool {
 
 fn callable_use(prefix: &str, mut suffix: &str, is_call: impl Fn(&str, &str) -> bool) -> bool {
     let mut prefix = prefix.trim_end();
-    // Unwrap only balanced pairs around the name, including in alias assignments.
-    while let Some(left) = prefix.strip_suffix('(') {
-        let Some(right) = trim_call_expression_spacing(suffix).and_then(|s| s.strip_prefix(')'))
-        else {
+    // Balanced parentheses can enclose the name or its __call__ attribute.
+    while let Some(rest) = trim_call_expression_spacing(suffix) {
+        if let (Some(left), Some(right)) = (prefix.strip_suffix('('), rest.strip_prefix(')')) {
+            prefix = left.trim_end();
+            suffix = right;
+        } else if let Some(after) = rest
+            .strip_prefix('.')
+            .and_then(trim_call_expression_spacing)
+            .and_then(|s| s.strip_prefix("__call__"))
+            .filter(|s| !s.starts_with(is_suffix_identifier_continue))
+        {
+            suffix = after;
+        } else {
             break;
-        };
-        prefix = left.trim_end();
-        suffix = right;
+        }
     }
-    if prefix
+    prefix
         .strip_suffix('=')
         .is_some_and(|s| !s.ends_with(['!', '<', '=', '>']))
-    {
-        return true;
-    }
-    let dunder = trim_call_expression_spacing(suffix)
-        .and_then(|s| s.strip_prefix('.'))
-        .and_then(trim_call_expression_spacing)
-        .and_then(|s| s.strip_prefix("__call__"));
-    is_call(prefix, dunder.unwrap_or(suffix))
+        || is_call(prefix, suffix)
 }
 
 fn prefix_ends_with_code_context(value: &str) -> bool {
@@ -1457,6 +1459,8 @@ fn suffix_starts_non_prose_call(prefix: &str, rest: &str) -> bool {
     let mut depth = 0usize;
     for (index, ch) in trimmed.char_indices() {
         match ch {
+            // A prose exemption must not repeatedly rescan unbounded nested calls.
+            '(' if depth == MAX_STRING_LEXER_DEPTH => return true,
             '(' => depth += 1,
             ')' => {
                 depth = depth.saturating_sub(1);
@@ -1820,6 +1824,9 @@ mod tests {
 
     #[test]
     fn suspicious_string_matching_ignores_prose_call_mentions() {
+        let nested = |depth| "x __lazy_import__(".repeat(depth) + &") note ".repeat(depth);
+        assert_no_string_matches(&[&nested(MAX_STRING_LEXER_DEPTH)]);
+        assert_string_match(&nested(MAX_STRING_LEXER_DEPTH + 1), "__lazy_import__(");
         assert_no_string_matches(&[
             "x=1; Do not call os.system(command) from loaders",
             "Documentation: if os.system(command) is referenced",
