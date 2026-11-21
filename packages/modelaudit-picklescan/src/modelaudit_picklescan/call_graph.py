@@ -1853,6 +1853,7 @@ _RCE_SINK_EXACT = frozenset(
         "asyncio.create_subprocess_exec",
         "asyncio.create_subprocess_shell",
         _IMPORT_EXECUTION_SINK,
+        "builtins.__lazy_import__",
         "builtins.compile",
         "builtins.eval",
         "builtins.exec",
@@ -1871,6 +1872,7 @@ _RCE_SINK_EXACT = frozenset(
         "subprocess.check_call",
         "subprocess.check_output",
         "subprocess.run",
+        "types.LazyImportType.resolve",
         "yaml.load",
         "yaml.unsafe_load",
     }
@@ -1884,7 +1886,7 @@ _FILE_OPEN_SINK_EXACT = frozenset(
     }
 )
 _FILE_WRITE_METHODS = frozenset({"write", "writelines"})
-_BUILTIN_CALLS = frozenset({"__import__", "compile", "eval", "exec", "open"})
+_BUILTIN_SINK_NAMES = frozenset({"__import__", "__lazy_import__", "compile", "eval", "exec", "open"})
 _TCL_CALL_DISPATCH_SUFFIXES = (".tk.call", "._tk.call")
 _TCL_EVAL_DISPATCH_SUFFIXES = (".tk.eval", "._tk.eval")
 _SUBPROCESS_DISPATCH_SUFFIXES = (
@@ -1896,6 +1898,7 @@ _SUBPROCESS_DISPATCH_SUFFIXES = (
 )
 _STATIC_IMPORT_REFERENCE_ALIAS_SUFFIXES = {
     "six.moves.builtins.__import__": "builtins.__import__",
+    "six.moves.builtins.__lazy_import__": "builtins.__lazy_import__",
     "six.moves.builtins.compile": "builtins.compile",
     "six.moves.builtins.eval": "builtins.eval",
     "six.moves.builtins.exec": "builtins.exec",
@@ -8298,7 +8301,12 @@ def _bytecode_cache_can_override_source(
         if cached_mtime != int(source_stat.st_mtime) & 0xFFFFFFFF or cached_size != source_stat.st_size & 0xFFFFFFFF:
             return False
     source_code = compile(source, str(source_path), "exec", dont_inherit=True, optimize=optimize_level)
-    return cache_bytes[16:] != marshal.dumps(source_code)
+    body = cache_bytes[16:]
+    # On CPython 3.15, py_compile can serialize a singly referenced code object.
+    # Match importlib's extra reference when the root sets marshal's FLAG_REF.
+    if body and body[0] & 0x80:
+        _retained_code = source_code
+    return body != marshal.dumps(source_code)
 
 
 def _typing_extensions_runtime_guard_value(
@@ -10532,7 +10540,7 @@ def _resolve_expr(
             return aliases[expression.id]
         if expression.id in local_defs:
             return f"{module_name}.{expression.id}"
-        if expression.id in _BUILTIN_CALLS:
+        if expression.id in _BUILTIN_SINK_NAMES:
             return f"builtins.{expression.id}"
         return expression.id
     if isinstance(expression, ast.Attribute):

@@ -166,10 +166,12 @@ def test_call_graph_resolves_six_moves_getoutput_alias(reference: str) -> None:
         ("botocore.vendored.six.moves.cPickle.loads", "pickle.loads"),
         # Dangerous builtins aliases.
         ("six.moves.builtins.__import__", "builtins.__import__"),
+        ("six.moves.builtins.__lazy_import__", "builtins.__lazy_import__"),
         ("six.moves.builtins.compile", "builtins.compile"),
         ("six.moves.builtins.eval", "builtins.eval"),
         ("six.moves.builtins.exec", "builtins.exec"),
         ("botocore.vendored.six.moves.builtins.__import__", "builtins.__import__"),
+        ("botocore.vendored.six.moves.builtins.__lazy_import__", "builtins.__lazy_import__"),
         ("botocore.vendored.six.moves.builtins.compile", "builtins.compile"),
         ("botocore.vendored.six.moves.builtins.eval", "builtins.eval"),
         ("botocore.vendored.six.moves.builtins.exec", "builtins.exec"),

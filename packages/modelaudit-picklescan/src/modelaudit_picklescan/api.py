@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, cast
 
 from .call_graph import (
+    _BUILTIN_SINK_NAMES,
     _PYTORCH_FIXED_STORAGE_ITEM_SIZES,
     _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES,
     CallGraphFinding,
@@ -63,7 +64,6 @@ _CANONICAL_DISTRIBUTION_LOOKUP = importlib_metadata.distribution
 _RUST_STREAM_READ_CHUNK_SIZE = 1024 * 1024
 _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY = "call_graph_source_fingerprints"
 _SOURCE_INDEPENDENT_BUILTIN_MODULES = frozenset({"builtins"})
-_SOURCE_INDEPENDENT_BUILTIN_DANGEROUS_NAMES = frozenset({"__import__", "compile", "eval", "exec", "open"})
 _NESTED_EXECUTION_FINDING_RULE_CODES = frozenset({"S213", "S601", "S602"})
 _PYTORCH_ZIP_METADATA_BASENAMES = frozenset({"version", "byteorder"})
 _PYTORCH_CHECKPOINT_SUFFIXES = frozenset({".pt", ".pth", ".ckpt"})
@@ -5320,7 +5320,7 @@ def _source_independent_builtin_import_reference(reference: Mapping[str, object]
     return (
         module in _SOURCE_INDEPENDENT_BUILTIN_MODULES
         and bool(name)
-        and name not in _SOURCE_INDEPENDENT_BUILTIN_DANGEROUS_NAMES
+        and name not in _BUILTIN_SINK_NAMES
         and reference.get("is_dangerous") is not True
     )
 

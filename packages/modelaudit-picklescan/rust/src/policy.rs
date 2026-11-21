@@ -310,6 +310,7 @@ const LEGACY_BUILTIN_EXCEPTION_NAMES: &[&str] = &[
 ];
 const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
     "__import__",
+    "__lazy_import__",
     "breakpoint",
     "classmethod.__get__",
     "compile",
@@ -634,6 +635,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("types", "FrameType.f_locals.__get__"),
     ("types", "FunctionType"),
     ("types", "GetSetDescriptorType.__get__"),
+    ("types", "LazyImportType.resolve"),
     ("types", "MemberDescriptorType.__get__"),
     ("types", "MethodDescriptorType.__get__"),
     ("types", "MethodType"),
