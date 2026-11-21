@@ -308,10 +308,11 @@ def test_unreadable_lightgbm_remains_inconclusive_when_filename_matches_suppress
 ) -> None:
     path = tmp_path / "path_traversal.lightgbm"
     path.touch()
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("modelaudit.scanners.base.os.access", lambda _path, _mode: False)
     monkeypatch.setattr("modelaudit.config.get_config", lambda: ModelAuditConfig(suppress={"S405"}))
 
-    result = LightGBMScanner().scan(str(path))
+    result = LightGBMScanner().scan(path.name)
 
     assert result.success is False
     assert result.metadata["operational_error_reason"] == "lightgbm_read_failed"
