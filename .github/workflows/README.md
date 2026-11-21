@@ -8,7 +8,7 @@
 | **Docker Image CI**        | `docker-image-test.yml` | Dockerfile or Python code changes         |
 | **Validate PR Title**      | `validate-pr-title.yml` | PR open/edit events                       |
 | **CodeQL**                 | `codeql.yml`            | Pushes, PRs, weekly schedule, manual runs |
-| **Nightly CI**             | `nightly.yml`           | Nightly schedule and manual dispatch      |
+| **Nightly CI**             | `nightly.yml`           | Nightly, PRs editing the workflow, manual |
 | **Release**                | `release-please.yml`    | Pushes to main and manual dispatch        |
 | **Docker Publish**         | `docker-publish.yml`    | Published releases and manual dispatch    |
 

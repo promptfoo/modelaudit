@@ -1,6 +1,8 @@
 name: Nightly CI
 
 on:
+  pull_request:
+    paths: [".github/workflows/nightly.yml"]
   schedule:
     # Run daily at 04:00 UTC
     - cron: "0 4 * * *"
@@ -8,6 +10,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   correctness:
@@ -59,7 +65,7 @@ jobs:
       - name: Sync dependencies
         id: sync
         run: >-
-          uv sync --extra ${{ matrix.os == 'windows-latest' && 'all-ci-windows' || 'all-ci' }}
+          uv sync --locked --extra ${{ matrix.os == 'windows-latest' && 'all-ci-windows' || 'all-ci' }}
           ${{ matrix.python-version == '3.15' && '--extra h5' || '' }}
 
       - name: Verify H5 import
@@ -68,7 +74,7 @@ jobs:
 
       - name: Run correctness shard (fast + slow + integration)
         run: |
-          uv run pytest -n auto -m "not performance" --modelaudit-shard-count 3 --modelaudit-shard-index ${{ matrix.shard }} --tb=short --durations=20
+          uv run --no-sync pytest -n auto -m "not performance" --modelaudit-shard-count 3 --modelaudit-shard-index ${{ matrix.shard }} --tb=short --durations=20
 
       - name: Capture ProcessProvider native diagnostic
         id: capture-native
@@ -102,11 +108,11 @@ jobs:
 
       - name: Sync dependencies
         run: |
-          uv sync --extra all-ci
+          uv sync --locked --extra all-ci
 
       - name: Run performance tests once without xdist
         run: |
-          uv run pytest -n 0 -m performance --tb=short --durations=20
+          uv run --no-sync pytest -n 0 -m performance --tb=short --durations=20
 
   picklescan-rust:
     name: Standalone Picklescan Rust Tests
