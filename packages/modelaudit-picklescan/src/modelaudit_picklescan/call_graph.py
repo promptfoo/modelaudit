@@ -2071,6 +2071,8 @@ class _ModuleSourceContext:
     module_statements: tuple[ast.stmt, ...]
     is_package: bool
     deleted_names: frozenset[str]
+    lazy_import_names: frozenset[str]
+    lazy_import_readers: frozenset[tuple[str, int]]
 
 
 @dataclass(frozen=True)
@@ -3752,6 +3754,8 @@ def _call_graph_entrypoints_for_reference(
         context = _module_source_context(module)
         if context is not None:
             export_name, separator, _member_path = name.partition(".")
+            if sys.version_info >= (3, 15) and _reference_reads_lazy_import(module, name):
+                entrypoints = (*entrypoints, _IMPORT_EXECUTION_SINK)
             deleted = export_name in context.deleted_names
             if "__getattr__" in context.deleted_names:
                 analysis = _analyze_module(module)
@@ -3772,6 +3776,23 @@ def _call_graph_entrypoints_for_reference(
             str(analysis_limit_error), partial_entrypoints=entrypoints
         ) from analysis_limit_error
     return entrypoints
+
+
+def _reference_reads_lazy_import(module: str, name: str) -> bool:
+    for _ in range(_MAX_MODULE_COMPONENTS):
+        context = _module_source_context(module)
+        if context is None:
+            return False
+        component, _, name = name.partition(".")
+        if component in context.lazy_import_names:
+            return True
+        if not name:
+            return False
+        analysis = _analyze_module(module)
+        if analysis is None:
+            return False
+        module = analysis.aliases.get(component, f"{module}.{component}")
+    raise _CallGraphAnalysisLimitError("lazy import lookup exceeds module component limit")
 
 
 def _resolved_call_graph_entrypoints_for_reference(
@@ -6332,7 +6353,16 @@ def _find_invoked_import_execution_path(
     if not allow_non_lifecycle_entrypoint and not _is_pickle_entered_import_execution_entrypoint(resolved):
         return None
     if not _can_enter_function_with_arguments(function_node, positional_arg_count, keyword_arg_names):
-        return None
+        # A dotted GLOBAL can supply self explicitly to an unbound method.
+        positional = (*function_node.args.posonlyargs, *function_node.args.args)
+        if not (
+            allow_non_lifecycle_entrypoint
+            and positional_arg_count > 0
+            and positional
+            and positional[0].arg == "self"
+            and _can_enter_function_with_arguments(function_node, positional_arg_count - 1, keyword_arg_names)
+        ):
+            return None
     ignore_direct_import = _template_import_requires_keywords(resolved, keyword_arg_names)
     if not ignore_direct_import and _IMPORT_EXECUTION_SINK in _direct_import_execution_calls(
         function_node, module_name, is_package
@@ -8165,13 +8195,58 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
     is_package = source_path.name == "__init__.py"
     module_body = _runtime_selected_module_statements(tree.body, module_name)
     module_statements = _definition_scope_statements(module_body)
+    lazy_names: frozenset[str] = frozenset()
+    if sys.version_info >= (3, 15):
+        lazy_names = _lazy_import_names(module_statements, module_name, is_package)
     return _ModuleSourceContext(
         source_path=source_path,
         module_body=module_body,
         module_statements=module_statements,
         is_package=is_package,
         deleted_names=_module_deleted_export_names(module_body),
+        lazy_import_names=lazy_names,
+        lazy_import_readers=_lazy_import_readers(source, source_path, lazy_names) if lazy_names else frozenset(),
     )
+
+
+def _lazy_import_names(statements: tuple[ast.stmt, ...], module_name: str, is_package: bool) -> frozenset[str]:
+    """Return bindings whose first lookup can import a shadowable module (PEP 810)."""
+    names: set[str] = set()
+    configured_modules: set[str] = set()
+    for node in statements:
+        explicit = getattr(node, "is_lazy", False)
+        if isinstance(node, ast.Assign | ast.AnnAssign) and isinstance(node.value, ast.List | ast.Tuple | ast.Set):
+            if "__lazy_modules__" in _assignment_alias_target_names(node):
+                configured_modules.update(
+                    item.value
+                    for item in node.value.elts
+                    if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                )
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if (explicit or alias.name in configured_modules) and _import_module_can_execute_user_code(alias.name):
+                    names.add(alias.asname or alias.name.partition(".")[0])
+        elif isinstance(node, ast.ImportFrom) and (explicit or configured_modules):
+            target = _resolve_import_from_module(module_name, is_package, node.level, node.module)
+            if (explicit or target in configured_modules) and _import_module_can_execute_user_code(target):
+                names.update(alias.asname or alias.name for alias in node.names)
+    return frozenset(names)
+
+
+def _lazy_import_readers(source: str, source_path: Path, names: frozenset[str]) -> frozenset[tuple[str, int]]:
+    """Use lexical scopes so parameters and local variables can shadow deferred bindings."""
+    readers: set[tuple[str, int]] = set()
+    pending = [symtable.symtable(source, str(source_path), "exec")]
+    while pending:
+        scope = pending.pop()
+        pending.extend(scope.get_children())
+        if scope.get_type() == "function":
+            for name in names.intersection(scope.get_identifiers()):
+                symbol = scope.lookup(name)
+                if symbol.is_global() and symbol.is_referenced():
+                    readers.add((scope.get_name(), scope.get_lineno()))
+                    break
+    return frozenset(readers)
 
 
 def _module_deleted_export_names(nodes: Iterable[ast.stmt]) -> frozenset[str]:
@@ -9836,6 +9911,7 @@ def _collect_function_calls(
         node: ast.FunctionDef | ast.AsyncFunctionDef,
         function_aliases: dict[str, str],
         class_name: str | None = None,
+        declaring_module: str = module_name,
     ) -> None:
         calls = _calls_in_function(
             node,
@@ -9847,6 +9923,9 @@ def _collect_function_calls(
             local_class_entrypoints,
             class_name=class_name,
         )
+        context = _module_source_context(declaring_module)
+        if context is not None and (node.name, node.lineno) in context.lazy_import_readers:
+            calls = (_IMPORT_EXECUTION_SINK, *calls)
         existing = calls_by_function.get(function_name)
         calls_by_function[function_name] = calls if existing is None else _dedupe_calls((*existing, *calls))
 
@@ -9871,7 +9950,7 @@ def _collect_function_calls(
                     **method.aliases,
                     **{local_name: f"{method.module_name}.{local_name}" for local_name in method.local_defs},
                 }
-                record_calls(function_name, method.node, inherited_aliases, statement.name)
+                record_calls(function_name, method.node, inherited_aliases, statement.name, method.module_name)
     return calls_by_function
 
 

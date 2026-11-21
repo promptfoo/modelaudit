@@ -76,7 +76,8 @@ def test_typing_lazy_annotation_import_preserves_members_and_invocation_boundari
     with _isolated_call_graph_caches():
         analysis = call_graph._analyze_module("typing")
         assert analysis is not None
-        assert analysis.aliases["_lazy_annotationlib"] == "annotationlib"
+        binding = "annotationlib" if sys.version_info >= (3, 15) else "_lazy_annotationlib"
+        assert analysis.aliases[binding] == "annotationlib"
         findings = call_graph.find_dangerous_call_graphs([reference], [reference])
         assert any(
             finding.sink == "builtins.__import__"
