@@ -29,6 +29,7 @@ from typing import IO, Any, BinaryIO, cast
 from unittest.mock import create_autospec
 
 import pytest
+from modelaudit_picklescan import _storage_literals
 from modelaudit_picklescan import api as picklescan_api
 from modelaudit_picklescan.api import _source_backed_import_requires_initialization_proof
 from modelaudit_picklescan.call_graph import (
@@ -2826,15 +2827,15 @@ def test_pytorch_zip_literal_route_bounds_long_base64_without_size_only_signal(
     def bounded_decode(token: bytes, *, validate: bool) -> bytes:
         assert validate is True
         decode_lengths.append(len(token))
-        assert len(token) <= pytorch_zip_scanner_module._MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES
+        assert len(token) <= _storage_literals._BASE64_WINDOW_BYTES
         return b"ordinary metadata"
 
-    monkeypatch.setattr(pytorch_zip_scanner_module.base64, "b64decode", bounded_decode)
-    token = b"A" * (pytorch_zip_scanner_module._MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES + 1024)
+    monkeypatch.setattr(base64, "b64decode", bounded_decode)
+    token = b"A" * (_storage_literals._BASE64_WINDOW_BYTES + 1024)
 
-    assert PyTorchZipScanner._base64_literal_value_has_suspicious_text(token) is False
+    assert pytorch_zip_scanner_module._LITERAL_MATCHER.matches(token) is False
     assert decode_lengths
-    assert max(decode_lengths) <= pytorch_zip_scanner_module._MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES
+    assert max(decode_lengths) <= _storage_literals._BASE64_WINDOW_BYTES
 
 
 def test_pytorch_zip_discovery_scans_extension_opcode_crossing_trusted_probe_boundary(
@@ -4077,6 +4078,17 @@ def test_pytorch_zip_discovery_routes_storage_literals_matching_native_suspiciou
     )
 
 
+@pytest.mark.parametrize("literal", [b"__new__", base64.b64encode(b"__class__"), binascii.hexlify(b"__getinitargs__")])
+def test_pytorch_zip_discovery_applies_modelaudit_literal_policy(tmp_path: Path, literal: bytes) -> None:
+    path = tmp_path / "storage.pt"
+    result = _scan_referenced_float_storage(path, _proto0_string_literal(literal), pad_with=b" ")
+    assert result.metadata["pickle_files"] == ["archive/data.pkl", "archive/data/0"]
+
+    standalone = picklescan_api.scan_file(path)
+    assert standalone.metadata["pickle_files"] == ("archive/data.pkl",)
+    assert standalone.verdict.value == "clean"
+
+
 def test_pytorch_zip_discovery_scans_initial_scalar_literal_split_at_probe_boundary(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_initial_scalar_literal_split_nested_pickle.pt"
     nested_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
@@ -5152,7 +5164,7 @@ def test_pytorch_zip_literal_text_route_bounds_spaced_call_near_match() -> None:
     text = "os . system" + (" " * 60_000) + '"'
 
     started_at = time.monotonic()
-    assert PyTorchZipScanner._literal_text_has_storage_route_signal(text) is False
+    assert pytorch_zip_scanner_module._LITERAL_MATCHER.matches_text(text) is False
     elapsed = time.monotonic() - started_at
 
     assert elapsed < 1.0
@@ -5176,21 +5188,17 @@ def test_pytorch_zip_encoded_nested_pickle_route_normalizes_wrapped_tokens() -> 
 
 def test_pytorch_zip_base64_literal_route_fails_closed_after_suffix_budget() -> None:
     payload = b"cposix\nsystem\n)R."
-    token = (b"A=" * (pytorch_zip_scanner_module._MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS + 1)) + base64.b64encode(
-        payload
-    )
+    token = (b"A=" * (_storage_literals._MAX_BASE64_SEGMENTS + 1)) + base64.b64encode(payload)
 
-    assert PyTorchZipScanner._base64_literal_route_token_segments(token) is None
+    assert _storage_literals.base64_token_segments(token) is None
     assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(token) is True
-    assert PyTorchZipScanner._base64_literal_value_has_suspicious_text(token) is True
+    assert pytorch_zip_scanner_module._LITERAL_MATCHER.matches(token) is True
 
 
 def test_pytorch_zip_base64_literal_route_fails_closed_after_dense_padding_boundaries() -> None:
-    token = (
-        b"".join(b"A=" for _ in range(pytorch_zip_scanner_module._MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS + 1)) + b"AAAA"
-    )
+    token = b"".join(b"A=" for _ in range(_storage_literals._MAX_BASE64_SEGMENTS + 1)) + b"AAAA"
 
-    assert PyTorchZipScanner._base64_literal_route_token_segments(token) is None
+    assert _storage_literals.base64_token_segments(token) is None
 
 
 @pytest.mark.parametrize("encoding", ["base64", "hex"])
@@ -5782,10 +5790,10 @@ def test_pytorch_zip_encoded_nested_pickle_route_preserves_prior_memo_across_lat
 
 
 def test_pytorch_zip_base64_literal_text_route_scans_middle_windows_without_size_only_signal() -> None:
-    assert PyTorchZipScanner._base64_literal_value_has_suspicious_text(base64.b64encode(b"B" * 80_000)) is False
+    assert pytorch_zip_scanner_module._LITERAL_MATCHER.matches(base64.b64encode(b"B" * 80_000)) is False
     value = base64.b64encode(b"B" * 40_000 + b'os.system("id")' + b"B" * 40_000)
 
-    assert PyTorchZipScanner._base64_literal_value_has_suspicious_text(value) is True
+    assert pytorch_zip_scanner_module._LITERAL_MATCHER.matches(value) is True
 
 
 @pytest.mark.parametrize(
@@ -22281,19 +22289,19 @@ def test_pytorch_zip_native8_literal_unicode_continuation_memory(character_count
 def test_pytorch_zip_native8_literal_compactor_keeps_batch_boundary_state(
     character: str, tail: str, expected: str
 ) -> None:
-    capacity = pytorch_zip_scanner_module._STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES
+    capacity = _storage_literals._TEXT_BATCH_SIZE
     for length in (capacity - 1, capacity, 2 * capacity - 1):
         prefix = character * length
-        assert PyTorchZipScanner._compact_python_member_access_and_calls(prefix + tail) == prefix + expected
+        assert _storage_literals._compact_member_access_and_calls(prefix + tail) == prefix + expected
         spaced_prefix = (character + "\u2003\t") * length
-        assert PyTorchZipScanner._compact_python_member_access_and_calls(spaced_prefix + tail) == (
+        assert _storage_literals._compact_member_access_and_calls(spaced_prefix + tail) == (
             " ".join([character] * length) + expected
         )
 
 
 @pytest.mark.parametrize("continuation", ["\n", "\r\n", "\r"])
 def test_pytorch_zip_native8_literal_compactor_retains_continued_security_at_batch_boundary(continuation: str) -> None:
-    capacity = pytorch_zip_scanner_module._STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES
+    capacity = _storage_literals._TEXT_BATCH_SIZE
     for length in (capacity - 3, capacity - 1):
         prefix = "一" * length
         dangerous = prefix + " os \\" + continuation + ". \u2003system ("
@@ -22936,11 +22944,11 @@ def test_pytorch_zip_native9_literal_repeated_continuation_memory(count: int, un
     ],
 )
 def test_pytorch_zip_native9_literal_normalization_matches_one_regex_pass(text: str) -> None:
-    normalized = pytorch_zip_scanner_module._PYTHON_LINE_CONTINUATION_RE.sub("", text)
-    expected = (text, normalized) if normalized != text else (text,)
-    candidates = PyTorchZipScanner._storage_route_text_candidates(text)
-    assert candidates == expected
-    assert candidates[0] is text
+    expected = _storage_literals._LINE_CONTINUATION.sub("", text)
+    normalized = _storage_literals.normalize_continuations(text)
+    assert normalized == expected
+    if expected == text:
+        assert normalized is text
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r", "\r\n"], ids=["lf", "cr", "crlf"])
@@ -22948,22 +22956,22 @@ def test_pytorch_zip_native9_literal_normalization_matches_one_regex_pass(text: 
 def test_pytorch_zip_native9_literal_normalization_keeps_match_and_indent_boundaries(
     newline: str, match_offset: int
 ) -> None:
-    capacity = pytorch_zip_scanner_module._STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES
+    capacity = _storage_literals._TEXT_BATCH_SIZE
     count = capacity + match_offset
     indentation = " \t\f" * (capacity + 1)
     text = "一\\\n" * (count - 1) + "head\\" + newline + indentation + "tail\ud800💡"
     expected = "一" * (count - 1) + "headtail\ud800💡"
-    assert PyTorchZipScanner._storage_route_text_candidates(text) == (text, expected)
+    assert _storage_literals.normalize_continuations(text) == expected
 
 
 def test_pytorch_zip_native9_literal_normalization_does_not_rescan_removal_joins() -> None:
-    capacity = pytorch_zip_scanner_module._STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES
+    capacity = _storage_literals._TEXT_BATCH_SIZE
     for prefix_count in (0, capacity - 1):
         text = "一\\\n" * prefix_count + "\\" * 2 + "\n\ntail"
         expected = "一" * prefix_count + "\\\ntail"
-        candidates = PyTorchZipScanner._storage_route_text_candidates(text)
-        assert candidates == (text, expected)
-        assert candidates[-1] != pytorch_zip_scanner_module._PYTHON_LINE_CONTINUATION_RE.sub("", expected)
+        normalized = _storage_literals.normalize_continuations(text)
+        assert normalized == expected
+        assert normalized != _storage_literals._LINE_CONTINUATION.sub("", expected)
 
 
 @pytest.mark.parametrize("preservation", [False, True], ids=["generic-single-pass", "existing-preservation-layer"])
@@ -22971,7 +22979,7 @@ def test_pytorch_zip_native9_literal_reuses_normalization_without_adding_a_pass(
     monkeypatch: pytest.MonkeyPatch, preservation: bool
 ) -> None:
     text = "os" + "\\" * 2 + "\n\n.system"
-    original = pytorch_zip_scanner_module._PYTHON_LINE_CONTINUATION_RE
+    original = _storage_literals._LINE_CONTINUATION
     first_pass = original.sub("", text)
     assert first_pass == "os\\\n.system"
     inputs: list[str] = []
@@ -22981,18 +22989,18 @@ def test_pytorch_zip_native9_literal_reuses_normalization_without_adding_a_pass(
             inputs.append(value)
             yield from original.finditer(value)
 
-    monkeypatch.setattr(pytorch_zip_scanner_module, "_PYTHON_LINE_CONTINUATION_RE", RecordingRegex())
+    monkeypatch.setattr(_storage_literals, "_LINE_CONTINUATION", RecordingRegex())
     if preservation:
         assert PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(text)
         assert inputs == [text, first_pass]
     else:
-        assert not PyTorchZipScanner._literal_text_has_storage_route_signal(text)
+        assert not pytorch_zip_scanner_module._LITERAL_MATCHER.matches_text(text)
         assert inputs == [text]
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r", "\r\n"], ids=["lf", "cr", "crlf"])
 def test_pytorch_zip_native9_literal_batch_boundary_keeps_security_and_passive_url_controls(newline: str) -> None:
-    capacity = pytorch_zip_scanner_module._STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES
+    capacity = _storage_literals._TEXT_BATCH_SIZE
     prefix = "一\\\n" * (capacity - 1) + " "
     dangerous = prefix + "os.\\" + newline + " \t\fsystem("
     benign = prefix + "os.\\" + newline + " \t\fösystem("

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import tracemalloc
 import uuid
 import warnings
 import zipfile
@@ -100,6 +101,7 @@ from modelaudit_picklescan import (
     ScanOptions,
     ScanStatus,
     Severity,
+    _storage_literals,
     call_graph,
     scan_bytes,
     scan_file,
@@ -6565,10 +6567,22 @@ def test_literal_text_route_bounds_spaced_call_near_match() -> None:
     text = "os . system" + (" " * 60_000) + '"'
 
     started_at = time.monotonic()
-    assert package_api._literal_text_has_storage_route_signal(text) is False
+    assert package_api._LITERAL_MATCHER.matches_text(text) is False
     elapsed = time.monotonic() - started_at
 
     assert elapsed < 1.0
+
+
+@pytest.mark.parametrize("unit", ["一\\\n", "一\t"], ids=["line-continuations", "member-spacing"])
+def test_storage_literal_text_normalization_bounds_fragment_memory(unit: str) -> None:
+    text = unit * 110_000
+    tracemalloc.start()
+    try:
+        assert not package_api._LITERAL_MATCHER.matches_text(text)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * len(text)
 
 
 def test_encoded_nested_pickle_route_normalizes_wrapped_tokens() -> None:
@@ -6589,17 +6603,17 @@ def test_encoded_nested_pickle_route_normalizes_wrapped_tokens() -> None:
 
 def test_base64_literal_route_fails_closed_after_suffix_budget() -> None:
     payload = b"cposix\nsystem\n)R."
-    token = (b"A=" * (package_api._MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS + 1)) + base64.b64encode(payload)
+    token = (b"A=" * (_storage_literals._MAX_BASE64_SEGMENTS + 1)) + base64.b64encode(payload)
 
-    assert package_api._base64_literal_route_token_segments(token) is None
+    assert _storage_literals.base64_token_segments(token) is None
     assert package_api._literal_value_has_encoded_nested_security_pickle(token) is True
-    assert package_api._base64_literal_value_has_suspicious_text(token) is True
+    assert package_api._LITERAL_MATCHER.matches(token) is True
 
 
 def test_base64_literal_route_fails_closed_after_dense_padding_boundaries() -> None:
-    token = b"".join(b"A=" for _ in range(package_api._MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS + 1)) + b"AAAA"
+    token = b"".join(b"A=" for _ in range(_storage_literals._MAX_BASE64_SEGMENTS + 1)) + b"AAAA"
 
-    assert package_api._base64_literal_route_token_segments(token) is None
+    assert _storage_literals.base64_token_segments(token) is None
 
 
 def test_encoded_nested_pickle_route_ignores_base64_marker_density_noise() -> None:
@@ -6651,10 +6665,10 @@ def test_encoded_nested_pickle_route_fails_closed_after_candidate_budget_gap() -
 
 
 def test_base64_literal_text_route_scans_middle_windows_without_size_only_signal() -> None:
-    assert package_api._base64_literal_value_has_suspicious_text(base64.b64encode(b"B" * 80_000)) is False
+    assert package_api._LITERAL_MATCHER.matches(base64.b64encode(b"B" * 80_000)) is False
     value = base64.b64encode(b"B" * 40_000 + b'os.system("id")' + b"B" * 40_000)
 
-    assert package_api._base64_literal_value_has_suspicious_text(value) is True
+    assert package_api._LITERAL_MATCHER.matches(value) is True
 
 
 @pytest.mark.parametrize(
