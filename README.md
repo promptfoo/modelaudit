@@ -174,7 +174,7 @@ pip install "modelaudit[all,tensorflow]"
 docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 ```
 
-The lightweight Docker image runs on Python 3.14 and ships the scanner without pip or ensurepip.
+The lightweight Docker image runs on Python 3.15 and omits pip and ensurepip.
 The full image uses Python 3.13 for stable TensorFlow CPU wheels.
 
 On Python 3.15, `all` and `all-ci` omit h5py. For Keras H5 scanning, install `modelaudit[all,h5]`.
