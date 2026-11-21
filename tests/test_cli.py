@@ -2174,6 +2174,14 @@ def test_cli_report_writers_reject_unpreservable_extended_acl(
 @pytest.mark.parametrize("with_acl", [False, True])
 def test_cli_report_writers_keep_only_original_linux_acl(tmp_path: Path, with_acl: bool) -> None:
     """Restoring group access must not enable entries inherited from the staging directory."""
+    try:
+        os.removexattr(tmp_path, "system.posix_acl_default")
+    except OSError as exc:
+        if exc.errno in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+            pytest.skip("The temporary directory does not support POSIX ACLs")
+        if exc.errno != errno.ENODATA:
+            raise
+
     report = tmp_path / "scanners.json"
     report.write_text("sentinel")
     report.chmod(0o640)
