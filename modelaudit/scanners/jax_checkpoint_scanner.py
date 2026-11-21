@@ -58,12 +58,48 @@ class _PatternFindingBudget:
     limit_reported: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _MetadataPath:
+    """Share ancestor keys across siblings and render the full path only for findings."""
+
+    parts: tuple[str, ...]
+    documentation: bool = False
+
+    _DOCUMENTATION_CONTEXT_HINTS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "description",
+            "doc",
+            "docs",
+            "documentation",
+            "comment",
+            "comments",
+            "note",
+            "notes",
+            "help",
+            "readme",
+            "example",
+            "examples",
+        }
+    )
+
+    def child(self, key: str | int) -> _MetadataPath:
+        if isinstance(key, int):
+            return _MetadataPath((*self.parts, f"[{key}]"), self.documentation)
+        documentation = self.documentation or not self._DOCUMENTATION_CONTEXT_HINTS.isdisjoint(
+            re.split(r"[.\[\]_-]+", key.lower())
+        )
+        return _MetadataPath((*self.parts, f".{key}"), documentation)
+
+    def __str__(self) -> str:
+        return "".join(self.parts)
+
+
 @dataclass
 class _BoundedJsonPrefixFrame:
     """Track visible JSON container position while a bounded prefix is walked."""
 
     kind: str
-    context: str
+    context: _MetadataPath
     state: str
     pending_key: str | None = None
     next_index: int = 0
@@ -99,22 +135,6 @@ class JaxCheckpointScanner(BaseScanner):
         "device_array",
     )
     _NON_JAX_NEAR_MATCH_PREFIXES: ClassVar[frozenset[str]] = frozenset({"a"})
-    _DOCUMENTATION_CONTEXT_HINTS: ClassVar[frozenset[str]] = frozenset(
-        {
-            "description",
-            "doc",
-            "docs",
-            "documentation",
-            "comment",
-            "comments",
-            "note",
-            "notes",
-            "help",
-            "readme",
-            "example",
-            "examples",
-        }
-    )
     _PICKLE_STRING_OPCODES: ClassVar[frozenset[str]] = frozenset(
         {
             "STRING",
@@ -324,13 +344,6 @@ class JaxCheckpointScanner(BaseScanner):
 
     _get_int_config = _scanner_int_config
 
-    @classmethod
-    def _looks_like_documentation_context(cls, context: str) -> bool:
-        """Return True when a metadata path looks documentation-only."""
-        lowered = context.lower()
-        context_parts = [part for part in re.split(r"[.\[\]_-]+", lowered) if part]
-        return any(part in cls._DOCUMENTATION_CONTEXT_HINTS for part in context_parts)
-
     @staticmethod
     def _looks_like_documentation_text(text: str) -> bool:
         """Return True when a metadata string looks like prose-only documentation.
@@ -363,122 +376,65 @@ class JaxCheckpointScanner(BaseScanner):
 
     @classmethod
     def _iter_string_metadata(
-        cls,
-        value: Any,
-        context: str = "root",
-        *,
-        depth: int = 0,
-        depth_cap_contexts: set[str] | None = None,
-    ) -> Iterator[tuple[str, str]]:
-        """Yield string leaves from nested metadata with their traversal context."""
-        if depth >= cls._MAX_METADATA_TRAVERSAL_DEPTH:
-            if depth_cap_contexts is not None:
-                depth_cap_contexts.add(context)
-            return
-
-        if isinstance(value, str):
+        cls, value: Any, context: _MetadataPath | None = None
+    ) -> Iterator[tuple[_MetadataPath, str | None]]:
+        """Yield string leaves, or None for a subtree skipped at the depth limit."""
+        if context is None:
+            context = _MetadataPath(("root",))
+        if len(context.parts) > cls._MAX_METADATA_TRAVERSAL_DEPTH:
+            yield context, None
+        elif isinstance(value, str):
             yield context, value
-            return
-
-        if isinstance(value, dict):
-            for key, nested_value in value.items():
-                yield from cls._iter_string_metadata(
-                    nested_value,
-                    f"{context}.{key}",
-                    depth=depth + 1,
-                    depth_cap_contexts=depth_cap_contexts,
-                )
-            return
-
-        if isinstance(value, (list, tuple, set)):
-            for index, nested_value in enumerate(value):
-                yield from cls._iter_string_metadata(
-                    nested_value,
-                    f"{context}[{index}]",
-                    depth=depth + 1,
-                    depth_cap_contexts=depth_cap_contexts,
-                )
-
-    def _add_metadata_traversal_depth_limit_checks(
-        self,
-        *,
-        contexts: set[str],
-        check_name: str,
-        location: str,
-        result: ScanResult,
-    ) -> None:
-        """Surface metadata traversal truncation so deeply nested payloads do not fail open."""
-        if not contexts:
-            return
-
-        mark_inconclusive_scan_result(result, self._METADATA_TRAVERSAL_LIMIT_REASON)
-        for context in sorted(contexts):
-            result.add_check(
-                name=check_name,
-                passed=False,
-                message=(
-                    f"Reached the maximum JAX metadata traversal depth at {context}; "
-                    "nested metadata below this path was not scanned"
-                ),
-                severity=IssueSeverity.INFO,
-                location=location,
-                details={
-                    "context": context,
-                    "max_metadata_traversal_depth": self._MAX_METADATA_TRAVERSAL_DEPTH,
-                    "traversal_depth_cap_reached": True,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": self._METADATA_TRAVERSAL_LIMIT_REASON,
-                },
-                rule_code="S902",
-            )
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                yield from cls._iter_string_metadata(child, context.child(str(key)))
+        elif isinstance(value, (list, tuple, set)):
+            for index, child in enumerate(value):
+                yield from cls._iter_string_metadata(child, context.child(index))
 
     def _add_suspicious_pattern_checks(
         self,
         text: str,
         *,
-        context: str,
-        check_name: str,
+        context: _MetadataPath,
+        kind: str,
         message_prefix: str,
         location: str,
         result: ScanResult,
         finding_budget: _PatternFindingBudget,
     ) -> None:
         """Match suspicious JAX regexes against one metadata/text context."""
-        if self._looks_like_documentation_context(context) and self._looks_like_documentation_text(text):
+        if finding_budget.limit_reported or (context.documentation and self._looks_like_documentation_text(text)):
             return
 
         for pattern in self.jax_suspicious_patterns:
             if not pattern.search(text):
                 continue
             if finding_budget.recorded_findings >= finding_budget.max_findings:
-                if not finding_budget.limit_reported:
-                    limit_check_name = check_name.replace(" Security Check", " Finding Limit")
-                    if limit_check_name == check_name:
-                        limit_check_name = f"{check_name} Finding Limit"
-                    result.add_check(
-                        name=limit_check_name,
-                        passed=False,
-                        message=(
-                            "Reached the maximum number of recorded JAX metadata pattern findings; "
-                            "additional matches were suppressed"
-                        ),
-                        severity=IssueSeverity.WARNING,
-                        location=location,
-                        details={
-                            "max_metadata_pattern_findings": finding_budget.max_findings,
-                        },
-                        rule_code="S902",
-                    )
-                    finding_budget.limit_reported = True
+                result.add_check(
+                    name=f"{kind} Pattern Finding Limit",
+                    passed=False,
+                    message=(
+                        "Reached the maximum number of recorded JAX metadata pattern findings; "
+                        "additional matches were suppressed"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    location=location,
+                    details={
+                        "max_metadata_pattern_findings": finding_budget.max_findings,
+                    },
+                    rule_code="S902",
+                )
+                finding_budget.limit_reported = True
                 return
 
             result.add_check(
-                name=check_name,
+                name=f"{kind} Pattern Security Check",
                 passed=False,
                 message=f"{message_prefix}: {pattern.pattern}",
                 severity=IssueSeverity.CRITICAL,
                 location=location,
-                details={"pattern": pattern.pattern, "context": context},
+                details={"pattern": pattern.pattern, "context": str(context)},
                 rule_code="S902",
             )
             finding_budget.recorded_findings += 1
@@ -488,8 +444,8 @@ class JaxCheckpointScanner(BaseScanner):
         result = self._create_result()
         self._add_suspicious_pattern_checks(
             text,
-            context="pickle_checkpoint",
-            check_name="JAX Pattern Security Check",
+            context=_MetadataPath(("pickle_checkpoint",)),
+            kind="JAX",
             message_prefix="Suspicious JAX pattern in pickle",
             location=path,
             result=result,
@@ -564,9 +520,8 @@ class JaxCheckpointScanner(BaseScanner):
         prefix_text: str,
         *,
         root_context: str = "json_checkpoint_bounded_prefix",
-        depth_cap_contexts: set[str] | None = None,
-    ) -> Iterator[tuple[str, str]]:
-        """Yield decoded visible JSON strings with bounded ancestor context."""
+    ) -> Iterator[tuple[_MetadataPath, str | None]]:
+        """Yield visible strings and depth-limit markers even when the JSON is incomplete."""
         decoder = json.JSONDecoder()
         frames: list[_BoundedJsonPrefixFrame] = []
         offset = 0
@@ -581,10 +536,10 @@ class JaxCheckpointScanner(BaseScanner):
             if parent.kind == "array":
                 parent.next_index += 1
 
-        def value_context(frame: _BoundedJsonPrefixFrame) -> str | None:
+        def value_context(frame: _BoundedJsonPrefixFrame) -> _MetadataPath | None:
             if frame.kind == "object":
-                return f"{frame.context}.{frame.pending_key}" if frame.pending_key is not None else None
-            return f"{frame.context}[{frame.next_index}]"
+                return frame.context.child(frame.pending_key) if frame.pending_key is not None else None
+            return frame.context.child(frame.next_index)
 
         while offset < len(prefix_text):
             if prefix_text[offset].isspace():
@@ -598,7 +553,7 @@ class JaxCheckpointScanner(BaseScanner):
                     return
                 kind = "object" if prefix_text[offset] == "{" else "array"
                 state = "key" if kind == "object" else "value"
-                frames.append(_BoundedJsonPrefixFrame(kind, root_context, state))
+                frames.append(_BoundedJsonPrefixFrame(kind, _MetadataPath((root_context,)), state))
                 offset += 1
                 continue
 
@@ -655,8 +610,7 @@ class JaxCheckpointScanner(BaseScanner):
                     continue
                 if marker in "{[":
                     if len(frames) >= cls._MAX_METADATA_TRAVERSAL_DEPTH:
-                        if depth_cap_contexts is not None:
-                            depth_cap_contexts.add(context)
+                        yield context, None
                         skipped_offset = cls._skip_bounded_json_prefix_container(prefix_text, offset)
                         if skipped_offset is None:
                             return
@@ -691,71 +645,87 @@ class JaxCheckpointScanner(BaseScanner):
             frame.state = "key" if frame.kind == "object" else "value"
             offset += 1
 
-    def _scan_bounded_json_prefix_patterns(
+    def _scan_bounded_json_prefix_patterns(self, path: str, result: ScanResult, *, orbax: bool = False) -> None:
+        """Recover visible metadata even when a bounded read ends mid-value."""
+        with open(path, "rb") as source:
+            prefix = source.read(JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES).decode("utf-8-sig", errors="ignore")
+        root = "orbax_metadata_bounded_prefix" if orbax else "json_checkpoint_bounded_prefix"
+        try:
+            parsed, _ = json.JSONDecoder().raw_decode(prefix, len(prefix) - len(prefix.lstrip()))
+        except (json.JSONDecodeError, RecursionError):
+            values = self._iter_bounded_json_prefix_strings(prefix, root_context=root)
+        else:
+            values = self._iter_string_metadata(parsed, _MetadataPath((root,)))
+        self._check_metadata_patterns(values, path, result, orbax=orbax, bounded=True)
+
+    def _check_metadata_patterns(
         self,
+        values: Iterator[tuple[_MetadataPath, str | None]],
         path: str,
         result: ScanResult,
         *,
-        root_context: str = "json_checkpoint_bounded_prefix",
-        check_name: str = "JSON Pattern Security Check",
-        message_prefix: str = "Suspicious pattern in bounded JSON checkpoint prefix",
-        depth_limit_check_name: str = "JSON Metadata Traversal Depth Limit",
-        detect_orbax_restore_fn: bool = False,
+        orbax: bool = False,
+        bounded: bool = False,
     ) -> None:
-        """Scan decoded JSON string content visible inside the bounded prefix."""
-        with open(path, "rb") as source:
-            prefix_text = source.read(JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES).decode("utf-8-sig", errors="ignore")
-
-        depth_cap_contexts: set[str] = set()
-        first_token_offset = len(prefix_text) - len(prefix_text.lstrip())
-        try:
-            parsed_root, _ = json.JSONDecoder().raw_decode(prefix_text, first_token_offset)
-        except (json.JSONDecodeError, RecursionError):
-            string_values = self._iter_bounded_json_prefix_strings(
-                prefix_text,
-                root_context=root_context,
-                depth_cap_contexts=depth_cap_contexts,
-            )
-        else:
-            string_values = self._iter_string_metadata(
-                parsed_root,
-                root_context,
-                depth_cap_contexts=depth_cap_contexts,
-            )
-
-        finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
-        orbax_restore_context = f"{root_context}.restore_fn"
-        first_orbax_restore_fn: str | None = None
-        dangerous_orbax_restore_fn: str | None = None
-        for context, text_value in string_values:
-            if detect_orbax_restore_fn and (
-                context == orbax_restore_context
-                or context.startswith(f"{orbax_restore_context}.")
-                or context.startswith(f"{orbax_restore_context}[")
+        """Use the same finding and depth budgets for parsed metadata and partial prefixes."""
+        kind = "Orbax" if orbax else "JSON"
+        source = "Orbax metadata" if orbax else "JSON checkpoint"
+        if bounded:
+            source = f"bounded {source} prefix"
+        message_prefix = f"Suspicious pattern in {source}"
+        budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
+        first_skipped: _MetadataPath | None = None
+        limited_paths = 0
+        restore_fn: str | None = None
+        dangerous_restore = False
+        for context, text in values:
+            if text is None:
+                first_skipped = first_skipped or context
+                limited_paths += 1
+                continue
+            # Complete files check the original restore_fn value. Prefixes can expose only some leaves.
+            if (
+                bounded
+                and not dangerous_restore
+                and len(context.parts) > 1
+                and (context.parts[1] == ".restore_fn" or context.parts[1].startswith((".restore_fn.", ".restore_fn[")))
             ):
-                if first_orbax_restore_fn is None:
-                    first_orbax_restore_fn = text_value
-                if dangerous_orbax_restore_fn is None and self._DANGEROUS_RESTORE_FN_PATTERN.search(text_value):
-                    dangerous_orbax_restore_fn = text_value
+                dangerous_restore = self._DANGEROUS_RESTORE_FN_PATTERN.search(text) is not None
+                if restore_fn is None or dangerous_restore:
+                    restore_fn = text
             self._add_suspicious_pattern_checks(
-                text_value,
+                text,
                 context=context,
-                check_name=check_name,
+                kind=kind,
                 message_prefix=message_prefix,
                 location=path,
                 result=result,
-                finding_budget=finding_budget,
+                finding_budget=budget,
             )
-        if dangerous_orbax_restore_fn is not None:
-            self._add_orbax_restore_fn_check(dangerous_orbax_restore_fn, path, result)
-        elif first_orbax_restore_fn is not None:
-            self._add_orbax_restore_fn_check(first_orbax_restore_fn, path, result)
-        self._add_metadata_traversal_depth_limit_checks(
-            contexts=depth_cap_contexts,
-            check_name=depth_limit_check_name,
-            location=path,
-            result=result,
-        )
+        if restore_fn is not None:
+            self._add_orbax_restore_fn_check(restore_fn, path, result)
+        if first_skipped is not None:
+            mark_inconclusive_scan_result(result, self._METADATA_TRAVERSAL_LIMIT_REASON)
+            first_path = str(first_skipped)
+            result.add_check(
+                name=f"{kind} Metadata Traversal Depth Limit",
+                passed=False,
+                message=(
+                    "Reached the maximum JAX metadata traversal depth. "
+                    f"Skipped {limited_paths} {'path' if limited_paths == 1 else 'paths'} starting at {first_path}."
+                ),
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "context": first_path,
+                    "limited_paths": limited_paths,
+                    "max_metadata_traversal_depth": self._MAX_METADATA_TRAVERSAL_DEPTH,
+                    "traversal_depth_cap_reached": True,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._METADATA_TRAVERSAL_LIMIT_REASON,
+                },
+                rule_code="S902",
+            )
 
     @staticmethod
     def _parse_pickle_global_reference(arg: str) -> tuple[str, str] | None:
@@ -1292,6 +1262,7 @@ class JaxCheckpointScanner(BaseScanner):
         return any(
             cls._contains_jax_indicator(text_value)
             for _, text_value in cls._iter_bounded_json_prefix_strings(prefix_text)
+            if text_value is not None
         )
 
     def _add_orbax_metadata_read_failure(
@@ -1370,15 +1341,7 @@ class JaxCheckpointScanner(BaseScanner):
             },
         )
         try:
-            self._scan_bounded_json_prefix_patterns(
-                str(metadata_path),
-                result,
-                root_context="orbax_metadata_bounded_prefix",
-                check_name="Orbax Pattern Security Check",
-                message_prefix="Suspicious pattern in bounded Orbax metadata prefix",
-                depth_limit_check_name="Orbax Metadata Traversal Depth Limit",
-                detect_orbax_restore_fn=True,
-            )
+            self._scan_bounded_json_prefix_patterns(str(metadata_path), result, orbax=True)
         except OSError as e:
             mark_operational_scan_error(result, self._ORBAX_METADATA_PREFIX_PATTERN_READ_FAILED_REASON)
             result.add_check(
@@ -1571,29 +1534,8 @@ class JaxCheckpointScanner(BaseScanner):
         if "restore_fn" in metadata:
             self._add_orbax_restore_fn_check(str(metadata["restore_fn"]), path, result)
 
-        # Check for code injection in metadata
-        pattern_finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
-        metadata_depth_cap_contexts: set[str] = set()
-        for context, text_value in self._iter_string_metadata(
-            metadata,
-            "orbax_metadata",
-            depth_cap_contexts=metadata_depth_cap_contexts,
-        ):
-            self._add_suspicious_pattern_checks(
-                text_value,
-                context=context,
-                check_name="Orbax Pattern Security Check",
-                message_prefix="Suspicious pattern in Orbax metadata",
-                location=path,
-                result=result,
-                finding_budget=pattern_finding_budget,
-            )
-        self._add_metadata_traversal_depth_limit_checks(
-            contexts=metadata_depth_cap_contexts,
-            check_name="Orbax Metadata Traversal Depth Limit",
-            location=path,
-            result=result,
-        )
+        values = self._iter_string_metadata(metadata, _MetadataPath(("orbax_metadata",)))
+        self._check_metadata_patterns(values, path, result, orbax=True)
 
         # Extract useful metadata
         if isinstance(metadata, dict):
@@ -2012,11 +1954,7 @@ class JaxCheckpointScanner(BaseScanner):
                 rule_code="S902",
             )
             try:
-                self._scan_bounded_json_prefix_patterns(
-                    path,
-                    result,
-                    detect_orbax_restore_fn=True,
-                )
+                self._scan_bounded_json_prefix_patterns(path, result)
             except OSError as e:
                 mark_operational_scan_error(result, self._JSON_PREFIX_PATTERN_READ_FAILED_REASON)
                 result.add_check(
@@ -2054,29 +1992,8 @@ class JaxCheckpointScanner(BaseScanner):
             ):
                 self._add_orbax_restore_fn_check(str(data["restore_fn"]), path, result)
 
-            # Analyze JSON content for suspicious patterns
-            pattern_finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
-            metadata_depth_cap_contexts: set[str] = set()
-            for context, text_value in self._iter_string_metadata(
-                data,
-                "json_checkpoint",
-                depth_cap_contexts=metadata_depth_cap_contexts,
-            ):
-                self._add_suspicious_pattern_checks(
-                    text_value,
-                    context=context,
-                    check_name="JSON Pattern Security Check",
-                    message_prefix="Suspicious pattern in JSON checkpoint",
-                    location=path,
-                    result=result,
-                    finding_budget=pattern_finding_budget,
-                )
-            self._add_metadata_traversal_depth_limit_checks(
-                contexts=metadata_depth_cap_contexts,
-                check_name="JSON Metadata Traversal Depth Limit",
-                location=path,
-                result=result,
-            )
+            values = self._iter_string_metadata(data, _MetadataPath(("json_checkpoint",)))
+            self._check_metadata_patterns(values, path, result)
 
         except json.JSONDecodeError as e:
             mark_inconclusive_scan_result(result, "jax_json_parse_failed")
