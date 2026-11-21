@@ -6578,42 +6578,10 @@ def _calls_for_function(function_name: str) -> tuple[str, ...] | None:
 
 
 def _function_reads_lazy_annotationlib(function: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    class _ProxyReadVisitor(ast.NodeVisitor):
-        found = False
-
-        def visit_Attribute(self, node: ast.Attribute) -> None:
-            if (
-                isinstance(node.ctx, ast.Load)
-                and isinstance(node.value, ast.Name)
-                and node.value.id == "_lazy_annotationlib"
-            ):
-                self.found = True
-            self.generic_visit(node)
-
-        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-            for decorator in node.decorator_list:
-                self.visit(decorator)
-            self._visit_defaults(node.args)
-
-        visit_AsyncFunctionDef = visit_FunctionDef
-
-        def visit_Lambda(self, node: ast.Lambda) -> None:
-            self._visit_defaults(node.args)
-
-        def _visit_defaults(self, args: ast.arguments) -> None:
-            for default in (*args.defaults, *args.kw_defaults):
-                if default is not None:
-                    self.visit(default)
-
-        def visit_Call(self, node: ast.Call) -> None:
-            self.generic_visit(node)
-            if isinstance(node.func, ast.Lambda):
-                self.visit(node.func.body)
-
-    visitor = _ProxyReadVisitor()
-    for statement in function.body:
-        visitor.visit(statement)
-    return visitor.found
+    return any(
+        isinstance(node.ctx, ast.Load) and isinstance(node.value, ast.Name) and node.value.id == "_lazy_annotationlib"
+        for node in _scope_expressions(function, ast.Attribute, annotations=False)
+    )
 
 
 def _template_import_requires_keywords(function_name: str, keyword_arg_names: tuple[str, ...] | None) -> bool:
@@ -8698,11 +8666,15 @@ def _collect_module_export_summary(
     return _WildcardExportSummary(frozenset(direct_names), tuple(wildcard_imports))
 
 
-def _collect_import_aliases(nodes: Iterable[ast.AST], module_name: str, is_package: bool) -> dict[str, str]:
+def _collect_import_aliases(
+    nodes: Iterable[ast.AST], module_name: str, is_package: bool, *, modules: list[str] | None = None
+) -> dict[str, str]:
     aliases: dict[str, str] = {}
     for statement in nodes:
         if isinstance(statement, ast.Import):
             for alias in statement.names:
+                if modules is not None:
+                    modules.append(alias.name)
                 if alias.asname:
                     aliases[alias.asname] = alias.name
                 else:
@@ -8712,6 +8684,8 @@ def _collect_import_aliases(nodes: Iterable[ast.AST], module_name: str, is_packa
             if statement.module == "__future__":
                 continue
             imported_module = _resolve_import_from_module(module_name, is_package, statement.level, statement.module)
+            if modules is not None:
+                modules.append(imported_module)
             for alias in statement.names:
                 if alias.name == "*":
                     continue
@@ -8722,33 +8696,25 @@ def _collect_import_aliases(nodes: Iterable[ast.AST], module_name: str, is_packa
 
 @_register_source_sensitive_cache
 @lru_cache(maxsize=4096)
-def _collect_function_import_aliases(
+def _function_imports(
     function_node: ast.FunctionDef | ast.AsyncFunctionDef,
     module_name: str,
     is_package: bool,
-) -> dict[str, str]:
-    aliases: dict[str, str] = {}
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Collect local aliases and imported modules from every lexical branch."""
+    modules: list[str] = []
+    aliases = _collect_import_aliases(_scope_imports(function_node), module_name, is_package, modules=modules)
+    return aliases, tuple(modules)
 
-    class _FunctionImportAliasVisitor(ast.NodeVisitor):
-        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-            if node is function_node:
-                self.generic_visit(node)
 
-        visit_AsyncFunctionDef = visit_FunctionDef
-
-        def visit_ClassDef(self, node: ast.ClassDef) -> None:
-            return None
-
-        def visit_Lambda(self, node: ast.Lambda) -> None:
-            self.visit(node.args)
-
-        def visit_Import(self, node: ast.Import | ast.ImportFrom) -> None:
-            aliases.update(_collect_import_aliases((node,), module_name, is_package))
-
-        visit_ImportFrom = visit_Import
-
-    _FunctionImportAliasVisitor().visit(function_node)
-    return aliases
+def _scope_imports(function: ast.FunctionDef | ast.AsyncFunctionDef) -> Iterator[ast.Import | ast.ImportFrom]:
+    pending: list[ast.AST] = list(reversed(function.body))
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            yield node
+        elif not isinstance(node, (ast.expr, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            pending.extend(reversed(list(ast.iter_child_nodes(node))))
 
 
 def _collect_local_defs(statements: Iterable[ast.stmt]) -> set[str]:
@@ -9971,10 +9937,8 @@ def _calls_in_function(
 ) -> tuple[str, ...]:
     calls: list[str] = []
     call_nodes = _iter_call_nodes(function_node)
-    function_aliases = {
-        **aliases,
-        **_collect_function_import_aliases(function_node, module_name, is_package),
-    }
+    local_aliases, _ = _function_imports(function_node, module_name, is_package)
+    function_aliases = {**aliases, **local_aliases}
     instance_aliases, parameter_controlled_names = _collect_function_instance_aliases(
         function_node,
         call_nodes,
@@ -10103,35 +10067,8 @@ def _direct_import_execution_calls(
     module_name: str,
     is_package: bool,
 ) -> tuple[str, ...]:
-    imports_user_code = False
-
-    class _ExecutedImportVisitor(ast.NodeVisitor):
-        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-            if node is function_node:
-                self.generic_visit(node)
-
-        visit_AsyncFunctionDef = visit_FunctionDef
-
-        def visit_ClassDef(self, node: ast.ClassDef | ast.Lambda) -> None:
-            return None
-
-        visit_Lambda = visit_ClassDef
-
-        def visit_Import(self, node: ast.Import) -> None:
-            nonlocal imports_user_code
-            imports_user_code = imports_user_code or any(
-                _import_module_can_execute_user_code(alias.name) for alias in node.names
-            )
-
-        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-            nonlocal imports_user_code
-            if node.module == "__future__":
-                return
-            imported_module = _resolve_import_from_module(module_name, is_package, node.level, node.module)
-            imports_user_code = imports_user_code or _import_module_can_execute_user_code(imported_module)
-
-    _ExecutedImportVisitor().visit(function_node)
-    return (_IMPORT_EXECUTION_SINK,) if imports_user_code else ()
+    _, modules = _function_imports(function_node, module_name, is_package)
+    return (_IMPORT_EXECUTION_SINK,) if any(_import_module_can_execute_user_code(name) for name in modules) else ()
 
 
 @_register_source_sensitive_cache
@@ -10457,40 +10394,37 @@ def _function_instance_alias_value(
 @_register_source_sensitive_cache
 @lru_cache(maxsize=4096)
 def _iter_call_nodes(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[ast.Call, ...]:
-    calls: list[ast.Call] = []
+    return tuple(_scope_expressions(function_node, ast.Call))
 
-    class _CallVisitor(ast.NodeVisitor):
-        def visit_Call(self, node: ast.Call) -> None:
-            calls.append(node)
-            if isinstance(node.func, ast.Lambda):
-                self.visit(node.func.args)
-                self.visit(node.func.body)
-                for arg in node.args:
-                    self.visit(arg)
-                for keyword in node.keywords:
-                    self.visit(keyword.value)
-                return
-            self.generic_visit(node)
 
-        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-            self._visit_nested_function_signature(node)
+_ExpressionT = TypeVar("_ExpressionT", bound=ast.Call | ast.Attribute)
 
-        visit_AsyncFunctionDef = visit_FunctionDef
 
-        def visit_Lambda(self, node: ast.Lambda) -> None:
-            self.visit(node.args)
-
-        def _visit_nested_function_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-            for decorator in node.decorator_list:
-                self.visit(decorator)
-            self.visit(node.args)
-            if node.returns is not None:
-                self.visit(node.returns)
-
-    visitor = _CallVisitor()
-    for statement in function_node.body:
-        visitor.visit(statement)
-    return tuple(calls)
+def _scope_expressions(
+    function: ast.FunctionDef | ast.AsyncFunctionDef, kind: type[_ExpressionT], *, annotations: bool = True
+) -> Iterator[_ExpressionT]:
+    """Walk expressions in the function body, including nested signatures and immediately called lambdas."""
+    pending: list[ast.AST] = list(reversed(function.body))
+    while pending:
+        node = pending.pop()
+        if not node._fields or isinstance(node, (ast.Name, ast.Constant)):
+            continue
+        if isinstance(node, kind):
+            yield node
+        children: list[ast.AST]
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            children = [*node.decorator_list, node.args]
+            if annotations and node.returns is not None:
+                children.append(node.returns)
+        elif isinstance(node, ast.Lambda):
+            children = [node.args]
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Lambda):
+            children = [node.func.args, node.func.body, *node.args, *node.keywords]
+        elif isinstance(node, ast.arguments) and not annotations:
+            children = [value for value in (*node.defaults, *node.kw_defaults) if value is not None]
+        else:
+            children = list(ast.iter_child_nodes(node))
+        pending.extend(reversed(children))
 
 
 def _propagate_parameter_controlled_names(

@@ -707,68 +707,40 @@ sys.path.insert(0, str(module_dir))
 """
 
 
-def test_iter_call_nodes_reuses_cached_walk(monkeypatch: pytest.MonkeyPatch) -> None:
-    module = ast.parse(
-        """
-def bridge(target, command):
-    callback = getattr(target, command)
-    callback(command)
-"""
-    )
-    bridge = module.body[0]
+def test_iter_call_nodes_reuses_cached_walk() -> None:
+    bridge = ast.parse("def bridge(target, command): return getattr(target, command)(command)").body[0]
     assert isinstance(bridge, ast.FunctionDef)
-
-    visits = 0
-    original_visit = ast.NodeVisitor.visit
-
-    def counting_visit(self: ast.NodeVisitor, node: ast.AST) -> Any:
-        nonlocal visits
-        visits += 1
-        return original_visit(self, node)
-
-    monkeypatch.setattr(ast.NodeVisitor, "visit", counting_visit)
     call_graph._iter_call_nodes.cache_clear()
 
-    first = call_graph._iter_call_nodes(bridge)
-    first_visit_count = visits
-    second = call_graph._iter_call_nodes(bridge)
-
-    assert first == second
-    assert first_visit_count > 0
-    assert visits == first_visit_count
+    calls = call_graph._iter_call_nodes(bridge)
+    assert [ast.unparse(node.func) for node in calls] == ["getattr(target, command)", "getattr"]
+    assert call_graph._iter_call_nodes(bridge) is calls
 
 
-def test_collect_function_import_aliases_reuses_cached_walk(monkeypatch: pytest.MonkeyPatch) -> None:
-    module = ast.parse(
-        """
+def test_function_imports_reuse_cached_walk() -> None:
+    bridge = ast.parse("""
 def bridge():
-    import os
-    from subprocess import run
-    return run
-"""
-    )
-    bridge = module.body[0]
+    import os, pkg.helper
+    if False:
+        from subprocess import run
+    try:
+        from .provider import value as run
+    except ImportError:
+        import fallback
+    class Local:
+        import ignored_class as run
+    def nested():
+        import ignored_function as run
+""").body[0]
     assert isinstance(bridge, ast.FunctionDef)
+    call_graph._function_imports.cache_clear()
 
-    calls = 0
-    original_collect_import_aliases = call_graph._collect_import_aliases
-
-    def counting_collect_import_aliases(
-        statements: tuple[ast.stmt, ...],
-        module_name: str,
-        is_package: bool,
-    ) -> dict[str, str]:
-        nonlocal calls
-        calls += 1
-        return original_collect_import_aliases(statements, module_name, is_package)
-
-    monkeypatch.setattr(call_graph, "_collect_import_aliases", counting_collect_import_aliases)
-    call_graph._collect_function_import_aliases.cache_clear()
-
-    expected = {"os": "os", "run": "subprocess.run"}
-    assert call_graph._collect_function_import_aliases(bridge, "benchmod", False) == expected
-    assert call_graph._collect_function_import_aliases(bridge, "benchmod", False) == expected
-    assert calls == 2
+    imports = call_graph._function_imports(bridge, "pkg.bridge", False)
+    assert imports == (
+        {"os": "os", "pkg": "pkg", "run": "pkg.provider.value", "fallback": "fallback"},
+        ("os", "pkg.helper", "subprocess", "pkg.provider", "fallback"),
+    )
+    assert call_graph._function_imports(bridge, "pkg.bridge", False) is imports
 
 
 def test_parameter_controlled_names_reuses_cached_analysis(monkeypatch: pytest.MonkeyPatch) -> None:
