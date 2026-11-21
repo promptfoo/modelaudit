@@ -341,16 +341,31 @@ def test_release_metadata_requires_open_same_repo_release_branch(tmp_path: Path,
     branch = "release-please--branches--main"
     head = "1" * 40
     steps = _job_steps(_load_release_workflow(), "release-please")
-    shell = _step_by_name(steps, "Check if PR exists")["run"]
-    gh = tmp_path / "gh"
-    gh.write_text('#!/bin/sh\ncat "$MOCK_PR"\n')
-    gh.chmod(0o755)
-    pr = {"number": 7, "state": "OPEN", "baseRefName": "main", "headRefName": branch, "headRefOid": head}
+    mock = """
+gh() {
+  if [[ $1 == api ]]; then
+    [[ $2 == "repos/$GITHUB_REPOSITORY/git/ref/heads/$RETRY_BRANCH" ]] || return 1
+    echo "$REF_HEAD"
+  elif [[ -f "$STALE_PR" ]]; then
+    cat "$STALE_PR"
+    rm "$STALE_PR"
+  else
+    echo "$MOCK_PR"
+  fi
+}
+sleep() { :; }
+"""
+    shell = mock + _step_by_name(steps, "Check if PR exists")["run"]
+    pr = {"number": 7, "state": "OPEN", "baseRefName": "main", "headRefName": branch, "isCrossRepository": False}
+    current = json.dumps({**pr, "headRefOid": head})
+    previous = json.dumps({**pr, "headRefOid": "2" * 40})
     output = tmp_path / "output"
+    stale = tmp_path / "stale.json"
     env = {
         **os.environ,
-        "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
-        "MOCK_PR": str(tmp_path / "pr.json"),
+        "REF_HEAD": head,
+        "MOCK_PR": current,
+        "STALE_PR": str(stale),
         "GITHUB_OUTPUT": str(output),
         "GITHUB_REPOSITORY": "example/modelaudit",
         "PR_OUTPUT": json.dumps({"headBranchName": branch}) if event == "release" else "",
@@ -362,12 +377,19 @@ def test_release_metadata_requires_open_same_repo_release_branch(tmp_path: Path,
         {"headRefName": "other"},
         {"baseRefName": "other"},
         {"isCrossRepository": True},
+        {"headRefOid": None},
+        {"headRefOid": "invalid"},
+        {"headRefOid": head + "\n"},
+        {"number": "7\npr_head=other"},
     ):
-        (tmp_path / "pr.json").write_text(json.dumps({**pr, "isCrossRepository": False, **override}))
-        assert subprocess.run(["bash", "-c", shell], env=env, capture_output=True).returncode != 0
+        stale.write_text(json.dumps({**pr, "headRefOid": head, **override}))
+        assert subprocess.run(["bash", "-c", shell], env=env, capture_output=True, timeout=30).returncode != 0
         assert not output.exists()
-    (tmp_path / "pr.json").write_text(json.dumps({**pr, "isCrossRepository": False}))
-    subprocess.run(["bash", "-c", shell], env=env, capture_output=True, check=True)
+    mismatch = subprocess.run(["bash", "-c", shell], env={**env, "MOCK_PR": previous}, capture_output=True, timeout=30)
+    assert mismatch.returncode != 0 and not output.exists()
+    stale.write_text(previous)
+    subprocess.run(["bash", "-c", shell], env=env, capture_output=True, check=True, timeout=30)
+    assert not stale.exists()
     assert output.read_text().splitlines() == [f"pr_branch={branch}", "pr_number=7", f"pr_head={head}"]
 
 
