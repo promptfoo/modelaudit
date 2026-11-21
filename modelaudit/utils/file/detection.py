@@ -3847,6 +3847,10 @@ def _parse_sentencepiece_trainer_spec_proto_stream(
     )
     if payload is None:
         return None
+    # TrainerSpec string fields can encode entire TensorFlow nodes. Check
+    # every trainer, even after TensorFlow's top-level routing window.
+    if inspect_values and _classify_tensorflow_field_two_payload(payload, outer_hint="unknown") != "unknown":
+        return None
     return _parse_sentencepiece_trainer_spec_proto(payload, 0, len(payload), inspect_values=inspect_values)
 
 
@@ -4082,8 +4086,15 @@ def _should_fail_closed_malformed_sentencepiece_model_proto_file(path: str | Pat
     return Path(path).suffix.lower() in {"", ".proto"} and _is_malformed_sentencepiece_model_proto_candidate_file(path)
 
 
-def _has_sentencepiece_model_proto_route(path: str | Path) -> bool:
-    return Path(path).suffix.lower() in {"", ".model", ".proto"} and is_sentencepiece_model_proto_file(path)
+def _has_declared_sentencepiece_model_proto_route(path: Path) -> bool:
+    # Preserve suffix ownership, including reporting ZIP findings inside a
+    # tokenizer whose trainer metadata also resembles another format.
+    return path.suffix.lower() in {".model", ".proto"} and is_sentencepiece_model_proto_file(path)
+
+
+def _has_extensionless_sentencepiece_model_proto_route(path: Path) -> bool:
+    # Extensionless tokenizers are a fallback after existing content owners.
+    return not path.suffix and is_sentencepiece_model_proto_file(path)
 
 
 def is_sentencepiece_model_proto_file(path: str | Path) -> bool:
@@ -9845,7 +9856,7 @@ def detect_format_from_magic_bytes(
     if file_path is not None and _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
         return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
 
-    if file_path is not None and _has_sentencepiece_model_proto_route(file_path):
+    if file_path is not None and _has_declared_sentencepiece_model_proto_route(file_path):
         return "sentencepiece"
 
     renamed_tensorflow_format = "unknown"
@@ -9881,6 +9892,8 @@ def detect_format_from_magic_bytes(
         return "jax_checkpoint"
 
     if renamed_tensorflow_format == "inconclusive":
+        if file_path is not None and _has_extensionless_sentencepiece_model_proto_route(file_path):
+            return "sentencepiece"
         return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
 
     if file_path is not None and file_path.suffix.lower() == ".mlmodel" and coreml_route_status is None:
@@ -10052,7 +10065,7 @@ def detect_file_format_from_magic(path: str) -> str:
             if _could_be_content_routed_flax_msgpack(file_path):
                 return "flax_msgpack"
 
-            if _has_sentencepiece_model_proto_route(file_path):
+            if _has_extensionless_sentencepiece_model_proto_route(file_path):
                 return "sentencepiece"
 
             renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
@@ -10237,9 +10250,6 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
             return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
 
-        if _has_sentencepiece_model_proto_route(file_path):
-            return "sentencepiece"
-
         if (
             _allows_renamed_binary_content_route(file_path)
             and _detect_executorch_content_route(file_path, magic8) == "executorch"
@@ -10262,6 +10272,9 @@ def detect_file_format_for_skip_filter(path: str) -> str:
                 return xml_format
         if _could_be_content_routed_flax_msgpack(file_path):
             return "flax_msgpack"
+
+        if _has_extensionless_sentencepiece_model_proto_route(file_path):
+            return "sentencepiece"
 
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
     if renamed_tensorflow_format != "unknown":
@@ -10482,7 +10495,7 @@ def detect_file_format(path: str) -> str:
     if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
         return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
 
-    if _has_sentencepiece_model_proto_route(file_path):
+    if _has_declared_sentencepiece_model_proto_route(file_path):
         return "sentencepiece"
 
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(
@@ -10586,6 +10599,9 @@ def detect_file_format(path: str) -> str:
         return "rknn"
     if ext not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(magic8):
         return "tflite"
+
+    if _has_extensionless_sentencepiece_model_proto_route(file_path):
+        return "sentencepiece"
 
     if renamed_tensorflow_format == "oversized":
         return "tf_metagraph"

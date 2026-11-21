@@ -161,6 +161,16 @@ def _pickle_result_consumes_entire_payload(path: str, result: ScanResult) -> boo
     return positions[0] == positions[1] == positions[2] == file_size
 
 
+def prefer_selected_sentencepiece_zip(path: str, header_format: str, policy: ScannerSelectionPolicy) -> bool:
+    """Allow a ZIP subtype to own the scan when the overlapping tokenizer scanner is disabled."""
+    return (
+        header_format == "sentencepiece"
+        and not policy.allows("sentencepiece")
+        and allows_zip_content_analysis(policy)
+        and zipfile.is_zipfile(path)
+    )
+
+
 def _select_zip_scanner_id(path: str, ext: str, config: dict[str, Any] | None) -> str:
     """Select a ZIP subtype by trusted structure and suffix fallback."""
     if config is not None and not allows_zip_structure_analysis(policy_from_config(config), path):
@@ -1338,6 +1348,8 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         return with_safetensors_overlap(result)
 
     header_format_override = trusted_content_format if trusted_content_format in {"hdf5", "mxnet", "xgboost"} else None
+    if prefer_selected_sentencepiece_zip(path, routed_content_format, scanner_selection):
+        header_format_override = "zip"
     try:
         scanner_id = _select_nested_scanner_id(path, header_format_override, config)
     except ZipPreflightRejected as exc:

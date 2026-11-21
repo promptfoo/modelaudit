@@ -2335,6 +2335,44 @@ class TestXGBoostFailClosedEndToEnd:
         assert not any(issue.rule_code == "S1004" for issue in direct_archive.issues)
         _assert_no_xgboost_s1004(aggregate)
 
+    @pytest.mark.parametrize("suffix", [".model", ".proto", ""])
+    def test_sentencepiece_does_not_hide_a_zip_member(self, tmp_path: Path, suffix: str) -> None:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            # The records, including their CRCs, form valid UTF-8 inside TrainerSpec.input.
+            for name, data in (("data.pkl", b"cos\nsystem\np3\n."), ("version", b"3 ")):
+                entry = zipfile.ZipInfo(name)
+                entry.external_attr = 1
+                archive.writestr(entry, data)
+        payload = buffer.getvalue()
+        tokenizer = tmp_path / f"tokenizer{suffix}"
+        trainer_input = _proto_field(1, 2, _proto_varint(len(payload)) + payload)
+        tokenizer.write_bytes(
+            _sentencepiece_model_proto() + _sentencepiece_trainer_spec(vocab_size=8, extra_fields=trainer_input)
+        )
+
+        for entrypoint in (scan_file, scan_nested_file):
+            result = entrypoint(str(tokenizer), config={"cache_enabled": False})
+            assert any(
+                check.name == "SentencePiece Vocabulary Validation" and check.status == CheckStatus.PASSED
+                for check in result.checks
+            )
+            pytorch = entrypoint(str(tokenizer), config={"cache_enabled": False, "scanners": ["pytorch_zip", "pickle"]})
+            assert pytorch.scanner_name == "pytorch_zip"
+            for analysis in (result, pytorch):
+                assert any(
+                    issue.severity == IssueSeverity.CRITICAL and "os.system" in issue.message
+                    for issue in analysis.issues
+                )
+            limited = entrypoint(str(tokenizer), config={"cache_enabled": False, "max_zip_entries": 1})
+            assert not limited.success
+            assert "zip_analysis_incomplete" in limited.metadata["scan_outcome_reasons"]
+            excluded = entrypoint(
+                str(tokenizer), config={"cache_enabled": False, "max_zip_entries": 1, "exclude_scanners": ["zip"]}
+            )
+            assert excluded.success
+            assert "zip" in excluded.metadata["skipped_scanner_ids"]
+
     def test_sentencepiece_tokenizer_model_cli_xgboost_selection_is_not_false_positive(self, tmp_path: Path) -> None:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(_sentencepiece_model_proto())
@@ -2586,6 +2624,53 @@ class TestXGBoostFailClosedEndToEnd:
         assert cli_result.exit_code == 0
         assert "xgboost" not in cli_payload.get("scanner_names", [])
         assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+
+    @pytest.mark.parametrize("suffix", ["", ".model", ".proto"])
+    @pytest.mark.parametrize("format_id", ["tf_metagraph", "tf_savedmodel"])
+    def test_sentencepiece_trainer_does_not_hide_tensorflow_graph(
+        self, tmp_path: Path, suffix: str, format_id: str
+    ) -> None:
+        # ModelProto.trainer_spec and MetaGraphDef.graph_def both use field 2.
+        # Their field 1 can simultaneously be a UTF-8 input path and a NodeDef.
+        node = _proto_field(1, 2, b"\x05check") + _proto_field(2, 2, b"\x06PyFunc")
+        graph = _proto_field(1, 2, _proto_varint(len(node)) + node)
+        if format_id == "tf_savedmodel":
+            graph = _proto_field(2, 2, _proto_varint(len(graph)) + graph)
+        path = tmp_path / f"tokenizer{suffix}"
+        path.write_bytes(_sentencepiece_model_proto() + _sentencepiece_trainer_spec_field(graph))
+
+        for entrypoint in (scan_file, scan_nested_file):
+            result = entrypoint(str(path), config={"cache_enabled": False})
+            if suffix:
+                assert not result.success
+                assert "sentencepiece_validation_incomplete" in result.metadata["scan_outcome_reasons"]
+            else:
+                assert result.scanner_name == format_id
+                assert any(
+                    issue.severity == IssueSeverity.CRITICAL and "PyFunc" in issue.message for issue in result.issues
+                )
+
+    def test_late_tensorflow_graph_in_sentencepiece_trainer_remains_inconclusive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 4)
+        path = tmp_path / "tokenizer"
+        vocab = _sentencepiece_model_proto()
+        path.write_bytes(vocab + _sentencepiece_trainer_spec_field(b"\x0a\x08\x12\x06PyFunc"))
+        assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 2
+        # The same number of vocabulary pieces remains valid with a normal path.
+        path.write_bytes(vocab + _sentencepiece_trainer_spec_field(b"\x0a\x08train.tx"))
+        result = scan_file(str(path), config={"cache_enabled": False})
+        assert result.scanner_name == "sentencepiece" and result.success
+
+    def test_extensionless_sentencepiece_preserves_torch7_findings(self, tmp_path: Path) -> None:
+        path = tmp_path / "tokenizer"
+        torch7 = b"4\n1\n3\nV 1\n9\nnn.Module\nos.execute()"
+        trainer = _proto_field(1, 2, _proto_varint(len(torch7)) + torch7)
+        path.write_bytes(_sentencepiece_model_proto() + _sentencepiece_trainer_spec_field(trainer))
+        result = scan_file(str(path), config={"cache_enabled": False})
+        assert result.scanner_name == "torch7"
+        assert any("Execution primitives" in issue.message for issue in result.issues)
 
     def test_large_sentencepiece_ownership_probe_skips_unsampled_piece_text(self) -> None:
         class _CountingBytesIO(io.BytesIO):

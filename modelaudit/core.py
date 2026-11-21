@@ -84,6 +84,7 @@ from modelaudit.scanners.archive_dispatch import (
     merge_hdf5_userblock_zip_findings,
     merge_inconclusive_flax_msgpack_outcome,
     merge_safetensors_overlap_analysis,
+    prefer_selected_sentencepiece_zip,
 )
 from modelaudit.scanners.base import (
     DEFAULT_MAX_FILE_READ_SIZE,
@@ -6484,7 +6485,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     pytorch_binary_supplemental_scanner_id = (
         detect_pytorch_binary_supplemental_format(path) if ext == ".bin" and header_format == "pytorch_binary" else None
     )
-    if (
+    if prefer_selected_sentencepiece_zip(path, header_format, scanner_selection) or (
         format_probe_error is None
         and header_format in {"unknown", "pytorch_binary"}
         and pytorch_binary_supplemental_scanner_id is None

@@ -1,16 +1,19 @@
 """Static SentencePiece ModelProto validation without loading a tokenizer."""
 
 import os
+import zipfile
 from io import BytesIO
 from typing import BinaryIO, ClassVar
 
 from ..scanner_results import mark_inconclusive_scan_result
+from ..scanner_selection import add_scanner_selection_skip_check, allows_zip_content_analysis, policy_from_config
 from ..utils._path_hardening import _file_stat_matches
 from ..utils.file.detection import (
     _SENTENCEPIECE_MODEL_PROTO_READ_BYTES,
     _classify_sentencepiece_model_proto_stream,
     is_sentencepiece_model_proto_file,
 )
+from .archive_dispatch import merge_executable_zip_container_findings
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 
@@ -71,5 +74,10 @@ class SentencePieceScanner(BaseScanner):
         )
         if not valid:
             mark_inconclusive_scan_result(result, "sentencepiece_validation_incomplete")
-        result.finish(success=valid)
+        selection = policy_from_config(self.config)
+        if allows_zip_content_analysis(selection):
+            merge_executable_zip_container_findings(path, result, self.config, context="SentencePiece ZIP polyglot")
+        elif zipfile.is_zipfile(path):
+            add_scanner_selection_skip_check(result, path, "zip", selection, context="SentencePiece ZIP polyglot")
+        result.finish(success=valid and not result.has_errors)
         return result
