@@ -132,34 +132,25 @@ def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi()
         for lane in _jobs(_load_release_workflow())["build-picklescan-package"]["strategy"]["matrix"]["include"]
     }
     assert set(matrix["os"]) == release_platforms
+    assert release_platforms == {"ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "macos-15-intel", "windows-latest"}
     assert matrix["python-version"] == ["3.14", "3.15"]
     assert not matrix.get("exclude")
-    assert job["timeout-minutes"] == "${{ matrix.timeout-minutes }}"
-    # Per-platform timeouts apply to both recent versions. Extra lanes cover older releases.
-    platform_timeouts = {
-        lane["os"]: lane["timeout-minutes"] for lane in matrix["include"] if "python-version" not in lane
-    }
-    assert platform_timeouts == {
-        "ubuntu-latest": 30,
-        "ubuntu-24.04-arm": 30,
-        "macos-15": 60,
-        "macos-15-intel": 75,
-        "windows-latest": 90,
-    }
-    extra_lanes = {
-        (lane["os"], lane["python-version"]): lane["timeout-minutes"]
-        for lane in matrix["include"]
-        if "python-version" in lane
-    }
-    assert extra_lanes == {
+    assert job["timeout-minutes"] == "${{ matrix.timeout-minutes || 30 }}"
+    # Entries without a version apply to both recent releases. The rest add individual jobs.
+    included = {(lane["os"], lane.get("python-version")): lane.get("timeout-minutes", 30) for lane in matrix["include"]}
+    assert len(included) == len(matrix["include"])
+    assert included == {
+        ("macos-15", None): 60,
+        ("macos-15-intel", None): 75,
+        ("windows-latest", None): 90,
         ("ubuntu-latest", "3.10"): 15,
-        ("ubuntu-latest", "3.11"): 15,
+        ("ubuntu-latest", "3.11"): 30,
         ("ubuntu-latest", "3.12"): 30,
         ("ubuntu-latest", "3.13"): 30,
         ("macos-15-intel", "3.11"): 45,
         ("macos-15-intel", "3.12"): 45,
     }
-    versions = set(matrix["python-version"]) | {version for _, version in extra_lanes}
+    versions = set(matrix["python-version"]) | {version for _, version in included if version is not None}
     assert project["requires-python"] == ">=3.10"
     assert cargo["features"]["abi3"] == ["pyo3/abi3-py310"]
     for version in versions:
