@@ -161,8 +161,11 @@ pip install "modelaudit[all]"
 # Core only (static scanners, pickle, NumPy, archives, manifests, metadata)
 pip install modelaudit
 
-# Specific frameworks (TensorFlow installs on Python 3.11-3.12; ONNX installs on Python 3.10-3.12)
+# Specific frameworks (TensorFlow installs on Python 3.11-3.12)
 pip install "modelaudit[tensorflow,pytorch,h5,onnx,safetensors]"
+
+# Scan an ONNX model from a source checkout with uv and Rust installed
+uv run --locked --python 3.15 --no-dev --extra onnx modelaudit model.onnx
 
 # CI/CD environments
 pip install "modelaudit[all-ci]"
@@ -181,7 +184,7 @@ On Python 3.15, `all` and `all-ci` omit h5py. For Keras H5 scanning, install `mo
 Building h5py from source requires the HDF5 development libraries and a C compiler. The 7z and
 UBJSON dependencies may also require a compiler. Use Python 3.14 if you need prebuilt h5py wheels.
 
-The ONNX extra is available on Python 3.10–3.12. TensorRT has no Python 3.15 bindings yet.
+TensorRT has no Python 3.15 bindings yet.
 The native pickle scanner requires a GIL-enabled CPython build. On Apple Silicon, PyTorch wheels
 require macOS 14 or newer. Use the core package for static scanning on macOS 11–13.
 

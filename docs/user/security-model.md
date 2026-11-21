@@ -77,7 +77,7 @@ Exit codes:
 
 1. Scan artifacts before loading or serving them.
 2. Treat `CRITICAL` findings as release blockers.
-3. Keep scanner dependencies current (`modelaudit[all]` for broad portable coverage; ONNX is included on Python 3.10-3.12; add `modelaudit[tensorflow]` on Python 3.11-3.12 only for TensorFlow runtime-dependent paths).
+3. Keep scanner dependencies current with `modelaudit[all]`. For TensorFlow runtime-dependent paths on Python 3.11-3.12, add `modelaudit[tensorflow]`.
 4. Pair scanning with provenance and runtime controls.
 
 ## Reporting gaps or misses

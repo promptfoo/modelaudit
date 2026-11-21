@@ -78,9 +78,7 @@ h5 = [
 ]
 pytorch = ["torch>=2.13.0,<3.0"]
 safetensors = ["safetensors>=0.4.0"]
-# Temporary RC pin for CVE-2026-28500: the advisory targets onnx.hub.load(),
-# which ModelAudit does not call.
-onnx = ["onnx>=1.21.0rc3,<2.0; python_version < '3.13'"]
+onnx = ["onnx>=1.23.2,<2.0"]
 dill = ["dill>=0.3.0,<1.0"]
 joblib = ["joblib>=1.0.0,<2.0", "scikit-learn>=1.0.0,<2.0"]
 flax = ["msgpack>=1.2.1,<2.0"]

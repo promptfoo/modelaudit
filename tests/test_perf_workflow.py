@@ -898,9 +898,9 @@ def test_python_platform_smoke_is_required_for_python_changes() -> None:
     pin = _step_by_name(steps, "Pin Python version")
     assert pin["run"].strip() == "uv python pin ${{ matrix.python-version }}"
     sync = _step_by_name(steps, "Sync smoke dependencies")
-    assert (
-        sync["run"]
-        == "uv sync --locked --extra all-ci-windows ${{ matrix.python-version == '3.14' && '--extra h5' || '' }}"
+    assert sync["run"] == (
+        "uv sync --locked --extra all-ci-windows --extra onnx "
+        "${{ matrix.python-version == '3.14' && '--extra h5' || '' }}"
     )
     probe = _step_by_name(steps, "Verify H5 import")
     # PowerShell reports the last native command's status, so the probe must own its step.
@@ -909,5 +909,9 @@ def test_python_platform_smoke_is_required_for_python_changes() -> None:
     test_step = _step_by_name(steps, "Test runtime compatibility")
     assert steps.index(pin) < steps.index(sync) < steps.index(probe) < steps.index(test_step)
     assert "if" not in test_step
-    assert "uv run --locked pytest tests/test_python_compatibility.py -n 0" in test_step["run"]
+    assert test_step["run"] == (
+        "uv run --locked pytest -n 0 --tb=short tests/test_python_compatibility.py "
+        "tests/scanners/test_onnx_scanner.py::test_onnx_scanner_reuses_raw_bytes_for_model_parse "
+        "tests/scanners/test_onnx_scanner.py::test_onnx_scanner_python_op"
+    )
     assert not any(step.get("continue-on-error") for step in [smoke, pin, sync, probe, test_step])
