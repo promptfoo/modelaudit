@@ -167,15 +167,13 @@ jobs:
 
       - name: Audit dependencies for vulnerabilities
         run: |
-          # CVE-2026-4539 currently has no upstream Pygments fix release.
           # pip-audit cannot audit unpublished editable path requirements, so
           # the standalone Rust-backed pickle package is audited separately.
           uv export --frozen --extra all-ci --no-hashes --no-emit-project \
             --no-emit-package modelaudit-picklescan \
             > /tmp/modelaudit-audit-requirements.txt
           # The export already contains every pinned transitive dependency.
-          uvx pip-audit --strict --no-deps --disable-pip --desc \
-            --ignore-vuln CVE-2026-4539 -r /tmp/modelaudit-audit-requirements.txt
+          uvx pip-audit --strict --no-deps --disable-pip --desc -r /tmp/modelaudit-audit-requirements.txt
           uv export --project packages/modelaudit-picklescan --frozen --no-hashes --no-emit-project \
             > /tmp/modelaudit-picklescan-audit-requirements.txt
           if grep -Eq '^[A-Za-z0-9_.-]' /tmp/modelaudit-picklescan-audit-requirements.txt; then
