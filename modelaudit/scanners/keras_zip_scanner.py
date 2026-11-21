@@ -15,14 +15,9 @@ from pathlib import Path
 from typing import Any, ClassVar, cast
 
 from modelaudit.detectors.network_comm import redact_url_for_finding
-from modelaudit.detectors.suspicious_symbols import (
-    SUSPICIOUS_CONFIG_PROPERTIES,
-    SUSPICIOUS_LAYER_TYPES,
-)
 
 from ..config.explanations import (
     get_cve_2024_3660_explanation,
-    get_cve_2025_1550_explanation,
     get_cve_2025_8747_explanation,
     get_cve_2025_9906_explanation,
     get_cve_2025_12058_explanation,
@@ -51,12 +46,11 @@ from .archive_dispatch import (
     SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY,
 )
 from .archive_member_security import is_executable_archive_member_name
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
+from .base import Check, Issue, IssueSeverity, ScanResult
 from .keras_utils import (
-    DANGEROUS_CONFIG_MODULE_ROOTS,
-    _keras_exact_module_policy,
-    check_custom_loss_config,
-    check_custom_metric_config,
+    _SAFE_KERAS_MODULE_ROOTS,
+    BaseKerasScanner,
+    KerasConfigScope,
     check_lambda_dict_function,
     check_lambda_list_function,
     check_subclassed_model,
@@ -69,11 +63,6 @@ from .zip_scanner import (
     ZipScanner,
 )
 
-# CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json
-# Allowlist of top-level module names that are safe in Keras model configs.
-# Any module outside this list in a layer's "module" or "fn_module" key is suspicious.
-# Uses exact root matching: "math" matches "math" and "math.ops" but NOT "mathutils".
-_SAFE_KERAS_MODULE_ROOTS: frozenset[str] = frozenset({"keras", "tensorflow", "tf_keras", "tf", "numpy", "math"})
 _SAFE_ALLOWLISTED_REGISTERED_OBJECTS: frozenset[str] = frozenset({"notequal"})
 
 _DANGEROUS_LAMBDA_MODULE_TOKENS = frozenset(
@@ -100,58 +89,6 @@ _DANGEROUS_LAMBDA_FUNCTION_NAMES = frozenset(
 _DANGEROUS_LAMBDA_FUNCTION_MODULE_ROOTS = {
     "attrgetter": frozenset({"operator"}),
 }
-
-# Native extension modules are not packages. Only known executable symbols are
-# critical; other exact-module references remain subject to callable warnings.
-_DANGEROUS_EXACT_MODULE_SYMBOLS, _DANGEROUS_EXACT_MODULE_SYMBOL_PREFIXES = _keras_exact_module_policy()
-
-_NESTED_SERIALIZED_OBJECT_KEYS = frozenset(
-    {
-        "activation",
-        "activity_regularizer",
-        "backward_layer",
-        "beta_initializer",
-        "bias_constraint",
-        "bias_initializer",
-        "bias_regularizer",
-        "callable",
-        "cell",
-        "cells",
-        "depthwise_constraint",
-        "depthwise_initializer",
-        "depthwise_regularizer",
-        "embeddings_constraint",
-        "embeddings_initializer",
-        "embeddings_regularizer",
-        "fn",
-        "forward_layer",
-        "function",
-        "gamma_initializer",
-        "kernel_constraint",
-        "kernel_initializer",
-        "kernel_regularizer",
-        "layer",
-        "layers",
-        "learning_rate",
-        "loss",
-        "losses",
-        "metric",
-        "metrics",
-        "moving_mean_initializer",
-        "moving_variance_initializer",
-        "optimizer",
-        "output_activation",
-        "pointwise_constraint",
-        "pointwise_initializer",
-        "pointwise_regularizer",
-        "recurrent_activation",
-        "recurrent_constraint",
-        "recurrent_initializer",
-        "recurrent_regularizer",
-        "schedule",
-        "weighted_metrics",
-    }
-)
 
 # CVE-2025-8747: keras.utils.get_file used as gadget to download + execute files
 _GET_FILE_PATTERN = re.compile(r"get_file", re.IGNORECASE)
@@ -348,7 +285,7 @@ class _ConfigTraversalState:
         return self.halted or self.item_limit_reached
 
 
-class KerasZipScanner(BaseScanner):
+class KerasZipScanner(BaseKerasScanner):
     """Scanner for ZIP-based Keras .keras model files"""
 
     MAX_EMBEDDED_WEIGHTS_BYTES: ClassVar[int] = 100 * 1024 * 1024
@@ -429,14 +366,6 @@ class KerasZipScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
-        # Additional scanner-specific configuration
-        self.suspicious_layer_types = dict(SUSPICIOUS_LAYER_TYPES)
-        if config and "suspicious_layer_types" in config:
-            self.suspicious_layer_types.update(config["suspicious_layer_types"])
-
-        self.suspicious_config_props = list(SUSPICIOUS_CONFIG_PROPERTIES)
-        if config and "suspicious_config_properties" in config:
-            self.suspicious_config_props.extend(config["suspicious_config_properties"])
 
         configured_embedded_limit = self._normalize_positive_int_config(
             self.config.get("max_embedded_weights_bytes"),
@@ -466,7 +395,6 @@ class KerasZipScanner(BaseScanner):
         )
         self._nested_layer_items_scanned = 0
         self._content_route_embedded_weights = False
-        self._checked_config_module_references: set[tuple[int, str, str]] = set()
         self._current_keras_version: str | None = None
         self._torchmodule_version_status: bool | None = None
 
@@ -1000,11 +928,6 @@ class KerasZipScanner(BaseScanner):
                     details={"filename": redacted_filename},
                 )
 
-    @staticmethod
-    def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
-        """Mark the scan as incomplete without converting it into a security finding."""
-        BaseScanner._mark_inconclusive_reason_first(result, reason, INCONCLUSIVE_SCAN_OUTCOME)
-
     def _new_config_traversal_state(self) -> _ConfigTraversalState:
         return _ConfigTraversalState(
             max_depth=self.max_config_traversal_depth,
@@ -1468,11 +1391,6 @@ class KerasZipScanner(BaseScanner):
         result.checks = [check for check in result.checks if not cls._is_expected_recursive_weights_limit_noise(check)]
 
     @staticmethod
-    def _scan_result_has_security_findings(result: ScanResult) -> bool:
-        """Return True when the scan found warning or critical security risk."""
-        return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
-
-    @staticmethod
     def _scan_result_has_actionable_security_findings(result: ScanResult) -> bool:
         """Return True for actionable findings, excluding standalone pickle parse-noise warnings."""
         return any(
@@ -1480,17 +1398,6 @@ class KerasZipScanner(BaseScanner):
             and issue.rule_code not in {"S901", "S902"}
             for issue in result.issues
         )
-
-    @classmethod
-    def _finish_scan_result(cls, result: ScanResult) -> None:
-        """Fail closed on incomplete/no-finding scans while preserving security precedence."""
-        is_inconclusive = result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-        has_security_findings = cls._scan_result_has_security_findings(result)
-        if is_inconclusive and not has_security_findings:
-            result.finish(success=False)
-            return
-
-        result.finish(success=result.success and not result.has_errors)
 
     def _scan_model_config(
         self,
@@ -1539,13 +1446,7 @@ class KerasZipScanner(BaseScanner):
             )
 
         # Root configs can themselves be serialized callables rather than model containers.
-        self._check_layer_module_references(
-            model_config,
-            result,
-            "model_config",
-            check_config_fields=False,
-            check_nested=False,
-        )
+        self._check_layer_module_references(model_config, result, "model_config", scope=None)
 
         # Check for suspicious model types (Lambda, etc.)
         if model_class_is_string and model_class in self.suspicious_layer_types:
@@ -2075,28 +1976,7 @@ class KerasZipScanner(BaseScanner):
             )
             return
 
-        self._check_custom_metric_config(compile_config.get("metrics"), result, "compile_config.metrics")
-        self._check_custom_metric_config(
-            compile_config.get("weighted_metrics"),
-            result,
-            "compile_config.weighted_metrics",
-        )
-        self._check_custom_loss_config(compile_config.get("loss"), result, "compile_config.loss")
-        for key in ("optimizer", "loss", "metrics", "weighted_metrics"):
-            self._check_nested_serialized_module_references(
-                compile_config.get(key),
-                result,
-                f"compile_config.{key}",
-                trusted_container=True,
-            )
-
-    def _check_custom_metric_config(self, metrics_config: Any, result: ScanResult, context: str) -> None:
-        """Flag custom metrics embedded anywhere in a serialized metric tree."""
-        check_custom_metric_config(metrics_config, result, f"{self.current_file_path} ({context})")
-
-    def _check_custom_loss_config(self, loss_config: Any, result: ScanResult, context: str) -> None:
-        """Flag custom losses embedded anywhere in a serialized loss tree."""
-        check_custom_loss_config(loss_config, result, f"{self.current_file_path} ({context})")
+        self._check_training_objects(compile_config, result, "compile_config", "optimizer")
 
     def _check_torch_module_wrapper(self, result: ScanResult, layer_name: str) -> None:
         """Check for CVE-2025-49655: TorchModuleWrapper deserialization RCE.
@@ -2227,124 +2107,22 @@ class KerasZipScanner(BaseScanner):
         except ValueError:
             return None
 
-    @staticmethod
-    def _config_reference_symbols(source: dict[str, Any], object_class: str) -> set[str]:
-        symbols = {object_class}
-        for key in ("config", "registered_name", "function_name"):
-            value = source.get(key)
-            if isinstance(value, str) and value.strip():
-                symbols.add(value.strip())
-        return symbols
-
-    @classmethod
-    def _is_dangerous_exact_module_reference(
-        cls,
-        source: dict[str, Any],
-        module_value: str,
-        object_class: str,
-    ) -> bool:
-        symbols = cls._config_reference_symbols(source, object_class)
-        dangerous_symbols = _DANGEROUS_EXACT_MODULE_SYMBOLS.get(module_value, frozenset())
-        if symbols & dangerous_symbols:
-            return True
-        prefixes = _DANGEROUS_EXACT_MODULE_SYMBOL_PREFIXES.get(module_value, ())
-        return any(symbol.startswith(prefixes) for symbol in symbols) if prefixes else False
-
-    def _check_config_module_reference(
-        self,
-        source: dict[str, Any],
-        key: str,
-        module_value: str,
-        object_class: str,
-        result: ScanResult,
-        layer_name: str,
-    ) -> None:
-        reference_key = (id(source), key, module_value)
-        if reference_key in self._checked_config_module_references:
-            return
-        self._checked_config_module_references.add(reference_key)
-
-        redacted_module_value = redact_evidence_string(module_value)
-        redacted_object_class = redact_evidence_string(object_class)
-        top_module = module_value.split(".")[0]
-        is_dangerous = top_module in DANGEROUS_CONFIG_MODULE_ROOTS or self._is_dangerous_exact_module_reference(
-            source,
-            module_value,
-            object_class,
-        )
-        is_outside_allowlist = top_module not in _SAFE_KERAS_MODULE_ROOTS
-
-        if is_dangerous:
-            result.add_check(
-                name="CVE-2025-1550: Dangerous Module in Config",
-                passed=False,
-                message=(
-                    f"CVE-2025-1550: Layer '{layer_name}' references dangerous module "
-                    f"'{redacted_module_value}' in {key} field — arbitrary code execution via safe_mode bypass"
-                ),
-                severity=IssueSeverity.CRITICAL,
-                location=f"{self.current_file_path} (layer: {layer_name})",
-                details={
-                    "layer_name": layer_name,
-                    "layer_class": redacted_object_class,
-                    "key": key,
-                    "module": redacted_module_value,
-                    "cve_id": "CVE-2025-1550",
-                    "cvss": 7.3,
-                    "cwe": "CWE-94",
-                    "description": (
-                        "Arbitrary dangerous module references in .keras config can bypass safe_mode "
-                        "and execute attacker-controlled code during model loading."
-                    ),
-                    "remediation": "Upgrade Keras to >= 3.9.0 or remove untrusted module references",
-                },
-                why=get_cve_2025_1550_explanation("dangerous_module"),
-            )
-        elif is_outside_allowlist and (
-            key == "fn_module" or object_class == "function" or self._is_lambda_layer_class(object_class)
-        ):
-            result.add_check(
-                name="CVE-2025-1550: Untrusted Module in Config",
-                passed=False,
-                message=(
-                    f"CVE-2025-1550: Layer '{layer_name}' references non-allowlisted module "
-                    f"'{redacted_module_value}' in {key} field — potential safe_mode bypass"
-                ),
-                severity=IssueSeverity.WARNING,
-                location=f"{self.current_file_path} (layer: {layer_name})",
-                details={
-                    "layer_name": layer_name,
-                    "layer_class": redacted_object_class,
-                    "key": key,
-                    "module": redacted_module_value,
-                    "cve_id": "CVE-2025-1550",
-                    "cvss": 7.3,
-                    "cwe": "CWE-94",
-                    "description": (
-                        "Non-allowlisted callable module references may indicate safe_mode bypass "
-                        "paths in untrusted .keras config content."
-                    ),
-                    "remediation": "Upgrade Keras to >= 3.9.0 or verify this module is safe",
-                },
-                why=get_cve_2025_1550_explanation("untrusted_module"),
-            )
-
     def _check_nested_serialized_module_references(
         self,
         config_value: Any,
         result: ScanResult,
         layer_name: str,
         *,
-        trusted_container: bool = False,
+        scope: KerasConfigScope = KerasConfigScope.CONFIG,
     ) -> None:
         """Inspect nested Keras object configs without recursing on attacker-controlled depth."""
         state = self._new_config_traversal_state()
-        pending: deque[tuple[Any, str | None, bool, int, str]] = deque(
-            [(config_value, None, trusted_container, 0, f"layer:{layer_name}")]
+        pending: deque[tuple[Any, KerasConfigScope, int, str]] = deque(
+            [(config_value, scope, 0, f"layer:{layer_name}")]
         )
         state.items_pending = 1
         while pending:
-            node, parent_key, container_is_trusted, depth, context = pending.popleft()
+            node, scope, depth, context = pending.popleft()
             state.items_pending -= 1
             if not self._reserve_config_traversal_item(state, result, context=context, depth=depth):
                 continue
@@ -2356,13 +2134,7 @@ class KerasZipScanner(BaseScanner):
                     child_context = self._config_child_path(context, f"[{index}]")
                     if not self._queue_config_traversal_item(
                         pending,
-                        (
-                            item,
-                            parent_key,
-                            container_is_trusted,
-                            depth + 1,
-                            child_context,
-                        ),
+                        (item, scope, depth + 1, child_context),
                         state,
                         result,
                         context=child_context,
@@ -2373,123 +2145,23 @@ class KerasZipScanner(BaseScanner):
             if not isinstance(node, dict):
                 continue
 
-            object_class = node.get("class_name")
-            serialized_shape = isinstance(object_class, str) and "config" in node
-            is_serialized_object = serialized_shape and (
-                container_is_trusted
-                or parent_key in _NESTED_SERIALIZED_OBJECT_KEYS
-                or "registered_name" in node
-                or object_class == "function"
-                or self._is_lambda_layer_class(object_class)
-            )
-            if is_serialized_object:
-                assert isinstance(object_class, str)
-                for key in ("module", "fn_module"):
-                    module_value = node.get(key)
-                    if isinstance(module_value, str) and module_value.strip():
-                        self._check_config_module_reference(
-                            node,
-                            key,
-                            module_value.strip(),
-                            object_class,
-                            result,
-                            layer_name,
-                        )
-
-            next_container_is_trusted = container_is_trusted and not is_serialized_object
+            object_class = self._check_serialized_module_node(node, scope, result, layer_name)
             if state.item_limit_reached:
                 continue
             for key, value in node.items():
-                if key in {"module", "fn_module", "class_name", "registered_name"}:
+                child_scope = scope.child(str(key), value, object_class)
+                if child_scope is None:
                     continue
                 child_context = self._config_child_path(context, f".{redact_evidence_string(str(key), max_chars=64)}")
                 if not self._queue_config_traversal_item(
                     pending,
-                    (
-                        value,
-                        str(key).lower(),
-                        next_container_is_trusted,
-                        depth + 1,
-                        child_context,
-                    ),
+                    (value, child_scope, depth + 1, child_context),
                     state,
                     result,
                     context=child_context,
                     depth=depth + 1,
                 ):
                     break
-
-    def _check_layer_module_references(
-        self,
-        layer: dict[str, Any],
-        result: ScanResult,
-        layer_name: str,
-        *,
-        check_config_fields: bool = True,
-        check_nested: bool = True,
-    ) -> None:
-        """Check layer config for dangerous module references (CVE-2025-1550).
-
-        CVE-2025-1550: Keras Model.load_model allows arbitrary code execution even
-        with safe_mode=True by specifying arbitrary Python modules/functions in
-        config.json's module/fn_module keys. This checks ALL layers, not just Lambda.
-        """
-        layer_class = layer.get("class_name")
-        if not isinstance(layer_class, str) or "config" not in layer:
-            return
-
-        for key in ("module", "fn_module"):
-            layer_value = layer.get(key)
-            if isinstance(layer_value, str) and layer_value.strip():
-                self._check_config_module_reference(
-                    layer,
-                    key,
-                    layer_value.strip(),
-                    layer_class,
-                    result,
-                    layer_name,
-                )
-
-        layer_config = layer.get("config")
-        if not isinstance(layer_config, dict):
-            return
-
-        if check_config_fields:
-            for key in ("module", "fn_module"):
-                config_value = layer_config.get(key)
-                if isinstance(config_value, str) and config_value.strip():
-                    self._check_config_module_reference(
-                        layer_config,
-                        key,
-                        config_value.strip(),
-                        layer_class,
-                        result,
-                        layer_name,
-                    )
-
-        if layer_class == "FlaxLayer":
-            self._check_nested_serialized_module_references(
-                layer_config.get("module"),
-                result,
-                layer_name,
-                trusted_container=True,
-            )
-
-        inbound_nodes = layer.get("inbound_nodes")
-        if isinstance(inbound_nodes, list):
-            for inbound_node in inbound_nodes:
-                if not isinstance(inbound_node, dict):
-                    continue
-                for key in ("args", "kwargs"):
-                    self._check_nested_serialized_module_references(
-                        inbound_node.get(key),
-                        result,
-                        layer_name,
-                        trusted_container=True,
-                    )
-
-        if check_nested:
-            self._check_nested_serialized_module_references(layer_config, result, layer_name)
 
     def _check_get_file_gadget(self, model_config: Any, result: ScanResult) -> None:
         """Check for CVE-2025-8747: keras.utils.get_file gadget bypass.
