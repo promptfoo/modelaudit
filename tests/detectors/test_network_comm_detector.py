@@ -8944,8 +8944,11 @@ def test_filtered_bare_credential_uses_shared_evidence_redaction(
     assert "secret.invalid" not in json.dumps(findings, sort_keys=True)
 
 
+@pytest.mark.parametrize(("count", "limit"), [(100, 32), (1100, 128)])
 def test_shared_evidence_redaction_classification_budget_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
+    count: int,
+    limit: int,
 ) -> None:
     """Dense ambiguous endpoint values must have bounded redaction work."""
     calls = 0
@@ -8957,15 +8960,25 @@ def test_shared_evidence_redaction_classification_budget_fails_closed(
 
     monkeypatch.setattr(network_comm, "_redact_network_evidence", preserve_marked_evidence)
     ip = "45.33.32.156"
-    data = b"".join(f"api_key=value-{index} endpoint={ip}\n".encode() for index in range(100))
+    data = b"".join(f"api_key=value-{index} endpoint={ip}\n".encode() for index in range(count))
 
     findings = NetworkCommDetector().scan(data, "tokens.txt")
 
-    assert calls == network_comm._MAX_EVIDENCE_REDACTION_CLASSIFICATIONS
+    assert calls == limit
     assert sum(finding.get("ip") == ip for finding in findings) == calls
     assert findings[-1]["type"] == "detector_finding_limit"
     assert findings[-1]["analysis_incomplete"] is True
-    assert findings[-1]["max_classifications"] == network_comm._MAX_EVIDENCE_REDACTION_CLASSIFICATIONS
+    assert findings[-1]["max_classifications"] == calls
+
+
+def test_model_card_endpoint_classification_scales_with_document_size() -> None:
+    endpoints = b"".join(f"api_key=value-{index} endpoint=45.33.32.156\n".encode() for index in range(48))
+    data = endpoints + b"ordinary documentation " * 380 + b"\ngit clone https://github.com/a/b"
+    detector = NetworkCommDetector({"max_findings": 100})
+    findings = detector.scan(data, "README.md")
+    assert detector._evidence_redaction_classifications > 32
+    assert not detector._evidence_redaction_limit_reached
+    assert any("git clone" in finding["message"].lower() for finding in findings)
 
 
 def test_filtered_code_tokens_leave_redaction_budget_for_real_endpoints() -> None:

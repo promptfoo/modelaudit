@@ -204,7 +204,7 @@ Common scan options:
 ```text
 --format {text,json,sarif}   Output format (default: auto-detected)
 --output FILE                Write results to file
---strict                     Fail on warnings, scan all file types, strict license validation
+--strict                     Fail on warnings, scan all file types, enforce strict license and tensor storage checks
 --sbom FILE                  Generate CycloneDX SBOM
 --stream                     Process files one-by-one; remote downloads are deleted after scanning
 --assume-shard-family        Treat explicitly listed cross-directory shards as one model family
@@ -220,6 +220,18 @@ Common scan options:
 --exclude-scanner NAME       Exclude a scanner from the active set (comma-separated or repeated)
 --list-scanners              List scanner IDs, class names, extensions, and dependencies
 ```
+
+A PyTorch checkpoint stores loading instructions in `data.pkl` and tensor values in separate ZIP members.
+When ModelAudit verifies that the instructions use an ambiguous member only as raw tensor values, it can
+finish the default scan without ruling out a separate pickle hidden in those bytes. Look for
+`hidden_pickle_coverage: inconclusive` and the affected members under **Hidden Pickle Coverage**.
+These results are not cached. Use `--strict` to count this gap as an incomplete scan.
+
+This distinction applies only to recognized protocol-2 float tensor layouts after a full member read
+(up to 16 MiB per ambiguous member and 64 MiB per archive). Unknown layouts, read failures and
+unknown payload boundaries still block completion. Loading instructions and confirmed
+threats are checked in either mode. The additional search inside raw weights can find concrete
+payloads, but cannot establish that a separately unpickled tensor is harmless. A completed scan can still report warnings and exit nonzero.
 
 Reports retain raw source identifiers and credential-bearing evidence. Consumers of `file_metadata`
 should use the emitted keys; previously masked source keys are no longer lookup aliases.
@@ -307,6 +319,12 @@ modelaudit model.pkl --format sarif --output results.sarif
 ```
 
 ## Troubleshooting
+
+Pickle opcode scanning works without the model's runtime libraries. To inspect invoked Python callables,
+ModelAudit also reads their installed source. For PyTorch Trainer checkpoints, install the trusted versions
+of `torch`, `transformers`, and `accelerate` used by your deployment in the scanning environment.
+A `call_graph_source_unavailable` notice identifies the unresolved reference. The scan stays inconclusive
+until ModelAudit can inspect it. ModelAudit does not load the checkpoint to resolve these calls.
 
 - Run `modelaudit doctor --show-failed` to list unavailable scanners and missing optional deps.
 - Run `modelaudit debug --json` to collect environment/config diagnostics for bug reports. Inspect the raw output and remove sensitive values before sharing it.

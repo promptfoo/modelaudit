@@ -48606,9 +48606,12 @@ class TestOnnxFiniteReplayValueNameWork:
                     and getattr(caller.f_locals.get("subgraph"), "name", "") == "r37_value_name_identity_body"
                 ):
                     selected_output_getters += 1
-            elif name == "exact_loop_repeated_state_weight_rank_bounds" and event == "return":
-                if getattr(local.get("subgraph"), "name", "") == "r37_value_name_identity_body":
-                    replay_results.append(result)
+            elif (
+                name == "exact_loop_repeated_state_weight_rank_bounds"
+                and event == "return"
+                and getattr(local.get("subgraph"), "name", "") == "r37_value_name_identity_body"
+            ):
+                replay_results.append(result)
 
         previous_profile = sys.getprofile()
         try:

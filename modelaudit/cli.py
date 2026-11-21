@@ -2477,6 +2477,7 @@ def _build_user_scan_overrides(
         user_overrides["skip_non_model_files"] = False
         user_overrides["selective_download"] = False
         user_overrides["strict_license"] = True
+        user_overrides["strict_tensor_storage"] = True
         user_overrides["use_cache"] = False
         user_overrides["use_hf_whitelist"] = False
     if verbose:
@@ -2629,11 +2630,14 @@ def _resolve_scan_runtime_config(
     )
 
 
-def _scanner_selection_overrides(runtime: _ScanRuntimeConfig) -> dict[str, Any]:
-    """Return config kwargs needed to preserve scanner selection across scan paths."""
-    if runtime.scanner_selection is None:
-        return {}
-    return {SCANNER_SELECTION_CONFIG_KEY: runtime.scanner_selection}
+def _scanner_policy_overrides(runtime: _ScanRuntimeConfig) -> dict[str, Any]:
+    """Forward explicit scanner policies through local, remote, and streaming scans."""
+    overrides: dict[str, Any] = {}
+    if runtime.scanner_selection is not None:
+        overrides[SCANNER_SELECTION_CONFIG_KEY] = runtime.scanner_selection
+    if runtime.config.get("strict_tensor_storage"):
+        overrides["strict_tensor_storage"] = True
+    return overrides
 
 
 def _streaming_scan_options(runtime: _ScanRuntimeConfig, blacklist: tuple[str, ...]) -> dict[str, Any]:
@@ -2873,9 +2877,23 @@ def _format_scan_output(
     """Render scan results in the requested output format."""
     if output_format == "json":
         if not verbose:
-            audit_result.issues = [issue for issue in audit_result.issues if issue.severity != IssueSeverity.DEBUG]
-            audit_result.checks = [check for check in audit_result.checks if check.severity != IssueSeverity.DEBUG]
+            audit_result = audit_result.model_copy(
+                update={
+                    "issues": [
+                        issue
+                        for issue in audit_result.issues
+                        if issue.severity != IssueSeverity.DEBUG or record_details_have_incomplete_coverage(issue)
+                    ],
+                    "checks": [
+                        check
+                        for check in audit_result.checks
+                        if check.severity != IssueSeverity.DEBUG
+                        or record_details_have_incomplete_coverage(check, allow_skipped_check_exemption=True)
+                    ],
+                }
+            )
         serialized_result = _serialize_scan_report(audit_result, exclude_none=True)
+        serialized_result["incomplete_coverage"] = results_have_inconclusive_outcome(audit_result)
         return json.dumps(_JSON_VALUE_ADAPTER.dump_python(serialized_result, mode="json"), indent=2)
 
     if output_format == "sarif":
@@ -2915,7 +2933,9 @@ def _emit_scan_output(
                     click.echo(f"Found {warning_count} warning(s)")
                 else:
                     click.echo(f"Found {len(visible_issues)} informational issue(s)")
-            else:
+            if results_have_inconclusive_outcome(audit_result):
+                click.echo("Scan coverage incomplete")
+            elif not visible_issues:
                 click.echo("No security issues found")
         return
 
@@ -3191,7 +3211,7 @@ def _scan_local_or_downloaded_path(
                 scan_root=actual_path,
                 progress_callback=progress_callback,
                 **_streaming_scan_options(runtime, blacklist),
-                **_scanner_selection_overrides(runtime),
+                **_scanner_policy_overrides(runtime),
             )
             path_state.record_non_shard_result_errors(streaming_result)
             audit_result.aggregate_scan_result(streaming_result.model_dump())
@@ -3209,7 +3229,7 @@ def _scan_local_or_downloaded_path(
             "progress_update_interval": 2.0,
             "cache_enabled": runtime.cache_enabled,
             "cache_dir": runtime.cache_dir,
-            **_scanner_selection_overrides(runtime),
+            **_scanner_policy_overrides(runtime),
         }
         is_dvc_pointer = actual_path.lower().endswith(".dvc")
         has_prior_dvc_coverage = bool(path_state.dvc_covered_paths or path_state.dvc_covered_directories)
@@ -3573,7 +3593,7 @@ def _resolve_scan_source_for_path(
                             streaming_kwargs["_trusted_source_provenance"] = trusted_source_provenance
                         streaming_kwargs[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = stream_repository_file_inventory
                         streaming_kwargs[REPOSITORY_SCAN_ROOT_CONFIG_KEY] = str(stream_repository_scan_root)
-                        streaming_kwargs.update(_scanner_selection_overrides(runtime))
+                        streaming_kwargs.update(_scanner_policy_overrides(runtime))
 
                         try:
                             streaming_result = scan_model_streaming(
@@ -3736,7 +3756,7 @@ def _resolve_scan_source_for_path(
                     timeout=runtime.timeout,
                     delete_after_scan=True,
                     **_streaming_scan_options(runtime, blacklist),
-                    **_scanner_selection_overrides(runtime),
+                    **_scanner_policy_overrides(runtime),
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
                 path_state.record_non_shard_result_errors(streaming_result)
@@ -3871,7 +3891,7 @@ def _resolve_scan_source_for_path(
                     timeout=runtime.timeout,
                     delete_after_scan=True,
                     **_streaming_scan_options(runtime, blacklist),
-                    **_scanner_selection_overrides(runtime),
+                    **_scanner_policy_overrides(runtime),
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
                 path_state.record_non_shard_result_errors(streaming_result)
@@ -3975,7 +3995,7 @@ def _resolve_scan_source_for_path(
                 cache_enabled=runtime.cache_enabled,
                 cache_dir=runtime.cache_dir,
                 use_hf_whitelist=runtime.use_hf_whitelist,
-                **_scanner_selection_overrides(runtime),
+                **_scanner_policy_overrides(runtime),
             )
 
             path_state.record_non_shard_result_errors(results)
@@ -4061,7 +4081,7 @@ def _resolve_scan_source_for_path(
                 selective_download=runtime.selective_download,
                 use_hf_whitelist=runtime.use_hf_whitelist,
                 **jfrog_scan_kwargs,
-                **_scanner_selection_overrides(runtime),
+                **_scanner_policy_overrides(runtime),
             )
 
             if download_spinner:
@@ -4523,7 +4543,10 @@ def delegate_info() -> None:
 @click.option(
     "--strict",
     is_flag=True,
-    help="Strict mode: imply --no-whitelist and --no-cache, scan all file types, strict license validation",
+    help=(
+        "Imply --no-whitelist and --no-cache, scan all file types, and require conclusive "
+        "tensor storage discovery and strict license validation"
+    ),
 )
 @click.option(
     "--no-whitelist",
@@ -4942,7 +4965,8 @@ def scan_command(
 def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     """Format scan results as human-readable text with colors"""
     output_lines = []
-    has_incomplete_coverage = _results_have_incomplete_coverage(results)
+    incomplete_summaries = _incomplete_coverage_summaries(results)
+    has_incomplete_coverage = results.get("incomplete_coverage") is True or bool(incomplete_summaries)
 
     # Add scan summary header
     output_lines.append(style_text("\n📊 SCAN SUMMARY", fg="white", bold=True))
@@ -5049,12 +5073,23 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                     output_lines.append(f"  • Framework: {style_text(framework_version, fg='cyan')}")
                 break  # Only show the first model info found
 
+    if has_incomplete_coverage:
+        output_lines.append("")
+        output_lines.append(style_text("  Scan Coverage:", fg="bright_black"))
+        output_lines.append(
+            "  " + style_text("⚠️  Incomplete security coverage", fg="yellow", bold=True),
+        )
+        for file_path, reason in incomplete_summaries[:5]:
+            output_lines.append(f"    • {_escape_terminal_text(file_path)}: {_escape_terminal_text(reason)}")
+        incomplete_count = len(incomplete_summaries)
+        if incomplete_count > 5:
+            output_lines.append(f"    ... and {incomplete_count - 5} more incomplete files")
+
     # Add security check statistics
     if "total_checks" in results and results["total_checks"] > 0:
         total = results["total_checks"]
         passed = results.get("passed_checks", 0)
         failed = results.get("failed_checks", 0)
-        success_rate = (passed / total * 100) if total > 0 else 0
 
         output_lines.append("")
         output_lines.append(style_text("  Security Checks:", fg="bright_black"))
@@ -5068,19 +5103,20 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         check_str += f" (Total: {total})"
         output_lines.append(check_str)
 
-        # Show success rate with color coding
-        if success_rate >= 95:
-            rate_color = "green"
-            rate_icon = "✅"
-        elif success_rate >= 80:
-            rate_color = "yellow"
-            rate_icon = "⚠️"
-        else:
-            rate_color = "red"
-            rate_icon = "🚨"
+        if not has_incomplete_coverage:
+            success_rate = passed / total * 100
+            if success_rate >= 95:
+                rate_color = "green"
+                rate_icon = "✅"
+            elif success_rate >= 80:
+                rate_color = "yellow"
+                rate_icon = "⚠️"
+            else:
+                rate_color = "red"
+                rate_icon = "🚨"
 
-        rate_str = style_text(f"  {rate_icon} Success Rate: {success_rate:.1f}%", fg=rate_color, bold=True)
-        output_lines.append(rate_str)
+            rate_str = style_text(f"  {rate_icon} Success Rate: {success_rate:.1f}%", fg=rate_color, bold=True)
+            output_lines.append(rate_str)
 
     # Show failed checks if any exist
     failed_checks_list = [c for c in results.get("checks", []) if c.get("status") == "failed"]
@@ -5104,19 +5140,6 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
                 output_lines.append(f"    • {check_name}: {unique_msg}")
         if len(check_groups) > 5:
             output_lines.append(f"    ... and {len(check_groups) - 5} more check types")
-
-    if has_incomplete_coverage:
-        incomplete_summaries = _incomplete_coverage_summaries(results)
-        output_lines.append("")
-        output_lines.append(style_text("  Scan Coverage:", fg="bright_black"))
-        output_lines.append(
-            "  " + style_text("⚠️  Incomplete security coverage", fg="yellow", bold=True),
-        )
-        for file_path, reason in incomplete_summaries[:5]:
-            output_lines.append(f"    • {_escape_terminal_text(file_path)}: {_escape_terminal_text(reason)}")
-        incomplete_count = len(incomplete_summaries)
-        if incomplete_count > 5:
-            output_lines.append(f"    ... and {incomplete_count - 5} more incomplete files")
 
     # Add issue summary
     issues = results.get("issues", [])
@@ -5271,10 +5294,6 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append(encouragement_line)
 
     return "\n".join(output_lines)
-
-
-def _results_have_incomplete_coverage(results: dict[str, Any]) -> bool:
-    return bool(_incomplete_coverage_summaries(results))
 
 
 def _incomplete_coverage_summaries(results: dict[str, Any]) -> list[tuple[str, str]]:

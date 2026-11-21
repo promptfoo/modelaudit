@@ -999,6 +999,24 @@ def test_pickle_report_to_scan_result_fails_closed_for_truncated_literal_scan_no
     )
 
 
+@pytest.mark.parametrize("module", ["torch._utils", "transformers.training_args", "accelerate.state"])
+def test_missing_framework_source_reports_failed_coverage_with_guidance(module: str) -> None:
+    report = _notice_report(
+        source="trainer.pt",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        message="Python call-graph analysis could not inspect invoked callable source",
+        location="trainer.pt:data.pkl",
+        code="call_graph_source_unavailable",
+        details={"module": module, "reason": "source_unavailable", "analysis_incomplete": True},
+    )
+    result = pickle_report_to_scan_result(report)
+    assert not result.success
+    check = next(check for check in result.checks if check.name == "Standalone Pickle Notice")
+    assert check.status.value == "failed"
+    assert check.why and f"trusted {module.partition('.')[0]} version" in check.why
+
+
 def _import_reference_cap_notice(location: str) -> Notice:
     return Notice(
         message="Import reference metadata exceeded the scanner reporting limit",

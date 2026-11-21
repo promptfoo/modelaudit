@@ -931,12 +931,16 @@ class ScanResult:
 
     def to_dict(self, *, include_private_metadata: bool = False) -> dict[str, Any]:
         """Convert the scan result to a dictionary for serialization"""
-        # Only count WARNING and CRITICAL severity checks as failures
-        # INFO and DEBUG are informational - they should not count as failures
+        from .models import _record_has_incomplete_coverage
+
         failed_checks_count = sum(
             1
-            for c in self.checks
-            if c.status == CheckStatus.FAILED and c.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
+            for check in self.checks
+            if check.status == CheckStatus.FAILED
+            and (
+                check.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
+                or _record_has_incomplete_coverage(check)
+            )
         )
 
         result = {
@@ -963,12 +967,21 @@ class ScanResult:
 
     def summary(self) -> str:
         """Return a human-readable summary of the scan result"""
+        from .models import _metadata_has_incomplete_coverage, _records_have_incomplete_coverage
+
         error_count = sum(1 for issue in self.issues if issue.severity == IssueSeverity.CRITICAL)
         warning_count = sum(1 for issue in self.issues if issue.severity == IssueSeverity.WARNING)
         info_count = sum(1 for issue in self.issues if issue.severity == IssueSeverity.INFO)
 
         result = []
-        result.append(f"Scan completed in {self.duration:.2f}s")
+        if (
+            _metadata_has_incomplete_coverage(self.metadata)
+            or _records_have_incomplete_coverage(self.issues)
+            or _records_have_incomplete_coverage(self.checks, allow_skipped_check_exemption=True)
+        ):
+            result.append(f"Scan coverage incomplete after {self.duration:.2f}s")
+        else:
+            result.append(f"Scan completed in {self.duration:.2f}s")
         result.append(
             f"Scanned {self.bytes_scanned} bytes with scanner '{self.scanner_name}'",
         )

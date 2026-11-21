@@ -427,6 +427,39 @@ def test_text_scanner_verified_huggingface_readme_click_cli_respects_whitelist_p
     assert (network[0]["details"]["severity"] == "INFO") is whitelist_enabled
 
 
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.parametrize(
+    ("text", "severity", "exit_code"),
+    [
+        pytest.param("Source (PDF [paper](https://docs.example.org/citation))", "info", 0, id="public-citation"),
+        pytest.param(
+            "[weights](https://downloads.example.org/weights.bin?access_token=fixture-token)",
+            "warning",
+            1,
+            id="credential-in-query",
+        ),
+    ],
+)
+def test_readme_in_symlinked_directory_preserves_url_evidence_and_severity(
+    tmp_path: Path, text: str, severity: str, exit_code: int
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_text(text + "\n", encoding="utf-8")
+    alias = tmp_path / "alias"
+    alias.symlink_to(repo, target_is_directory=True)
+
+    result = CliRunner().invoke(cli, ["scan", str(alias / "README.md"), "--format", "json", "--no-cache"])
+
+    assert result.exit_code == exit_code, result.output
+    (issue,) = [issue for issue in json.loads(result.output)["issues"] if issue["rule_code"] == "S309"]
+    assert issue["severity"] == severity
+    evidence = issue["details"]
+    assert evidence["url"] in text
+    assert evidence["evidence_location"]["line"] == 1
+    assert bool(evidence.get("contains_credentials")) == ("access_token=" in text)
+
+
 @pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
 @pytest.mark.parametrize(
     ("whitelist_value", "_whitelist_enabled"),
@@ -5534,6 +5567,32 @@ def _bert_like_multilingual_vocabulary(*tail_tokens: str) -> str:
     return "\n".join(tokens) + "\n"
 
 
+@pytest.mark.parametrize(
+    ("tokens", "expected"),
+    [
+        (["##@bank.com."], IssueSeverity.INFO),
+        (["##@bank.tk"], IssueSeverity.CRITICAL),
+        (["www.bank.com/researchdisclosures,"], IssueSeverity.INFO),
+        (["##@bank.com", 'connect("bank.com")'], IssueSeverity.WARNING),
+        (["##@bank.com", "bank.com/?token=secret"], IssueSeverity.WARNING),
+        (
+            ["##@bank.com", "__import__('socket').gethostbyname(", "'''", "bank.com", "'''.strip()", ")"],
+            IssueSeverity.WARNING,
+        ),
+        (["##@bank.com", "require('dns').resolve(", "`", "bank.com", "`", ")"], IssueSeverity.WARNING),
+    ],
+)
+def test_wordpiece_domain_requires_only_passive_occurrences(
+    tmp_path: Path, tokens: list[str], expected: IssueSeverity
+) -> None:
+    path = tmp_path / "vocab.txt"
+    path.write_text(_bert_like_multilingual_vocabulary(*tokens), encoding="utf-8")
+    result = TextScanner().scan(str(path))
+    findings = [c for c in result.checks if c.details.get("type") == "domain_name"]
+    assert findings
+    assert all(c.severity == expected for c in findings)
+
+
 class _LineIterationGuardBytes(bytes):
     def find(self, *args: Any, **kwargs: Any) -> int:
         raise AssertionError("line iteration must not call bytes.find")
@@ -6202,6 +6261,21 @@ def test_text_scanner_documentation_code_url_after_limit_fails_closed(tmp_path: 
     assert result.success is False
     assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+
+
+def test_model_card_links_near_token_prose_complete_network_inspection(tmp_path: Path) -> None:
+    links = "".join(f"[Example {i}](https://GitHub.com/org/example{i})\n" for i in range(40))
+    result = _scan_text_content(
+        tmp_path / "README.md",
+        f"To obtain token weights, see these examples.\n{links}\n```sh\ngit clone https://github.com/org/model\n```\n",
+    )
+
+    assert result.success
+    assert any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+    assert any(check.details.get("command_type") == "git_clone" for check in _failed_network_detection_checks(result))
+    assert not any(check.name == "Network Communication Reporting Limit" for check in result.checks)
 
 
 def test_text_scanner_documentation_passive_endpoint_redaction_limit_is_informational(

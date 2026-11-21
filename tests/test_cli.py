@@ -521,6 +521,39 @@ def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("filename", "key", "expression", "expected_exit"),
+    [
+        ("config.yaml", "conv_feature_layers", "[(512, 10, 5)] + [(512, 3, 2)] * 4", 0),
+        ("config.yaml", "conv_feature_layers", " \t[(512, 10, 5)]", 0),
+        ("config.yaml", "conv_feature_layers", "(__import__('os').system('id'), [(512, 10, 5)])[1]", 1),
+        ("config.yaml", "conv_feature_layers", " (__import__('os').system('id'), [(512, 10, 5)])[1]", 1),
+        ("config.yaml", "conv_feature_layers", "\t(__import__('os').system('id'), [(512, 10, 5)])[1]", 1),
+        ("hyperparams.yaml", "conv_feature_layers", "[getattr(__builtins__, 'eval')('1')]", 1),
+        ("hyperparams.yaml", "conv_feature_layers", " [getattr(__builtins__, 'eval')('1')]", 1),
+        ("hyperparams.yaml", "conv_feature_layers", "\t[getattr(__builtins__, 'eval')('1')]", 1),
+        ("config.yaml", "description", "__import__('os').system('id')", 0),
+    ],
+)
+def test_scan_cli_fairseq_convolution_expression(
+    tmp_path: Path, filename: str, key: str, expression: str, expected_exit: int
+) -> None:
+    target = tmp_path / filename
+    target.write_text(f"model:\n  _name: wav2vec2\n  {key}: {json.dumps(expression)}\n", encoding="utf-8")
+    result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "json", str(target)], catch_exceptions=False)
+
+    assert result.exit_code == expected_exit
+    output = parse_click_json_output(result.output)
+    assert output["success"] is True
+    findings = [issue for issue in output["issues"] if issue.get("rule_code") == "S104"]
+    if expected_exit:
+        assert len(findings) == 1
+        assert findings[0]["details"]["expression"] == expression
+        assert findings[0]["details"]["key"] == "model.conv_feature_layers"
+    else:
+        assert not findings
+
+
+@pytest.mark.parametrize(
     ("default", "body", "expected_exit", "evidence"),
     [
         ("'text'", "{{ value|trim }}", 0, set()),
@@ -2174,8 +2207,7 @@ def test_directory_can_replace_entries_rejects_linux_access_acl_for_root(
 def test_sticky_directory_replacement_rejects_unowned_output(monkeypatch: pytest.MonkeyPatch) -> None:
     parent_stat = types.SimpleNamespace(st_mode=stat.S_IFDIR | stat.S_ISVTX | 0o777, st_uid=1001)
     output_stat = cast(os.stat_result, types.SimpleNamespace(st_uid=1002))
-    monkeypatch.setattr(cli_module.os, "fstat", lambda _fd: parent_stat)
-    monkeypatch.setattr(cli_module.os, "geteuid", lambda: 1003)
+    monkeypatch.setattr(cli_module, "os", types.SimpleNamespace(fstat=lambda _fd: parent_stat, geteuid=lambda: 1003))
 
     with pytest.raises(cli_module._OutputWriteError, match=r"sticky directory.*Permission denied"):
         cli_module._validate_posix_output_replacement_permission("/tmp/report.json", 123, output_stat)
@@ -2193,8 +2225,9 @@ def test_sticky_directory_replacement_allows_privileged_or_owned_output(
 ) -> None:
     parent_stat = types.SimpleNamespace(st_mode=stat.S_IFDIR | stat.S_ISVTX | 0o777, st_uid=parent_uid)
     output_stat = cast(os.stat_result, types.SimpleNamespace(st_uid=output_uid))
-    monkeypatch.setattr(cli_module.os, "fstat", lambda _fd: parent_stat)
-    monkeypatch.setattr(cli_module.os, "geteuid", lambda: effective_uid)
+    monkeypatch.setattr(
+        cli_module, "os", types.SimpleNamespace(fstat=lambda _fd: parent_stat, geteuid=lambda: effective_uid)
+    )
 
     cli_module._validate_posix_output_replacement_permission("/tmp/report.json", 123, output_stat)
 
@@ -2572,9 +2605,9 @@ def test_windows_output_encryption_state_comes_from_pinned_handle(
 ) -> None:
     """EFS preservation must inspect the opened file rather than its path."""
     monkeypatch.setattr(
-        cli_module.os,
-        "fstat",
-        lambda fd: types.SimpleNamespace(fd=fd, st_file_attributes=file_attributes),
+        cli_module,
+        "os",
+        types.SimpleNamespace(fstat=lambda fd: types.SimpleNamespace(st_file_attributes=file_attributes)),
     )
 
     assert cli_module._windows_output_is_encrypted(17) is expected
@@ -3350,12 +3383,87 @@ def test_format_text_output_complete_benign_scan_remains_clean() -> None:
     assert "Incomplete security coverage" not in clean_output
 
 
+def test_nonverbose_report_preserves_debug_coverage_evidence_on_reload() -> None:
+    from modelaudit.core_results import determine_exit_code
+    from modelaudit.models import create_audit_result_model
+
+    result = create_initial_audit_result()
+    result.aggregate_scan_result(
+        {
+            "files_scanned": 1,
+            "checks": [
+                {
+                    "name": "Bounded analysis",
+                    "status": "failed",
+                    "message": "Inspection reached its limit",
+                    "severity": "debug",
+                    "details": {"analysis_incomplete": True},
+                },
+                {
+                    "name": "Trace",
+                    "status": "passed",
+                    "message": "Ordinary debug check",
+                    "severity": "debug",
+                },
+            ],
+        }
+    )
+    result.finalize_statistics()
+    report = json.loads(_format_scan_output(result, ["model.bin"], output_format="json", verbose=False))
+    assert report["incomplete_coverage"] is True
+    assert report["failed_checks"] == 1
+    assert [check["name"] for check in report["checks"]] == ["Bounded analysis"]
+    assert [check.name for check in result.checks] == ["Bounded analysis", "Trace"]
+    saved = create_audit_result_model(report)
+    assert saved.success is False
+    assert determine_exit_code(saved) == 2
+    assert saved.checks[0].details["analysis_incomplete"] is True
+
+
+def test_cli_reports_incomplete_routing_in_check_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(file_detection, "_TF_METAGRAPH_MAX_ROUTING_FIELDS", 2)
+    ambiguous = tmp_path / "ambiguous.model"
+    ambiguous.write_bytes(b"\x08\x01" + b"\x18\x00" * 4)
+    report_path = tmp_path / "report.json"
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            str(ambiguous),
+            "--no-cache",
+            "--no-triage",
+            "--verbose",
+            "--format",
+            "json",
+            "--output",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Scan coverage incomplete" in result.output
+    report = json.loads(report_path.read_text())
+    assert report["incomplete_coverage"] is True
+    assert report["success"] is False
+    assert report["has_errors"] is False
+    assert report["failed_checks"] == 1
+    assert report["total_checks"] == report["passed_checks"] + 1
+    check = next(check for check in report["checks"] if check["name"] == "TensorFlow Protobuf Routing")
+    assert check["status"] == "failed"
+    assert check["severity"] == "info"
+    assert check["details"]["scan_outcome_reason"] == "tensorflow_protobuf_routing_incomplete"
+
+
 def test_format_text_output_incomplete_coverage_without_findings_is_not_clean() -> None:
     """Incomplete coverage without findings should not be presented as a clean scan."""
     results = {
         "files_scanned": 1,
         "bytes_scanned": 10,
         "duration": 0.1,
+        "total_checks": 31,
+        "passed_checks": 31,
+        "failed_checks": 0,
         "issues": [],
         "file_metadata": {
             "model.bin": {
@@ -3368,6 +3476,7 @@ def test_format_text_output_incomplete_coverage_without_findings_is_not_clean() 
 
     output = format_text_output(results, verbose=False)
     clean_output = strip_ansi(output)
+    assert "Success Rate" not in clean_output
     assert "Incomplete security coverage" in clean_output
     assert "bounded_probe_exhausted" in clean_output
     assert "SCAN COVERAGE INCOMPLETE" in clean_output
@@ -4849,6 +4958,7 @@ def test_scan_strict_implies_no_whitelist_and_no_cache(mock_scan: MagicMock, tmp
     assert mock_scan.call_args.kwargs["use_hf_whitelist"] is False
     assert mock_scan.call_args.kwargs["cache_enabled"] is False
     assert mock_scan.call_args.kwargs["skip_file_types"] is False
+    assert mock_scan.call_args.kwargs["strict_tensor_storage"] is True
 
 
 @patch("modelaudit.cli.scan_model_directory_or_file")
@@ -6790,6 +6900,7 @@ def test_scan_huggingface_strict_streaming_uses_ephemeral_cache_dir(
     result = runner.invoke(cli, ["scan", "--stream", "--strict", "--quiet", "hf://test/model"])
 
     assert result.exit_code == 0
+    assert mock_scan_streaming.call_args.kwargs["strict_tensor_storage"] is True
     cache_dir = mock_download_streaming.call_args.kwargs["cache_dir"]
     assert isinstance(cache_dir, Path)
     assert cache_dir.name.startswith("modelaudit_hf_")

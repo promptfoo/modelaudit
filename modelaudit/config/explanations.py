@@ -1175,6 +1175,15 @@ def get_cve_2024_27318_explanation(vulnerability_type: str) -> str:
     )
 
 
+def get_cve_2026_126974_explanation() -> str:
+    """Explain the llama.cpp GGUF control-vector integer overflow."""
+    return (
+        "Affected llama.cpp control-vector loaders multiply the embedding width by a layer index parsed "
+        "from a GGUF tensor name using signed 32-bit arithmetic. Overflow can cause an out-of-bounds "
+        "write and code execution when the file is loaded as a control vector."
+    )
+
+
 def get_cve_2019_6446_explanation(vulnerability_type: str) -> str:
     """Get specific explanation for CVE-2019-6446 (NumPy allow_pickle RCE)."""
     explanations = {

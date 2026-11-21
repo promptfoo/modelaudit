@@ -6,7 +6,108 @@ Features and fixes increment the patch version. Breaking changes increment the m
 
 ## [Unreleased]
 
-[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/v0.2.56...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit` from the repository root.
+[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/v0.2.58...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit` from the repository root.
+
+## [0.2.58](https://github.com/promptfoo/modelaudit/compare/v0.2.57...v0.2.58) (2026-11-20)
+
+<!-- release-note-source: 9415dfd72ec870ed3506e6527718692adefcf2f8 -->
+
+<!-- release-note-entries: 7 -->
+
+### Other changes
+
+- PyTorch ZIP scans avoid counting the same tensor-storage prefix twice against the hidden-pickle inspection work limit.
+- README scans correctly classify visible hostnames near tokenizer and authentication terminology, avoiding unnecessary exhaustion of the endpoint inspection budget.
+- Recognize extended SentencePiece vocabularies with BERT control tokens, complete endpoint analysis on larger model cards, count failed coverage checks in scan totals, and provide remediation guidance for missing framework source.
+- Separate speculative hidden-pickle coverage in verified raw PyTorch tensors from default scan completion. Keep concrete payload findings and strict-mode incomplete coverage.
+- Show incomplete coverage in scanner summaries and saved reports. Keep coverage evidence visible in nonverbose JSON and omit the success rate when coverage is incomplete.
+- Treat low-confidence domains found only as passive WordPiece vocabulary tokens as informational. Preserve active and high-risk domain findings.
+- Upgrade `modelaudit-picklescan` to 0.1.16 to avoid false positives for ordinary checkpoint loading operations when trusted framework libraries are installed. Upgrading ModelAudit alone can leave an older PickleScan version installed.
+
+<details>
+<summary>All changes</summary>
+
+### Bug Fixes
+
+- avoid rechecking identical PyTorch storage prefixes ([#2044](https://github.com/promptfoo/modelaudit/issues/2044)) ([80b1b0d](https://github.com/promptfoo/modelaudit/commit/80b1b0dd5de1e10934ae42935c5f8bb66043bfae))
+- classify passive WordPiece domain tokens as informational ([#2050](https://github.com/promptfoo/modelaudit/issues/2050)) ([3e7dfa5](https://github.com/promptfoo/modelaudit/commit/3e7dfa5c967e557eab7130ae9b3757856b1f6029))
+- finish tokenizer and model card scans and report incomplete checks ([#2042](https://github.com/promptfoo/modelaudit/issues/2042)) ([239e575](https://github.com/promptfoo/modelaudit/commit/239e5753281a6759bc73f4f202e2ffb6c0c78f5a))
+- preserve hostname markers during endpoint classification ([#2047](https://github.com/promptfoo/modelaudit/issues/2047)) ([83fa9c9](https://github.com/promptfoo/modelaudit/commit/83fa9c9a22534376d982663af5c89a98438c5c60))
+- preserve incomplete coverage in saved scan reports ([#2045](https://github.com/promptfoo/modelaudit/issues/2045)) ([9415dfd](https://github.com/promptfoo/modelaudit/commit/9415dfd72ec870ed3506e6527718692adefcf2f8))
+- stop flagging normal PyTorch and Transformers checkpoints ([#2051](https://github.com/promptfoo/modelaudit/issues/2051)) ([f10748f](https://github.com/promptfoo/modelaudit/commit/f10748f32c5a2f5c1f3bd07ac283eab91a6ae12b))
+- stop valid PyTorch models from failing scans ([#2043](https://github.com/promptfoo/modelaudit/issues/2043)) ([0513a46](https://github.com/promptfoo/modelaudit/commit/0513a46914eb5b19170c352be4e78e4a92ff994c))
+
+[Full comparison](https://github.com/promptfoo/modelaudit/compare/v0.2.57...v0.2.58)
+
+</details>
+
+## [0.2.57](https://github.com/promptfoo/modelaudit/compare/v0.2.56...v0.2.57) (2026-11-18)
+
+<!-- release-note-source: 754c59bb7c0b7de016efa2f0539c87980510db9c -->
+
+<!-- release-note-entries: 11 -->
+
+### Upgrade notes
+
+If you already have ModelAudit installed, upgrade `modelaudit` and `modelaudit-picklescan` together to get both PyTorch fixes, including fewer false frame warnings and more accurate TorchScript findings.
+
+```sh
+python -m pip install --upgrade modelaudit==0.2.57 modelaudit-picklescan==0.1.15
+```
+
+### Security
+
+- Avoid CVE-2026-112940 and CVE-2026-112914 in the filelock dependency. Python 3.11 and later require filelock 4.2.9 or newer. Python 3.10 uses 3.20.3, which remains affected by CVE-2026-112909 and CVE-2026-112910. [#2024](https://github.com/promptfoo/modelaudit/issues/2024)
+- Detect GGUF control vectors that can trigger CVE-2026-126974 in affected llama.cpp loaders.
+- Detect executable Python expressions in fairseq convolution configuration files.
+
+<details>
+<summary>Other changes</summary>
+
+- Avoid incomplete Flax routing warnings on large ONNX weight sidecars when an existing full-file hash read rules out Flax checkpoint keys. The scanner retains coverage limits for unread bytes and independently verifies ONNX references. Direct scans can also rule out an impossible MessagePack length within a bounded prefix of a large external weight. [#2021](https://github.com/promptfoo/modelaudit/issues/2021)
+- License reports give ambiguous `.pkl` files an informational reminder to check usage rights. CycloneDX includes the dataset property for a complete, statically verified sequence of training-example records. [#2023](https://github.com/promptfoo/modelaudit/issues/2023)
+- Skops archives report pickle, joblib, and scikit-learn references in plain README documentation as informational. The CVE-2025-54886 finding for loader evidence recommends the upstream fix in skops 0.13.0. [#2028](https://github.com/promptfoo/modelaudit/issues/2028)
+- Network references, example code, and public cryptocurrency receiving addresses in text READMEs are informational by default. Exposed credentials still produce alerts, and reports retain the underlying evidence. [#2030](https://github.com/promptfoo/modelaudit/issues/2030)
+- ModelAudit reports a UUIDv4 used as a Bearer credential in a literal Authorization or Proxy-Authorization header, including headers quoted in README examples and configuration files. [#2032](https://github.com/promptfoo/modelaudit/issues/2032)
+- ModelAudit distinguishes native TorchScript module and tensor reconstruction from Python imports after verifying the archive’s declaration and tensor state. A storage constructor’s installed call graph is reported as conditional in this context. Standalone pickles and unverified archives retain their security findings.
+- PyTorch scans avoid a false oversized pickle frame warning when tensor bytes resemble an encoded pickle with an invalid persistent ID.
+- Report when a manifest matches the Hugging Face download metadata format and the record cannot verify its associated artifact.
+
+</details>
+
+<details>
+<summary>All changes</summary>
+
+### Features
+
+- support operator-reviewed README citations ([#2027](https://github.com/promptfoo/modelaudit/issues/2027)) ([593fc12](https://github.com/promptfoo/modelaudit/commit/593fc12661c7d81d79cbe6d3c6987633505c72fd))
+
+### Bug Fixes
+
+- **deps:** avoid affected filelock releases on Python 3.10–3.14 ([#2024](https://github.com/promptfoo/modelaudit/issues/2024)) ([7789737](https://github.com/promptfoo/modelaudit/commit/77897370647d5f2c7872b104430830b275129434))
+- detect executable fairseq convolution configs ([#2040](https://github.com/promptfoo/modelaudit/issues/2040)) ([9b7e620](https://github.com/promptfoo/modelaudit/commit/9b7e620a9e4ced6fdfb848001a4c7c03398228b8))
+- detect GGUF control vector integer overflow ([#2041](https://github.com/promptfoo/modelaudit/issues/2041)) ([754c59b](https://github.com/promptfoo/modelaudit/commit/754c59bb7c0b7de016efa2f0539c87980510db9c))
+- **licenses:** qualify rights notices for pickle files ([#2023](https://github.com/promptfoo/modelaudit/issues/2023)) ([2e41982](https://github.com/promptfoo/modelaudit/commit/2e419823e3c8875857142b048016f0bb82d9fc9f))
+- **manifest:** identify Hugging Face download records ([#2026](https://github.com/promptfoo/modelaudit/issues/2026)) ([8cd89b4](https://github.com/promptfoo/modelaudit/commit/8cd89b44c2fb1c5d1ca481dbbc14b9588c0b6c86))
+- **picklescan:** qualify frame warnings from encoded probes ([#2022](https://github.com/promptfoo/modelaudit/issues/2022)) ([098e156](https://github.com/promptfoo/modelaudit/commit/098e15605af4e789185ee70d9cf7a39f69dba687))
+- **pytorch:** attribute verified legacy TorchScript controls to the native loader ([#2025](https://github.com/promptfoo/modelaudit/issues/2025)) ([78936e3](https://github.com/promptfoo/modelaudit/commit/78936e307bbd71320f9d6e2d8f335dddbc3e3fa5))
+- **release:** generate release metadata from protected inputs ([#2031](https://github.com/promptfoo/modelaudit/issues/2031)) ([fd1e50c](https://github.com/promptfoo/modelaudit/commit/fd1e50cc02d7235a40aed311542455ee997d6ddc))
+- **routing:** rule out Flax while hashing large ONNX weights ([#2021](https://github.com/promptfoo/modelaudit/issues/2021)) ([57d052f](https://github.com/promptfoo/modelaudit/commit/57d052f0ff83cd26d688923f61ddcfbaef080be8))
+- **secrets:** recognize UUIDv4 credentials in explicit Bearer headers ([#2032](https://github.com/promptfoo/modelaudit/issues/2032)) ([a8f900f](https://github.com/promptfoo/modelaudit/commit/a8f900fd42c14adf37c1f6c377ed215503eb4945))
+- **skops:** report README loader references as informational ([#2028](https://github.com/promptfoo/modelaudit/issues/2028)) ([9374fc7](https://github.com/promptfoo/modelaudit/commit/9374fc78bccd8fa6d15ec212f09566c738168c73))
+- **text:** report README examples and public addresses as informational ([#2030](https://github.com/promptfoo/modelaudit/issues/2030)) ([3fc0883](https://github.com/promptfoo/modelaudit/commit/3fc0883046ddaf30d987f6e8988b632839eac62a))
+
+### Dependency updates
+
+- The repository lockfile updates `opentelemetry-api` from 1.45.1 to 1.45.2, which fixes a denial of service in trace context parsing. [#2038](https://github.com/promptfoo/modelaudit/pull/2038) · [Security advisory](https://github.com/advisories/GHSA-mf5v-w3w3-f6cg)
+
+### Reverts
+
+- remove operator-reviewed README citations ([f5924ad](https://github.com/promptfoo/modelaudit/commit/f5924ad63acd2ac67359c74e287d149602e6215c))
+
+[Full comparison](https://github.com/promptfoo/modelaudit/compare/v0.2.56...v0.2.57)
+
+</details>
 
 ## [0.2.56](https://github.com/promptfoo/modelaudit/compare/v0.2.55...v0.2.56) (2026-11-09)
 

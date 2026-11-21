@@ -18,6 +18,7 @@ from .rule_mapper import get_generic_rule_code, get_import_rule_code, get_pickle
 
 _INCONCLUSIVE_NOTICE_CODES = frozenset(
     {
+        "call_graph_source_unavailable",
         "encoded_nested_payload_truncated",
         "literal_scan_truncated",
         "nested_payload_truncated",
@@ -55,6 +56,7 @@ _LEGACY_NOTICE_RULE_CODES = {
     "nested_payload_detected": "S213",
 }
 _LEGACY_SCAN_OUTCOME_REASONS = {
+    "call_graph_source_unavailable": "pickle_analysis_incomplete",
     "opcode_budget": "opcode_budget_exceeded",
     "parse_incomplete": "pickle_analysis_incomplete",
     "buffer_opcode": "protocol5_external_buffer_context",
@@ -191,7 +193,9 @@ def pickle_report_to_scan_result(
 
     if has_incomplete_coverage:
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-        result.metadata["scan_outcome_reasons"] = incomplete_notice_reasons or ["pickle_analysis_incomplete"]
+        result.metadata["scan_outcome_reasons"] = list(dict.fromkeys(incomplete_notice_reasons)) or [
+            "pickle_analysis_incomplete"
+        ]
         result.metadata["analysis_incomplete"] = True
     elif report.status == ScanStatus.ERROR and any(error.category == "parse_error" for error in report.errors):
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
@@ -245,7 +249,7 @@ def pickle_report_to_scan_result(
             severity=IssueSeverity.CRITICAL if notice_is_nested_payload else _to_issue_severity(notice.severity),
             location=notice.location,
             details=details,
-            why=_legacy_why_for_notice(notice.code),
+            why=_legacy_why_for_notice(notice.code, details),
             rule_code=_legacy_rule_code_for_notice(notice.code, details),
         )
         if notice.code == "parse_incomplete" and not suppress_parse_failure_escalation:
@@ -487,7 +491,14 @@ def _legacy_rule_code_for_notice(notice_code: str | None, details: Mapping[str, 
     return _LEGACY_NOTICE_RULE_CODES.get(notice_code)
 
 
-def _legacy_why_for_notice(notice_code: str | None) -> str | None:
+def _legacy_why_for_notice(notice_code: str | None, details: Mapping[str, Any]) -> str | None:
+    if notice_code == "call_graph_source_unavailable" and details.get("reason") == "source_unavailable":
+        module = str(details.get("module", "")).partition(".")[0]
+        if module in {"torch", "transformers", "accelerate"}:
+            return (
+                f"ModelAudit needs readable {module} source to inspect this callable. "
+                f"Install the trusted {module} version used by the model in the scanning environment and rescan."
+            )
     if notice_code == "nested_payload_detected":
         return "Nested pickle payloads can hide code execution paths from shallow scanners."
     if notice_code == "encoded_nested_payload_detected":

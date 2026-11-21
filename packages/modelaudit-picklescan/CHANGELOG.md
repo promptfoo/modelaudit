@@ -6,7 +6,50 @@ Features and fixes increment the patch version. Breaking changes increment the m
 
 ## [Unreleased]
 
-[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.14...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit-picklescan` from the repository root.
+[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.16...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit-picklescan` from the repository root.
+
+## [0.1.16](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.15...modelaudit-picklescan-v0.1.16) (2026-11-20)
+
+<!-- release-note-source: 9415dfd72ec870ed3506e6527718692adefcf2f8 -->
+
+<!-- release-note-entries: 1 -->
+
+### Other changes
+
+- Stop flagging ordinary checkpoint reconstruction by trusted PyTorch, NumPy, Transformers and Accelerate installations.
+
+<details>
+<summary>All changes</summary>
+
+### Bug Fixes
+
+- stop flagging normal PyTorch and Transformers checkpoints ([#2051](https://github.com/promptfoo/modelaudit/issues/2051)) ([f10748f](https://github.com/promptfoo/modelaudit/commit/f10748f32c5a2f5c1f3bd07ac283eab91a6ae12b))
+
+[Full comparison](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.15...modelaudit-picklescan-v0.1.16)
+
+</details>
+
+## [0.1.15](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.14...modelaudit-picklescan-v0.1.15) (2026-11-18)
+
+<!-- release-note-source: 754c59bb7c0b7de016efa2f0539c87980510db9c -->
+
+<!-- release-note-entries: 1 -->
+
+### Bug fix
+
+- Pickle scans avoid a false oversized frame warning when encoded data resembles a nested pickle with an invalid persistent ID. [#2022](https://github.com/promptfoo/modelaudit/pull/2022)
+
+<details>
+<summary>All changes</summary>
+
+### Bug Fixes
+
+- **picklescan:** qualify frame warnings from encoded probes ([#2022](https://github.com/promptfoo/modelaudit/issues/2022)) ([098e156](https://github.com/promptfoo/modelaudit/commit/098e15605af4e789185ee70d9cf7a39f69dba687))
+- **pytorch:** attribute verified legacy TorchScript controls to the native loader ([#2025](https://github.com/promptfoo/modelaudit/issues/2025)) ([78936e3](https://github.com/promptfoo/modelaudit/commit/78936e307bbd71320f9d6e2d8f335dddbc3e3fa5))
+
+[Full comparison](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.14...modelaudit-picklescan-v0.1.15)
+
+</details>
 
 ## [0.1.14](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.13...modelaudit-picklescan-v0.1.14) (2026-11-09)
 

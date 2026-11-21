@@ -276,6 +276,7 @@ def pytest_runtest_setup(item):
             "test_hooks_egress.py",  # progress hook egress allowlist regressions
             "test_release_workflow.py",  # release workflow regression tests
             "test_release_notes.py",  # per-package release note assembly and review
+            "test_release_publication.py",  # release PR publication reports
             "test_docker_workflow.py",  # Docker workflow regression tests
             "test_process_provider_diagnostic.py",  # Nightly native artifact capture
             "test_sbom_symlink_containment.py",  # SBOM symlink containment regression tests

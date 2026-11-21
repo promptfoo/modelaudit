@@ -87,18 +87,16 @@ def extract_dangerous_constructs(code: str) -> dict[str, list[str]]:
                     elif func_name in ["system", "popen"]:
                         dangerous["subprocess_operations"].append(func_name)
 
-                elif isinstance(node.func, ast.Attribute):
-                    # Check for os.system, subprocess.run, etc.
-                    if isinstance(node.func.value, ast.Name):
-                        module = node.func.value.id
-                        method = node.func.attr
+                elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                    module = node.func.value.id
+                    method = node.func.attr
 
-                        if (module == "os" and method in ["system", "popen", "exec*"]) or (
-                            module == "subprocess" and method in ["run", "call", "Popen"]
-                        ):
-                            dangerous["subprocess_operations"].append(f"{module}.{method}")
-                        elif module == "socket" and method in ["socket", "connect"]:
-                            dangerous["network_operations"].append(f"{module}.{method}")
+                    if (module == "os" and method in ["system", "popen", "exec*"]) or (
+                        module == "subprocess" and method in ["run", "call", "Popen"]
+                    ):
+                        dangerous["subprocess_operations"].append(f"{module}.{method}")
+                    elif module == "socket" and method in ["socket", "connect"]:
+                        dangerous["network_operations"].append(f"{module}.{method}")
 
             # Check for variadic lambdas (can enable tuple unpacking exploits)
             elif isinstance(node, ast.Lambda):

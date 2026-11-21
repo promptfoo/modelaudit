@@ -382,7 +382,11 @@ def _make_unavailable_recognized_format_result(path: str, format_: str, scanner_
     from . import _registry
 
     result = ScanResult(scanner_name="unknown")
-    details: dict[str, Any] = {"format": format_, "path": path}
+    details: dict[str, Any] = {
+        "format": format_,
+        "path": path,
+        "scan_outcome_reason": _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON,
+    }
     if scanner_id:
         details["preferred_scanner_id"] = scanner_id
         scanner_load_error = _registry.get_failed_scanners().get(scanner_id)
@@ -411,7 +415,7 @@ def _make_incomplete_routing_result(path: str, *, name: str, message: str, forma
         message=message,
         severity=IssueSeverity.INFO,
         location=path,
-        details={"format": format_, "path": path},
+        details={"format": format_, "path": path, "scan_outcome_reason": reason},
     )
     mark_inconclusive_scan_result(result, reason)
     mark_operational_scan_error(result, reason)
@@ -1013,7 +1017,11 @@ def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any] 
         message="Llamafile routing was inconclusive because bounded marker bytes could not be read",
         severity=IssueSeverity.INFO,
         location=path,
-        details={"format": LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+        details={
+            "format": LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
+            "path": path,
+            "scan_outcome_reason": _LLAMAFILE_ROUTING_INCOMPLETE_REASON,
+        },
     )
     mark_inconclusive_scan_result(result, _LLAMAFILE_ROUTING_INCOMPLETE_REASON)
     mark_operational_scan_error(result, _LLAMAFILE_ROUTING_INCOMPLETE_REASON)
@@ -1060,7 +1068,11 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
         message="MXNet symbol routing was inconclusive because the bounded JSON probe reached its limit",
         severity=IssueSeverity.INFO,
         location=path,
-        details={"format": MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+        details={
+            "format": MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
+            "path": path,
+            "scan_outcome_reason": _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON,
+        },
     )
     mark_inconclusive_scan_result(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
     mark_operational_scan_error(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)

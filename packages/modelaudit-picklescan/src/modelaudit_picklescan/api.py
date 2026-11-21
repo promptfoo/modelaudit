@@ -6,6 +6,7 @@ import ast
 import base64
 import binascii
 import codecs
+import hashlib
 import io
 import os
 import pickletools
@@ -30,11 +31,15 @@ from .call_graph import (
     UnanalyzedCallGraphReference,
     _begin_shared_source_report,
     _CallGraphAnalysisLimitError,
+    _class_base_targets,
     _ensure_shared_source_snapshot_stable,
     _find_module_spec_without_imports,
+    _interpreter_reference_is_trusted,
     _is_skippable_pytorch_storage_persistent_id_reference,
     _module_spec_fields_without_hooks,
+    _resolve_class_target,
     _runtime_module_attribute_without_hooks,
+    _source_class_context,
     class_static_attribute_lookup_is_proven_source_backed,
     find_analyzed_callable_call_graph_global_positions,
     find_dangerous_call_graphs,
@@ -54,6 +59,7 @@ from .call_graph import _PYTORCH_STORAGE_REFERENCES as _PYTORCH_STORAGE_GLOBALS
 from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
 
+_CANONICAL_DISTRIBUTION_LOOKUP = importlib_metadata.distribution
 _RUST_STREAM_READ_CHUNK_SIZE = 1024 * 1024
 _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY = "call_graph_source_fingerprints"
 _SOURCE_INDEPENDENT_BUILTIN_MODULES = frozenset({"builtins"})
@@ -5356,6 +5362,7 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
     invocation_load_safe_modules: frozenset[str] = frozenset()
     safe_getattr_reconstruction_keys: frozenset[tuple[int, int]] = frozenset()
     source_snapshot_stable = True
+    ordinary_checkpoint_positions: frozenset[tuple[int, str, str]] = frozenset()
     callable_invocations_complete = not bool(report.metadata.get("callable_invocations_truncated"))
     non_allowlisted_global_imports_complete = not bool(report.metadata.get("non_allowlisted_global_imports_truncated"))
     try:
@@ -5452,6 +5459,13 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
         except Exception as error:
             enrichment_errors.append(("python_import_reference_trust", error))
         try:
+            if callable_invocations_complete and non_allowlisted_global_imports_complete:
+                ordinary_checkpoint_positions = _ordinary_checkpoint_positions(
+                    report, payload, suppress_safe_numpy_reconstruct
+                )
+        except Exception as error:
+            enrichment_errors.append(("python_checkpoint_reconstruction", error))
+        try:
             _ensure_shared_source_snapshot_stable(report_generation)
         except _CallGraphAnalysisLimitError as error:
             source_snapshot_stable = False
@@ -5462,6 +5476,18 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
         report = _without_proven_safe_getattr_reconstruction_findings(
             report,
             safe_getattr_reconstruction_keys,
+        )
+
+    if source_snapshot_stable and not enrichment_errors and ordinary_checkpoint_positions:
+        findings = tuple(
+            finding
+            for finding in report.findings
+            if finding.rule_code != "NON_ALLOWLISTED_GLOBAL"
+            or (finding.details.get("position"), finding.details.get("module"), finding.details.get("name"))
+            not in ordinary_checkpoint_positions
+        )
+        report = replace(
+            report, findings=findings, verdict=_verdict_for_findings(report.status, findings), private_metadata={}
         )
 
     if (
@@ -5997,6 +6023,193 @@ def _source_backed_framework_identity_requires_contextual_invocation(module: str
     )
 
 
+def _distribution_owns_module(module: str) -> bool:
+    if importlib_metadata.distribution is not _CANONICAL_DISTRIBUTION_LOOKUP:
+        return False
+    root = module.split(".", 1)[0]
+    try:
+        distribution = importlib_metadata.distribution(root)
+        directory = Path(str(distribution.locate_file(""))).resolve()
+        files = {str(file): file for file in distribution.files or ()}
+        parts = module.split(".")
+        for length in range(1, len(parts) + 1):
+            spec = _find_module_spec_without_imports(".".join(parts[:length]))
+            if spec is None:
+                return False
+            origin, _loader = _module_spec_fields_without_hooks(spec)
+            if not isinstance(origin, str):
+                return False
+            path = Path(origin).resolve()
+            entry = files.get(path.relative_to(directory).as_posix())
+            if entry is None or entry.hash is None or entry.hash.mode != "sha256" or entry.size != path.stat().st_size:
+                return False
+            with path.open("rb") as source:
+                digest = hashlib.sha256()
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(block)
+            if base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode("ascii") != entry.hash.value:
+                return False
+        return True
+    except (importlib_metadata.PackageNotFoundError, OSError, RuntimeError, ValueError):
+        return False
+
+
+def _checkpoint_opcodes(payload: bytes) -> list[tuple[str, Any, int, int | None]]:
+    memo: dict[int, tuple[str, Any, int | None] | None] = {}
+    operations: list[tuple[str, Any, int, int | None]] = []
+    for count, (opcode, arg, position) in enumerate(pickletools.genops(payload), 1):
+        if count > _SAFE_NUMPY_RECONSTRUCT_MAX_OPCODES or position is None:
+            return []
+        name = opcode.name
+        if name in {"BINPUT", "LONG_BINPUT", "PUT", "MEMOIZE"}:
+            if name == "MEMOIZE":
+                key = len(memo)
+            elif arg is not None:
+                key = int(arg)
+            else:
+                return []
+            previous = operations[-1] if operations else None
+            memo[key] = (
+                (previous[0], previous[1], previous[3])
+                if previous and previous[0] in {"GLOBAL", "BINUNICODE", "SHORT_BINUNICODE"}
+                else None
+            )
+            continue
+        value = memo.get(int(arg)) if name in {"BINGET", "LONG_BINGET", "GET"} and arg is not None else None
+        if value is not None:
+            kind, value_arg, definition = value
+            operations.append((kind, value_arg, position, definition))
+        else:
+            operations.append((name, arg, position, position if name == "GLOBAL" else None))
+    return operations if operations and operations[-1][0] == "STOP" and operations[-1][2] + 1 == len(payload) else []
+
+
+def _checkpoint_tensor_call(operations: list[tuple[str, Any, int, int | None]], index: int) -> bool:
+    window = operations[index : index + 64]
+    if len(window) < 8 or window[1][0] != "MARK":
+        return False
+    reductions = [i for i, op in enumerate(window) if op[0] == "REDUCE"]
+    if len(reductions) < 2:
+        return False
+    first, second = reductions[:2]
+    if second != first + 2 or first < 2:
+        return False
+    prefix = window[2 : first - 2]
+    allowed = {
+        "MARK",
+        "BINUNICODE",
+        "SHORT_BINUNICODE",
+        "GLOBAL",
+        "BININT",
+        "BININT1",
+        "BININT2",
+        "TUPLE",
+        "TUPLE1",
+        "TUPLE2",
+        "TUPLE3",
+        "EMPTY_TUPLE",
+        "BINPERSID",
+        "NEWFALSE",
+        "NEWTRUE",
+    }
+    return (
+        window[first - 2][0:2] == ("GLOBAL", "collections OrderedDict")
+        and window[first - 1][0] == "EMPTY_TUPLE"
+        and window[first + 1][0] == "TUPLE"
+        and sum(op[0] == "BINPERSID" for op in prefix) == 1
+        and all(
+            op[0] in allowed and (op[0] != "GLOBAL" or tuple(str(op[1]).split()) in _PYTORCH_STORAGE_GLOBALS)
+            for op in prefix
+        )
+    )
+
+
+def _ordinary_checkpoint_positions(
+    report: PickleReport, payload: bytes | None, safe_numpy: bool
+) -> frozenset[tuple[int, str, str]]:
+    if report.status != ScanStatus.COMPLETE or report.verdict == SafetyVerdict.MALICIOUS or type(payload) is not bytes:
+        return frozenset()
+    supported = _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES | _CODECS_ENCODE_REFERENCES
+    calls: dict[int, list[Mapping[str, object]]] = {}
+    for item in _sequence(report.metadata.get("callable_invocations")):
+        invocation = _mapping(item)
+        position = _optional_int(invocation.get("global_position"))
+        if position is not None:
+            calls.setdefault(position, []).append(invocation)
+    ownership: dict[str, bool] = {}
+    safe: set[tuple[int, str, str]] = set()
+    for finding in report.findings:
+        if finding.rule_code != "NON_ALLOWLISTED_GLOBAL":
+            continue
+        module, name = str(finding.details.get("module", "")), str(finding.details.get("name", ""))
+        reference = (module, name)
+        position = _optional_int(finding.details.get("position"))
+        if reference not in supported or position is None or position < 0:
+            continue
+        header = f"c{module}\n{name}\n".encode()
+        if not payload.startswith(header, position):
+            continue
+        invocations = calls.get(position, [])
+        if not invocations or any((item.get("module"), item.get("name")) != reference for item in invocations):
+            continue
+        if reference == ("_codecs", "encode"):
+            trusted = safe_numpy and _interpreter_reference_is_trusted(module, name)
+        else:
+            if module not in ownership:
+                ownership[module] = _distribution_owns_module(module)
+            trusted = ownership[module] and all(
+                import_only_reference_is_proven_trusted_for_pickle_invocation(module, name, item)
+                for item in invocations
+            )
+        if not trusted:
+            continue
+        shape = [(item.get("opcode"), item.get("positional_arg_count")) for item in invocations]
+        if reference in _NUMPY_RECONSTRUCT_REFERENCES | _NUMPY_DTYPE_REFERENCES:
+            ordinary = safe_numpy
+        elif reference == ("_codecs", "encode"):
+            ordinary = all(item == ("REDUCE", 2) for item in shape)
+        elif reference == ("torch._utils", "_rebuild_tensor_v2"):
+            operations = (
+                _checkpoint_opcodes(payload) if len(payload) <= _SAFE_NUMPY_RECONSTRUCT_MAX_PAYLOAD_BYTES else []
+            )
+            uses = [
+                i for i, (op, _, _, definition) in enumerate(operations) if op == "GLOBAL" and definition == position
+            ]
+            ordinary = (
+                bool(uses)
+                and _collections_ordered_dict_binding_is_canonical()
+                and all(_checkpoint_tensor_call(operations, i) for i in uses)
+            )
+        elif reference == ("torch", "device"):
+            ordinary = all(item in {("REDUCE", 1), ("REDUCE", 2)} for item in shape)
+        else:
+            context = _source_class_context(f"{module}.{name}")
+            ordinary = context is not None and (
+                (all(item == ("REDUCE", 1) for item in shape) and _checkpoint_is_enum(f"{module}.{name}"))
+                or (
+                    not context.class_node.bases
+                    and shape == [("NEWOBJ", 0), ("BUILD", None)]
+                    and invocations[1].get("build_uses_slot_state") is False
+                )
+            )
+        if ordinary:
+            safe.add((position, module, name))
+    return frozenset(safe)
+
+
+def _checkpoint_is_enum(target: str, depth: int = 0) -> bool:
+    if target == "enum.Enum":
+        return _runtime_module_attribute_without_hooks("enum", "Enum") is Enum
+    if depth >= 4 or (context := _source_class_context(target)) is None:
+        return False
+    bases = _class_base_targets(context.class_node, context.module_name, context.aliases, context.local_defs)
+    return any(
+        resolved is not None and _checkpoint_is_enum(resolved, depth + 1)
+        for base in bases
+        if (resolved := _resolve_class_target(base)) not in {"str", "builtins.str"}
+    )
+
+
 def _proven_trusted_invocation_global_positions(callable_invocations: object) -> frozenset[int]:
     grouped: dict[int, list[Mapping[str, object]]] = {}
     for raw_invocation in _sequence(callable_invocations):
@@ -6484,12 +6697,16 @@ def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | 
                     args = pop_value()
                     function = pop_value()
                     if _abstract_global_is(function, _CODECS_ENCODE_REFERENCES):
+                        if not _codecs_encode_args_are_safe(args):
+                            unsafe_numpy_reconstruct = True
                         stack.append(
                             _AbstractValue.BYTES
                             if _codecs_encode_args_are_safe(args)
                             else _AbstractCallResult(function, args)
                         )
                     elif _abstract_global_is(function, _NUMPY_DTYPE_REFERENCES):
+                        if not _numpy_dtype_reduce_args_are_safe(args):
+                            unsafe_numpy_reconstruct = True
                         stack.append(
                             _AbstractValue.NUMPY_DTYPE
                             if _numpy_dtype_reduce_args_are_safe(args)
@@ -6514,6 +6731,8 @@ def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | 
                             unsafe_numpy_reconstruct = True
                             stack.append(_ABSTRACT_UNKNOWN)
                     elif obj is _AbstractValue.NUMPY_DTYPE:
+                        if not _abstract_value_is_inert(state):
+                            unsafe_numpy_reconstruct = True
                         stack.append(obj if _abstract_value_is_inert(state) else _ABSTRACT_UNKNOWN)
                     else:
                         stack.append(obj)

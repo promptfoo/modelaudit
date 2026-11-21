@@ -174,15 +174,19 @@ _DIRECT_AUTH_SCHEME_VALUE_PATTERN = re.compile(
     rb"(?:^|[^A-Za-z0-9])(?:basic|bearer|token)[ \t]+[\"']?\s*$",
     re.IGNORECASE,
 )
-_EVIDENCE_MATCH_START_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_START__"
-_EVIDENCE_MATCH_END_MARKER = "__MODELAUDIT_ENDPOINT_MATCH_END__"
+# URL normalization lowercases hostnames. Markers must survive it to distinguish
+# a visible hostname from a credential removed by the evidence classifier.
+_EVIDENCE_MATCH_START_MARKER = "__modelaudit_endpoint_match_start__"
+_EVIDENCE_MATCH_END_MARKER = "__modelaudit_endpoint_match_end__"
 _SENSITIVE_NESTED_URL = "redacted://redacted.invalid/sensitive-endpoint"
 _OVER_ENCODED_NESTED_URL = "overencoded://redacted.invalid/nested-endpoint"
 _MAX_URL_TEXT_LOOKUP_BYTES = 4096
 _MAX_SNIPPET_URL_EXPANSION_BYTES = 4096
 _MAX_SNIPPET_CHARS = 200
 _MAX_PATH_TOKEN_DECODE_PASSES = 8
-_MAX_EVIDENCE_REDACTION_CLASSIFICATIONS = 32
+_EVIDENCE_REDACTION_CLASSIFICATIONS_PER_BLOCK = 32
+_EVIDENCE_REDACTION_BLOCK_BYTES = 8192
+_MAX_EVIDENCE_REDACTION_CLASSIFICATIONS = 128
 _PATH_TOKEN_DECODE_LIMIT_SENTINEL = "\0path-decode-limit"
 _MIN_CAPABILITY_TOKEN_ENTROPY = 3.5
 _MIN_URLSAFE_FILENAME_STEM_ENTROPY = 4.0
@@ -3061,11 +3065,12 @@ def _is_valid_official_readme_sample_image_example(
             elif isinstance(
                 parent,
                 (ast.Lambda, ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp, ast.comprehension),
+            ) or (
+                isinstance(parent, ast.Compare)
+                and current is not parent.left
+                and (not parent.comparators or current is not parent.comparators[0])
             ):
                 return False
-            elif isinstance(parent, ast.Compare):
-                if current is not parent.left and (not parent.comparators or current is not parent.comparators[0]):
-                    return False
             if isinstance(parent, ast.stmt):
                 return not (isinstance(parent, ast.Assert) and current is parent.msg)
             current = parent
@@ -5194,6 +5199,7 @@ class NetworkCommDetector:
         self._url_context_starts: list[int] = []
         self._url_context_iterator: Iterator[tuple[int, int, str]] | None = None
         self._pending_url_context: tuple[int, int, str] | None = None
+        self._evidence_redaction_limit = _EVIDENCE_REDACTION_CLASSIFICATIONS_PER_BLOCK
         self._evidence_redaction_classifications = 0
         self._evidence_redaction_limit_reached = False
         self._has_sensitive_evidence_hint = False
@@ -5239,6 +5245,11 @@ class NetworkCommDetector:
         self.findings_truncated = False
         self.truncated_finding_type = None
         self.truncated_finding = None
+        # Amortize bounded endpoint analysis over the input while retaining an absolute ceiling.
+        blocks = max(1, (len(data) + _EVIDENCE_REDACTION_BLOCK_BYTES - 1) // _EVIDENCE_REDACTION_BLOCK_BYTES)
+        self._evidence_redaction_limit = min(
+            _MAX_EVIDENCE_REDACTION_CLASSIFICATIONS, blocks * _EVIDENCE_REDACTION_CLASSIFICATIONS_PER_BLOCK
+        )
         self._evidence_redaction_classifications = 0
         self._evidence_redaction_limit_reached = False
         self._has_sensitive_evidence_hint = _SENSITIVE_EVIDENCE_HINT_PATTERN.search(data) is not None
@@ -5314,7 +5325,7 @@ class NetworkCommDetector:
                     **(
                         {
                             "redaction_analysis_incomplete": True,
-                            "max_classifications": _MAX_EVIDENCE_REDACTION_CLASSIFICATIONS,
+                            "max_classifications": self._evidence_redaction_limit,
                         }
                         if self._evidence_redaction_limit_reached
                         else {}
@@ -5328,7 +5339,7 @@ class NetworkCommDetector:
                     "detector": "network_communication",
                     "severity": "INFO",
                     "message": "Network endpoint redaction classification exceeded the safe work limit",
-                    "max_classifications": _MAX_EVIDENCE_REDACTION_CLASSIFICATIONS,
+                    "max_classifications": self._evidence_redaction_limit,
                     "truncated_finding_type": "endpoint_redaction_classification",
                     "truncated_finding": None,
                     "analysis_incomplete": True,
@@ -5414,7 +5425,7 @@ class NetworkCommDetector:
         after = min(len(data), match_end + _MAX_URL_TEXT_LOOKUP_BYTES)
         if _SENSITIVE_EVIDENCE_HINT_PATTERN.search(data[before:after]) is None:
             return False
-        if self._evidence_redaction_classifications >= _MAX_EVIDENCE_REDACTION_CLASSIFICATIONS:
+        if self._evidence_redaction_classifications >= self._evidence_redaction_limit:
             self._evidence_redaction_limit_reached = True
             return True
         self._evidence_redaction_classifications += 1
