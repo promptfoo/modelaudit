@@ -12,6 +12,8 @@
 | **Release**                | `release-please.yml`    | Pushes to main and manual dispatch        |
 | **Docker Publish**         | `docker-publish.yml`    | Published releases and manual dispatch    |
 
+CodeQL runs the default and `security-extended` queries for Python and GitHub Actions. Pull requests from forks run the analysis without uploading results.
+
 Every PR validates both packages’ release notes before reporting `CI Success`. Documentation-only PRs skip the code and package matrices. Release fragments alone skip Docker builds and automatic benchmarks. The documentation workflow checks formatting and links.
 
 Code PRs test GitHub's merge ref. Linux runs fail-fast root tests on Python 3.10 and 3.12–3.15. Windows runs one Python 3.11 shard. PRs also run the reduced NumPy lane and the Python 3.10–3.15 standalone pickle matrix. macOS and Windows smoke-test native pickle and ONNX scanning on Python 3.14 and 3.15, and H5 scanning on 3.14. Linux nightly runs also install the HDF5 development libraries and the explicit `h5` extra on Python 3.15. Workflow changes trigger the full sharded root matrix. Dependency changes trigger an audit on the PR merge ref and again on the merge-group candidate. The optional `run-slow-tests` label applies only to PRs.
