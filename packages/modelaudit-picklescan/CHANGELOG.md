@@ -6,7 +6,42 @@ Features and fixes increment the patch version. Breaking changes increment the m
 
 ## [Unreleased]
 
-[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.16...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit-picklescan` from the repository root.
+[Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.17...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit-picklescan` from the repository root.
+
+## [0.1.17](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.16...modelaudit-picklescan-v0.1.17) (2026-11-22)
+
+<!-- release-note-source: a5f388ce3bceefe1c08769d0676d6708b6c70afd -->
+
+<!-- release-note-entries: 5 -->
+
+### Security
+
+- Check adjacent Python bytecode with bounded reads. A changed or nonregular cache file prevents the scanner from trusting the adjacent source.
+- Detect pickles that load code through Python 3.15 lazy imports, including calls through aliases and wrapper functions.
+  On Python 3.15, keep analyzing calls in imported modules when their bytecode cache matches the source.
+- Flag calls to Python 3.15’s `__lazy_import__` in plain or Base64-encoded pickle strings, including PyTorch storage members.
+- Pickle scans now check Python source encoding declarations before trusting a referenced module. They treat unsupported encodings and bytecode caches that could require excessive compilation of nested `finally` blocks as untrusted.
+
+### Other changes
+
+- Reduce peak memory when scanning PyTorch storage literals with many line continuations or whitespace runs.
+
+<details>
+<summary>All changes</summary>
+
+### Features
+
+- support CPython 3.15 and detect deferred imports in pickle scans ([#2059](https://github.com/promptfoo/modelaudit/issues/2059)) ([59ea813](https://github.com/promptfoo/modelaudit/commit/59ea813feafac3b405a745bb2500b1db119fb182))
+
+### Bug Fixes
+
+- **picklescan:** detect lazy import calls and share PyTorch literal matching ([#2069](https://github.com/promptfoo/modelaudit/issues/2069)) ([48c8bad](https://github.com/promptfoo/modelaudit/commit/48c8bad3f205faa9ee1fac978a9bfe36821e1f35))
+- **picklescan:** share bounded reads for bytecode and scan cache validation ([#2075](https://github.com/promptfoo/modelaudit/issues/2075)) ([216377d](https://github.com/promptfoo/modelaudit/commit/216377ddb146f43073cc119ed9f1f80d32ff131f))
+- **picklescan:** validate source encodings and limit bytecode recompilation ([#2078](https://github.com/promptfoo/modelaudit/issues/2078)) ([acde5b2](https://github.com/promptfoo/modelaudit/commit/acde5b22b023b6c7749204c48ebc2cfd59baad7e))
+
+[Full comparison](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.16...modelaudit-picklescan-v0.1.17)
+
+</details>
 
 ## [0.1.16](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.15...modelaudit-picklescan-v0.1.16) (2026-11-20)
 
