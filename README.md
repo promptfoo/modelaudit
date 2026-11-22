@@ -317,6 +317,8 @@ To opt in during editable/development installs:
 export MODELAUDIT_TELEMETRY_DEV=1
 ```
 
+If you use `PROMPTFOO_POSTHOG_HOST` to route telemetry through a custom reverse proxy, PostHog 8 requires the proxy to forward `/i/v1/analytics/events`. Preserve the request headers, response status and response body as described in the [PostHog migration guide](https://github.com/PostHog/posthog-python/blob/posthog-v8.1.0/docs/migration-7.x-to-8.0.md#prepare-your-proxy).
+
 ## Output Examples
 
 ```bash
