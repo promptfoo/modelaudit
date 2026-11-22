@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 Features and fixes increment the patch version. Breaking changes increment the minor version during 0.x. See the [version policy](docs/agents/release-process.md#version-scheme-0ver).
 
+## [0.2.59](https://github.com/promptfoo/modelaudit/compare/v0.2.58...v0.2.59) (2026-11-22)
+
+
+### Features
+
+* support CPython 3.15 and detect deferred imports in pickle scans ([#2059](https://github.com/promptfoo/modelaudit/issues/2059)) ([59ea813](https://github.com/promptfoo/modelaudit/commit/59ea813feafac3b405a745bb2500b1db119fb182))
+* validate recognized SentencePiece tokenizers ([#2046](https://github.com/promptfoo/modelaudit/issues/2046)) ([dba4c01](https://github.com/promptfoo/modelaudit/commit/dba4c01b42c1a7bc2302bee8ada1c044f2261bf8))
+
+
+### Bug Fixes
+
+* **cli:** accept scan options before model paths ([#2071](https://github.com/promptfoo/modelaudit/issues/2071)) ([f38da5c](https://github.com/promptfoo/modelaudit/commit/f38da5c9e4e1475833c9c5bd8689261b57a9e86a))
+* **cli:** make new POSIX reports private ([#2076](https://github.com/promptfoo/modelaudit/issues/2076)) ([0d692a7](https://github.com/promptfoo/modelaudit/commit/0d692a7f5c93449868e6f8aa960b2391f472a059))
+* **deps:** keep filelock updates compatible with Python 3.10 ([#2034](https://github.com/promptfoo/modelaudit/issues/2034)) ([2c999f5](https://github.com/promptfoo/modelaudit/commit/2c999f5d79de46b6af247a2acdafe7719ed952ab))
+* **deps:** protect the Python 3.10 filelock compatibility check ([#2056](https://github.com/promptfoo/modelaudit/issues/2056)) ([ba1ff07](https://github.com/promptfoo/modelaudit/commit/ba1ff0711312c7c8fcb446b08b5508d84b91d189))
+* **jax:** bound metadata traversal and depth-limit reports ([#2060](https://github.com/promptfoo/modelaudit/issues/2060)) ([743309c](https://github.com/promptfoo/modelaudit/commit/743309ca700bb30a1542b8562d590c33f2b766fa))
+* **keras:** share module checks and inspect FeatureSpace objects ([#2058](https://github.com/promptfoo/modelaudit/issues/2058)) ([1571871](https://github.com/promptfoo/modelaudit/commit/15718710f7e9134997b3d2b621d571f483a76a01))
+* **onnx:** enable graph scanning on Python 3.13 through 3.15 ([#2068](https://github.com/promptfoo/modelaudit/issues/2068)) ([59730bd](https://github.com/promptfoo/modelaudit/commit/59730bd20b64e555424bd1196fa3bfef17df72e1))
+* **picklescan:** detect lazy import calls and share PyTorch literal matching ([#2069](https://github.com/promptfoo/modelaudit/issues/2069)) ([48c8bad](https://github.com/promptfoo/modelaudit/commit/48c8bad3f205faa9ee1fac978a9bfe36821e1f35))
+* **picklescan:** share bounded reads for bytecode and scan cache validation ([#2075](https://github.com/promptfoo/modelaudit/issues/2075)) ([216377d](https://github.com/promptfoo/modelaudit/commit/216377ddb146f43073cc119ed9f1f80d32ff131f))
+* **picklescan:** validate source encodings and limit bytecode recompilation ([#2078](https://github.com/promptfoo/modelaudit/issues/2078)) ([acde5b2](https://github.com/promptfoo/modelaudit/commit/acde5b22b023b6c7749204c48ebc2cfd59baad7e))
+* preserve JAX findings in standalone archive scans ([#2057](https://github.com/promptfoo/modelaudit/issues/2057)) ([14bd3f1](https://github.com/promptfoo/modelaudit/commit/14bd3f1f042d7e0e0ba8584f892f971b7195c573))
+* **scanners:** report unreadable files without a false critical log ([#2070](https://github.com/promptfoo/modelaudit/issues/2070)) ([e50f9db](https://github.com/promptfoo/modelaudit/commit/e50f9db3b1f653922cf9211e636736e8b25b317a))
+* **sources:** reuse pinned PyTorch Hub cache directories ([#2074](https://github.com/promptfoo/modelaudit/issues/2074)) ([65c3b0e](https://github.com/promptfoo/modelaudit/commit/65c3b0ea14f008f0927b263dec791050e318a59c))
+
 ## [Unreleased]
 
 [Commits since the latest release](https://github.com/promptfoo/modelaudit/compare/v0.2.58...main). To preview pending [release note fragments](changes/), run `python scripts/release_notes.py pending --package modelaudit` from the repository root.
