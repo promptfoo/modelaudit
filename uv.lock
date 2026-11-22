@@ -3278,6 +3278,9 @@ dev = [
     { name = "types-requests" },
     { name = "types-tensorflow" },
 ]
+lint = [
+    { name = "ruff" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -3354,6 +3357,7 @@ dev = [
     { name = "types-requests", specifier = ">=2.31.0" },
     { name = "types-tensorflow", specifier = ">=2.18.0.20250516" },
 ]
+lint = [{ name = "ruff", specifier = ">=0.17.0,<0.18.0" }]
 
 [[package]]
 name = "modelaudit-picklescan"
