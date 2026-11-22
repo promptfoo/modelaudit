@@ -187,36 +187,28 @@ def test_standalone_cpython_support_covers_release_platforms_and_preserves_abi()
 
 def test_standalone_package_lint_uses_locked_root_ruff_version() -> None:
     root_dir = Path(__file__).resolve().parents[1]
-    root_lock = tomllib.loads((root_dir / "uv.lock").read_text(encoding="utf-8"))
-    ruff_package = next(package for package in root_lock["package"] if package["name"] == "ruff")
-    expected_requirement = f"ruff=={ruff_package['version']}"
-    python_workflow = yaml.safe_load((root_dir / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8"))
-    assert isinstance(python_workflow, dict)
+    groups = tomllib.loads((root_dir / "pyproject.toml").read_text(encoding="utf-8"))["dependency-groups"]
+    assert {"include-group": "lint"} in groups["dev"]
+    assert [Requirement(entry).name for entry in groups["lint"]] == ["ruff"]
+    ci = yaml.safe_load((root_dir / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8"))
+    checks = ("check", "format --check")
+    ruff = "uv run --project ../.. --locked --isolated --only-group lint ruff"
+    standalone = {f"{ruff} {check} src tests" for check in checks}
+    targets = "modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/"
 
-    for workflow, job_name in (
-        (_load_release_workflow(), "build-picklescan-package"),
-        (python_workflow, "picklescan-package"),
+    for workflow, job_name, expected in (
+        (ci, "lint", {f"uv run --locked ruff {check} {targets}" for check in checks}),
+        (ci, "picklescan-package", standalone),
+        (_load_release_workflow(), "build-picklescan-package", standalone),
     ):
-        ruff_runs = [
-            run
-            for step in _job_steps(workflow, job_name)
-            if isinstance(run := step.get("run"), str) and ("ruff check" in run or "ruff format" in run)
-        ]
-        assert ruff_runs, f"{job_name} must run Ruff"
-        for run in ruff_runs:
-            assert f"uv run --with '{expected_requirement}' ruff" in run
+        runs = (step.get("run", "").strip() for step in _job_steps(workflow, job_name))
+        assert {run for run in runs if "ruff " in run} == expected
 
-    expected_commands = (
-        f"uv run --with '{expected_requirement}' ruff check src tests",
-        f"uv run --with '{expected_requirement}' ruff format --check src tests",
-    )
     for guide in (
         root_dir / "packages/modelaudit-picklescan/AGENTS.md",
         root_dir / "docs/agents/picklescan-package-split.md",
     ):
-        guide_lines = guide.read_text(encoding="utf-8").splitlines()
-        for expected_command in expected_commands:
-            assert expected_command in guide_lines
+        assert standalone.issubset(guide.read_text(encoding="utf-8").splitlines())
 
 
 @pytest.mark.parametrize(
@@ -229,7 +221,7 @@ def test_standalone_type_check_uses_supported_mypy(workflow_name: str, job_name:
     root_requirement = next(
         requirement
         for entry in root_project["dependency-groups"]["dev"]
-        if (requirement := Requirement(entry)).name == "mypy"
+        if isinstance(entry, str) and (requirement := Requirement(entry)).name == "mypy"
     )
     workflow = yaml.safe_load((root_dir / ".github" / "workflows" / workflow_name).read_text(encoding="utf-8"))
     step = _step_by_name(_job_steps(workflow, job_name), "Type check standalone package with mypy")

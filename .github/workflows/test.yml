@@ -145,13 +145,12 @@ jobs:
         run: |
           uv sync --extra all-ci
 
+      # Root lockfile updates can change Ruff without triggering the standalone matrix.
       - name: Lint with Ruff
-        run: |
-          uv run ruff check modelaudit/ tests/
+        run: uv run --locked ruff check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
 
       - name: Check formatting with Ruff
-        run: |
-          uv run ruff format --check modelaudit/ tests/
+        run: uv run --locked ruff format --check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
 
   dependency-audit:
     name: Dependency Audit
@@ -1010,12 +1009,10 @@ jobs:
           cargo test --manifest-path Cargo.toml
 
       - name: Lint standalone package with Ruff
-        run: |
-          uv run --with 'ruff==0.17.5' ruff check src tests
+        run: uv run --project ../.. --locked --isolated --only-group lint ruff check src tests
 
       - name: Check standalone package formatting with Ruff
-        run: |
-          uv run --with 'ruff==0.17.5' ruff format --check src tests
+        run: uv run --project ../.. --locked --isolated --only-group lint ruff format --check src tests
 
       - name: Type check standalone package with mypy
         run: |
