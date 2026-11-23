@@ -563,7 +563,7 @@ class Jinja2TemplateScanner(BaseScanner):
                     details={"file_type": context.file_type},
                 )
                 self._scan_jax_json_overlap(path, result)
-                result.finish(success=True)
+                self._finish_scan_result(result)
                 return result
 
             result = self._scan_extracted_templates(path, templates, context, result=result, file_size=file_size)

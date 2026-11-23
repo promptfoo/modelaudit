@@ -554,6 +554,115 @@ def test_scan_cli_fairseq_convolution_expression(
         assert not findings
 
 
+@pytest.mark.parametrize("filename", ["config.json", "config.yaml", "hyperparams.yaml"])
+@pytest.mark.parametrize("executable", [False, True])
+def test_scan_cli_fairseq_interpolated_convolution_expression(tmp_path: Path, filename: str, executable: bool) -> None:
+    expression = "(str('inert'), [(512, 10, 5)])[1]" if executable else "[(512, 10, 5)] * 2"
+    target = tmp_path / filename
+    target.write_text(
+        json.dumps({"model": {"conv_feature_layers": "${model.adp_trf_idx}", "adp_trf_idx": expression}}),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "json", str(target)], catch_exceptions=False)
+
+    assert result.exit_code == int(executable), result.output
+    output = parse_click_json_output(result.output)
+    assert output["success"] is True
+    findings = [issue for issue in output["issues"] if issue.get("rule_code") == "S104"]
+    assert len(findings) == int(executable)
+    if executable:
+        assert findings[0]["details"]["expression"] == "${model.adp_trf_idx}"
+        assert findings[0]["details"]["resolved_expression"] == expression
+
+
+@pytest.mark.parametrize(
+    ("expression", "values", "expected_exit"),
+    [
+        ("${model.alias}", {"alias": "${model.value}", "value": "str(1)"}, 1),
+        ("${model.first}${model.last}", {"first": "str", "last": "(1)"}, 1),
+        ("'${model.value}'", {"value": "str(1)"}, 0),
+        ("${model.value} + ${model.value}", {"value": "[(512, 10, 5)]"}, 0),
+        ("str('${env:UNREAD_ENVIRONMENT}')", {}, 1),
+    ],
+)
+def test_scan_cli_fairseq_reference_context(
+    tmp_path: Path, expression: str, values: dict[str, str], expected_exit: int
+) -> None:
+    target = tmp_path / "config.yaml"
+    target.write_text(json.dumps({"model": {"conv_feature_layers": expression, **values}}), encoding="utf-8")
+    result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "json", str(target)], catch_exceptions=False)
+
+    assert result.exit_code == expected_exit, result.output
+    output = parse_click_json_output(result.output)
+    assert output["success"] is True
+    assert any(issue.get("rule_code") == "S104" for issue in output["issues"]) is bool(expected_exit)
+
+
+@pytest.mark.parametrize("filename", ["config.json", "config.yaml", "hyperparams.yaml"])
+@pytest.mark.parametrize(
+    "case", ["missing", "cycle", "resolver", "container", "depth", "expansion", "lookups", "assembled"]
+)
+def test_scan_cli_fairseq_unresolved_references_fail_closed(tmp_path: Path, filename: str, case: str) -> None:
+    from modelaudit.cache import get_cache_manager
+
+    values: dict[str, Any] = {}
+    expression = "${model.value}"
+    if case == "cycle":
+        values["value"] = expression
+    elif case == "resolver":
+        expression = "${env:UNREAD_ENVIRONMENT}"
+    elif case == "container":
+        values["value"] = {"nested": "str(1)"}
+    elif case == "depth":
+        values = {f"ref{i}": f"${{model.ref{i + 1}}}" for i in range(100)}
+        values["ref100"] = "[(512, 10, 5)]"
+        expression = "${model.ref0}"
+    elif case == "expansion":
+        values = {"value": "${model.part}" * 100, "part": " " * 1000}
+    elif case == "lookups":
+        values = {"value": "${model.part}" * 1000, "part": "1"}
+    elif case == "assembled":
+        expression = "${model.adp_trf_idx}${model.layer_type}"
+        values = {"adp_trf_idx": "$", "layer_type": "{model.extractor_mode}", "extractor_mode": "str(1)"}
+    target = tmp_path / filename
+    target.write_text(json.dumps({"model": {"conv_feature_layers": expression, **values}}), encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    runner = CliRunner()
+
+    for _ in range(2):
+        result = runner.invoke(
+            cli, ["scan", "--cache-dir", str(cache_dir), "--format", "json", str(target)], catch_exceptions=False
+        )
+        assert result.exit_code == 2, result.output
+        output = parse_click_json_output(result.output)
+        assert output["success"] is False
+        assert output["incomplete_coverage"] is True
+        assert any(
+            issue.get("rule_code") == "S902"
+            and issue["details"].get("reason") == "fairseq_config_interpolation_incomplete"
+            and "analysis incomplete" in issue["message"]
+            for issue in output["issues"]
+        )
+    stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+    assert stats["cache_hits"] == 0
+    assert stats["total_entries"] == 0
+
+
+@pytest.mark.parametrize("filename", ["config.json", "config.yaml", "hyperparams.yaml"])
+def test_scan_cli_fairseq_incomplete_reference_preserves_other_findings(tmp_path: Path, filename: str) -> None:
+    target = tmp_path / filename
+    target.write_text(
+        json.dumps({"known": {"conv_feature_layers": "str(1)"}, "unresolved": {"conv_feature_layers": "${missing}"}}),
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "json", str(target)], catch_exceptions=False)
+    assert result.exit_code == 1, result.output
+    output = parse_click_json_output(result.output)
+    assert output["incomplete_coverage"] is True
+    assert {issue.get("rule_code") for issue in output["issues"]} >= {"S104", "S902"}
+
+
 @pytest.mark.parametrize(
     ("default", "body", "expected_exit", "evidence"),
     [
