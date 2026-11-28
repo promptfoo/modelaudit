@@ -1571,6 +1571,28 @@ def test_empty_variable_string_name_attribute_is_not_truncated(tmp_path: Path) -
     assert direct_truncated is False
 
 
+def test_large_h5_empty_weight_names_preserve_later_external_references(tmp_path: Path) -> None:
+    model_path = tmp_path / "empty_layer.h5"
+    with h5py.File(model_path, "w") as f:
+        f.attrs["model_config"] = json.dumps({"class_name": "Sequential", "config": {"layers": []}})
+        weights = f.create_group("model_weights")
+        weights.attrs["layer_names"] = [b"pool", b"dense"]
+        weights.create_group("pool").attrs["weight_names"] = []
+        dense = weights.create_group("dense")
+        dense.attrs["weight_names"] = [b"kernel"]
+        dense["kernel"] = h5py.ExternalLink("external.h5", "/payload")
+    inflate_h5_file_to_size(model_path)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.success is True
+    assert any(
+        ref["hdf5_path"] == "/model_weights/dense/kernel"
+        for issue in result.issues
+        for ref in issue.details.get("external_references", [])
+    )
+
+
 def test_large_empty_variable_string_name_attributes_scan_cleanly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

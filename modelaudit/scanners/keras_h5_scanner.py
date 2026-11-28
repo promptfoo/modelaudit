@@ -120,8 +120,6 @@ def _is_variable_string(attr_id):
 def _read_variable_string(attr_id, *, max_bytes, max_items, mode, max_text_chars):
     space = attr_id.get_space()
     point_count = int(space.get_simple_extent_npoints())
-    if point_count == 0 and mode == "names":
-        return {"status": "value", "value": [], "truncated": False}
     if point_count <= 0 or point_count > max_items:
         return {"status": "skipped", "reason": "point_count_exceeded", "point_count": point_count}
 
@@ -178,6 +176,9 @@ def _read_one_attribute(h5_file, request):
         attr_id = obj.attrs.get_id(attr_name)
         space = attr_id.get_space()
         point_count = int(space.get_simple_extent_npoints())
+        # H5Aget_storage_size can raise on an empty fixed-width attribute.
+        if point_count == 0 and mode == "names":
+            return {"status": "value", "value": [], "truncated": False}
         if point_count > max_items:
             return {"status": "skipped", "reason": "point_count_exceeded", "point_count": point_count}
 
