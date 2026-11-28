@@ -293,6 +293,7 @@ DOCUMENTATION_PASSIVE_BIBLIOGRAPHY_FIELDS = frozenset(
     }
 )
 DOCUMENTATION_MARKDOWN_PREFIX_PATTERN = re.compile(rb"(?:(?:[-*+>]|[0-9]{1,9}[.)])\s+){1,8}")
+DOCUMENTATION_SIMPLE_FRONT_MATTER = re.compile(rb"\A---\r?\n[\w .:/\t\r\n-]*?(?=^---\r?\n)", re.MULTILINE)
 DOCUMENTATION_CONFIG_NETWORK_KEY = rb"(?:endpoint|callback|webhook)(?:s|[_-][A-Za-z0-9_.-]{1,128}|(?:url|uri)s?)?"
 DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
     rb"(?:^|[\s{[(,;])(?:[\"']"
@@ -2439,6 +2440,12 @@ class TextScanner(BaseScanner):
             return False
         context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
         context_start = cls._documentation_last_closed_fence_end(payload, context_start, line_start)
+        # Plain metadata cannot open a call or literal. Keep the closing line
+        # as context for calls on the first body line.
+        if context_start == 0:
+            front_matter = DOCUMENTATION_SIMPLE_FRONT_MATTER.match(payload, 0, line_start)
+            if front_matter is not None:
+                context_start = front_matter.end()
         if context_start == line_start:
             return False
         markdown_link = cls._documentation_markdown_link_context(payload, position)

