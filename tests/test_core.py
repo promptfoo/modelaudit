@@ -14121,7 +14121,12 @@ def test_scan_file_config_json_with_tokenizer_schema_still_runs_manifest_control
     assert any(
         check.name == "Blacklist Pattern Check" and check.status == CheckStatus.FAILED for check in result.checks
     )
-    assert any(check.name == "Untrusted URL Check" and check.status == CheckStatus.FAILED for check in result.checks)
+    assert any(
+        check.name == "Remote Configuration Reference"
+        and check.status == CheckStatus.FAILED
+        and check.details["key_path"] == "download_url"
+        for check in result.checks
+    )
     assert any(check.name == "Weak Hash Detection" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
