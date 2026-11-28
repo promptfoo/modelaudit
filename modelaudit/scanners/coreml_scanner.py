@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import ClassVar, NamedTuple
 
-from ..detectors.network_comm import iter_credential_urls
+from ..detectors.network_comm import METADATA_NETWORK_CALL_PATTERN, iter_credential_urls
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import (
     _COREML_DESCRIPTION_FIELD_HINTS,
@@ -26,10 +26,6 @@ from .base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner, IssueSeverity, Scan
 
 _NETWORK_TARGET_PATTERN = re.compile(
     r"(?i)\b(?:https?://|wss?://|ftp://|file://|s3://|gs://|[a-z0-9.-]+\.(?:com|net|org|io|ai)(?:/|\b))"
-)
-_NETWORK_CALL_PATTERN = re.compile(
-    r"(?i)\b(?:requests\.(?:get|post|put|request)|urllib\.request\.urlopen|socket\.connect|fetch|urlopen)"
-    r"\s*\("
 )
 _COMMAND_PATTERN = re.compile(
     r"(?i)(?:"
@@ -758,7 +754,7 @@ class CoreMLScanner(BaseScanner):
         )
 
         has_command_pattern = bool(_COMMAND_PATTERN.search(value_for_scan))
-        has_network_pattern = bool(_NETWORK_CALL_PATTERN.search(value_for_scan))
+        has_network_pattern = bool(METADATA_NETWORK_CALL_PATTERN.search(value_for_scan))
         credential_url = next(iter_credential_urls(value_for_scan), None)
         if credential_url is not None:
             result.add_check(
@@ -796,7 +792,7 @@ class CoreMLScanner(BaseScanner):
 
         if decoded_payload is not None:
             decoded_has_command = bool(_COMMAND_PATTERN.search(decoded_payload))
-            decoded_has_network = bool(_NETWORK_CALL_PATTERN.search(decoded_payload))
+            decoded_has_network = bool(METADATA_NETWORK_CALL_PATTERN.search(decoded_payload))
             severity = IssueSeverity.WARNING
             if decoded_has_command and (executable_context or has_command_pattern):
                 severity = IssueSeverity.CRITICAL
@@ -1101,7 +1097,7 @@ class CoreMLScanner(BaseScanner):
 
             has_command = bool(_COMMAND_PATTERN.search(string_value))
             has_network = bool(
-                _NETWORK_TARGET_PATTERN.search(string_value) or _NETWORK_CALL_PATTERN.search(string_value)
+                _NETWORK_TARGET_PATTERN.search(string_value) or METADATA_NETWORK_CALL_PATTERN.search(string_value)
             )
             if not (has_command or has_network):
                 continue

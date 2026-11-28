@@ -22,6 +22,13 @@ from urllib.parse import parse_qsl, unquote, unquote_plus, urlsplit, urlunsplit
 
 from modelaudit.detectors._metadata import metadata_string_spans
 
+METADATA_NETWORK_CALL_PATTERN = re.compile(
+    r"(?<![\w./-])(?:(?:requests|httpx)\.(?:get|post|put|patch|delete|request)|"
+    r"urllib\.request\.(?:urlopen|urlretrieve)|socket\.connect|(?:[a-z_]\w*\.)?fetch|urlopen)\s*\(",
+    re.IGNORECASE,
+)
+
+
 _REDACTED_PATH_TOKEN = "<redacted>"
 _URL_IN_TEXT_PATTERN = re.compile(
     r"(?:https?|ftp|ftps|ssh|telnet|ws|wss|s3|gs|az|wasbs?|abfss?)://[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+",
@@ -59,7 +66,8 @@ _URL_CREDENTIAL_PATH_KEYS = frozenset(
     {"api_key", "apikey", "x_api_key", "access_token", "refresh_token", "auth_token", "client_secret", "password"}
 )
 _URL_CREDENTIAL_HINT_PATTERN = re.compile(
-    r"[@?&#%=]|hooks\.slack\.com|token|secret|credential|api[_-]?key|password|signature|"
+    r"[@%]|hooks\.slack\.com|token|secret|credential|api[_-]?key|access[_-]?key|private[_-]?key|"
+    r"auth|bearer|password|passwd|pwd|session|cookie|signature|[?&#;](?:sig|sas)|"
     r"gh[pousr]_|github_pat_|hf_|eyJ|xox[baprs]-|sk-|AKIA",
     re.IGNORECASE,
 )

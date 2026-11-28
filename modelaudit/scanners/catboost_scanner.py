@@ -8,6 +8,7 @@ import re
 import struct
 from typing import Any, ClassVar
 
+from ..detectors.network_comm import METADATA_NETWORK_CALL_PATTERN
 from ..utils.helpers.evidence import format_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
@@ -32,10 +33,7 @@ _PROCESS_CONTEXT_PATTERN = re.compile(
     r"\b(?:cmd\.exe|powershell(?:\.exe)?|/bin/sh|/bin/bash|bash\s+-c|sh\s+-c|curl\s+|wget\s+|nc\s+|netcat\s+)\b",
     re.IGNORECASE,
 )
-_NETWORK_INVOCATION_PATTERN = re.compile(
-    r"(?i)\b(?:(?:curl|wget)\s+(?:[^\r\n]*?\s)?(?:https?|ftp)://|"
-    r"(?:requests\.(?:get|post|put|request)|urllib\.request\.urlopen|socket\.connect|urlopen)\s*\()"
-)
+_NETWORK_COMMAND_PATTERN = re.compile(r"(?i)\b(?:curl|wget)\s+(?:[^\r\n]*?\s)?(?:https?|ftp)://")
 _SCRIPT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^#!\s*/", re.MULTILINE), "shebang marker"),
     (re.compile(r"<script\b", re.IGNORECASE), "embedded HTML script"),
@@ -391,7 +389,7 @@ class CatBoostScanner(BaseScanner):
                     },
                 )
 
-            if _NETWORK_INVOCATION_PATTERN.search(text):
+            if _NETWORK_COMMAND_PATTERN.search(text) or METADATA_NETWORK_CALL_PATTERN.search(text):
                 network_matches.append(
                     {
                         "text": text,
@@ -429,9 +427,11 @@ class CatBoostScanner(BaseScanner):
                     decoded_text = ""
 
                 decoded_lower = decoded_text.lower()
-                if any(
-                    token in decoded_lower for token in ["os.system", "subprocess", "bash -c"]
-                ) or _NETWORK_INVOCATION_PATTERN.search(decoded_text):
+                if (
+                    any(token in decoded_lower for token in ["os.system", "subprocess", "bash -c"])
+                    or _NETWORK_COMMAND_PATTERN.search(decoded_text)
+                    or METADATA_NETWORK_CALL_PATTERN.search(decoded_text)
+                ):
                     encoded_matches.append(
                         {
                             "text": decoded_text or payload,

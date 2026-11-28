@@ -16,7 +16,7 @@ from modelaudit.config.name_blacklist import check_model_name_policies
 from modelaudit.core_results import mark_operational_scan_error, scan_result_has_operational_error
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 
-from ..detectors.network_comm import iter_credential_urls
+from ..detectors.network_comm import METADATA_NETWORK_CALL_PATTERN, iter_credential_urls
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from ..utils._path_hardening import _file_stat_matches
 from ..utils.file.safetensors_index import INDEX_PROBE_BYTES, is_plain_safetensors_index
@@ -1098,6 +1098,15 @@ class ManifestScanner(BaseScanner):
                         severity=IssueSeverity.INFO,
                         location=self.current_file_path,
                         details={"url": value.strip(), "key_path": key_path},
+                    )
+                elif METADATA_NETWORK_CALL_PATTERN.search(value):
+                    result.add_check(
+                        name="Config Network Invocation",
+                        passed=False,
+                        message="Network invocation found in a configuration value",
+                        severity=IssueSeverity.INFO,
+                        location=self.current_file_path,
+                        details={"key_path": key_path},
                     )
 
     def _check_weak_hashes(self, content: Any, result: ScanResult) -> None:

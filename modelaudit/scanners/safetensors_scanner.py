@@ -12,7 +12,7 @@ import struct
 from collections.abc import Iterator
 from typing import Any, ClassVar
 
-from modelaudit.detectors.network_comm import iter_credential_urls
+from modelaudit.detectors.network_comm import METADATA_NETWORK_CALL_PATTERN, iter_credential_urls
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
 from ..core_results import mark_operational_scan_error
@@ -245,6 +245,7 @@ def _safetensors_name_preview(name: str) -> tuple[str, int, bool]:
 
 
 _CODE_METADATA_PATTERNS = (
+    METADATA_NETWORK_CALL_PATTERN.pattern,
     r"eval\s*\(",
     r"exec\s*\(",
     r"__import__\s*\(",

