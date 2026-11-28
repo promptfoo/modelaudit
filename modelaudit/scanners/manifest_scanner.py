@@ -11,12 +11,12 @@ from itertools import chain
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Final, TextIO
-from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from modelaudit.config.name_blacklist import check_model_name_policies
 from modelaudit.core_results import mark_operational_scan_error, scan_result_has_operational_error
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 
+from ..detectors.network_comm import iter_credential_urls
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from ..utils._path_hardening import _file_stat_matches
 from ..utils.file.safetensors_index import INDEX_PROBE_BYTES, is_plain_safetensors_index
@@ -88,76 +88,6 @@ MODEL_NAME_KEYS_LOWER = [
     "package_name",
 ]
 
-# Cloud storage URL patterns for detecting external resource references
-# These patterns detect references to cloud storage that could indicate
-# external dependencies or potential data exfiltration vectors
-CLOUD_STORAGE_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
-    # AWS S3
-    (re.compile(r"s3://[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE), "AWS S3 URI", "s3"),
-    (
-        re.compile(r"https?://[a-zA-Z0-9.\-_]+\.s3\.amazonaws\.com(?:/[^\s\"'<>]*)?", re.IGNORECASE),
-        "AWS S3 URL",
-        "s3",
-    ),
-    (
-        re.compile(r"https?://[a-zA-Z0-9.-]+\.s3\.[a-z0-9-]+\.amazonaws\.com(?:/[^\s\"'<>]*)?", re.IGNORECASE),
-        "AWS S3 Regional URL",
-        "s3",
-    ),
-    (
-        re.compile(r"https?://[a-zA-Z0-9.-]+\.s3-[a-z0-9-]+\.amazonaws\.com(?:/[^\s\"'<>]*)?", re.IGNORECASE),
-        "AWS S3 Regional URL",
-        "s3",
-    ),
-    (
-        re.compile(r"https?://s3\.amazonaws\.com/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
-        "AWS S3 URL",
-        "s3",
-    ),
-    (
-        re.compile(r"https?://s3\.[a-z0-9-]+\.amazonaws\.com/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
-        "AWS S3 Regional URL",
-        "s3",
-    ),
-    # Google Cloud Storage
-    (re.compile(r"gs://[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE), "Google Cloud Storage URI", "gcs"),
-    (
-        re.compile(r"https?://storage\.googleapis\.com/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
-        "Google Cloud Storage URL",
-        "gcs",
-    ),
-    (
-        re.compile(r"https?://storage\.cloud\.google\.com/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
-        "Google Cloud Storage URL",
-        "gcs",
-    ),
-    # Azure Blob Storage
-    (
-        re.compile(r"https?://[a-zA-Z0-9.\-_]+\.blob\.core\.windows\.net(?:/[^\s\"'<>]*)?", re.IGNORECASE),
-        "Azure Blob Storage URL",
-        "azure",
-    ),
-    (re.compile(r"az://[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE), "Azure Storage URI", "azure"),
-    (
-        re.compile(r"wasbs?://[^\s\"'<>@]+@[a-zA-Z0-9.\-_]+\.blob\.core\.windows\.net(?:/[^\s\"'<>]*)?", re.IGNORECASE),
-        "Azure WASB URI",
-        "azure",
-    ),
-    (
-        re.compile(r"abfss?://[^\s\"'<>@]+@[a-zA-Z0-9.\-_]+\.dfs\.core\.windows\.net(?:/[^\s\"'<>]*)?", re.IGNORECASE),
-        "Azure ADLS Gen2 URI",
-        "azure",
-    ),
-    # Hugging Face Hub (external model references)
-    (
-        re.compile(r"https?://huggingface\.co/[a-zA-Z0-9.\-_]+/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
-        "HuggingFace Hub URL",
-        "huggingface",
-    ),
-]
-
-# Keys that indicate hash/checksum values used for integrity verification
-# These are used to detect weak hash algorithms (MD5, SHA1)
 HASH_INTEGRITY_KEYS = [
     "hash",
     "checksum",
@@ -209,326 +139,17 @@ class _JinjaTraversalFrame:
     visited: bool = False
 
 
-# Comprehensive allowlist of trusted domains for ML model configs
-# URLs from domains NOT in this list will be flagged as untrusted
-# This is more secure than a blocklist - attackers can't bypass by registering new domains
-#
-# MAINTENANCE: When adding domains, ensure they are:
-# 1. Established ML/AI infrastructure (not personal sites)
-# 2. Commonly referenced in model configs
-# 3. Not easily exploitable for hosting malicious content
-TRUSTED_URL_DOMAINS = [
-    # ===========================================
-    # MODEL HUBS & REPOSITORIES
-    # ===========================================
-    "huggingface.co",
-    "hf.co",
-    "github.com",
-    "raw.githubusercontent.com",
-    "gist.githubusercontent.com",
-    "objects.githubusercontent.com",
-    "github.io",
-    "gitlab.com",
-    "gitlab.io",
-    "bitbucket.org",
-    "codeberg.org",
-    "sourceforge.net",
-    # International model hubs
-    "modelscope.cn",  # Alibaba's model hub
-    "civitai.com",  # Popular for diffusion models
-    "tfhub.dev",  # TensorFlow Hub
-    # ===========================================
-    # ML FRAMEWORKS & LIBRARIES
-    # ===========================================
-    "pytorch.org",
-    "download.pytorch.org",
-    "tensorflow.org",
-    "keras.io",
-    "onnx.ai",
-    "onnxruntime.ai",
-    "scikit-learn.org",
-    "spacy.io",
-    "huggingface.co",
-    "jax.readthedocs.io",
-    # ===========================================
-    # ML OPERATIONS & EXPERIMENT TRACKING
-    # ===========================================
-    "mlflow.org",
-    "wandb.ai",
-    "neptune.ai",
-    "comet.ml",
-    "dvc.org",
-    "labelstud.io",
-    "roboflow.com",
-    "ultralytics.com",
-    "lightning.ai",
-    "ray.io",
-    "anyscale.com",
-    "determined.ai",
-    "bentoml.com",
-    "gradio.app",
-    "streamlit.io",
-    "mosaicml.com",
-    # ===========================================
-    # VECTOR DATABASES (for RAG/embeddings)
-    # ===========================================
-    "pinecone.io",
-    "weaviate.io",
-    "qdrant.tech",
-    "milvus.io",
-    "chroma.ai",
-    "lancedb.com",
-    "vespa.ai",
-    # ===========================================
-    # CLOUD STORAGE & CDNs
-    # ===========================================
-    # AWS
-    "s3.amazonaws.com",
-    "cloudfront.net",
-    # Google Cloud
-    "storage.googleapis.com",
-    "storage.cloud.google.com",
-    "googleusercontent.com",  # User content storage
-    "gcr.io",
-    # Azure
-    "blob.core.windows.net",
-    "azureedge.net",
-    "azure.com",
-    # CDNs
-    "cdn.jsdelivr.net",
-    "unpkg.com",
-    "cdnjs.cloudflare.com",
-    "fastly.net",
-    "akamaized.net",
-    "replicate.delivery",  # Replicate CDN
-    # ===========================================
-    # AI/ML COMPANIES
-    # ===========================================
-    # Major labs
-    "openai.com",
-    "anthropic.com",
-    "google.com",
-    "ai.google",
-    "deepmind.com",
-    "meta.com",
-    "ai.meta.com",
-    "llama.meta.com",
-    "microsoft.com",
-    "nvidia.com",
-    "developer.nvidia.com",
-    # Model providers
-    "stability.ai",
-    "mistral.ai",
-    "cohere.com",
-    "cohere.ai",
-    "replicate.com",
-    "together.ai",
-    "together.xyz",
-    "fireworks.ai",
-    "perplexity.ai",
-    "ai21.com",  # AI21 Labs
-    "aleph-alpha.com",
-    "runwayml.com",
-    "midjourney.com",
-    # ML platforms
-    "databricks.com",
-    "snowflake.com",
-    "datarobot.com",
-    "h2o.ai",
-    "clarifai.com",
-    "scale.com",
-    "labelbox.com",
-    "appen.com",
-    "sagemaker.aws",
-    "vertexai.google.com",
-    # ===========================================
-    # RESEARCH ORGANIZATIONS
-    # ===========================================
-    "arxiv.org",
-    "paperswithcode.com",
-    "semanticscholar.org",
-    "aclanthology.org",
-    "neurips.cc",
-    "openreview.net",
-    "ieee.org",
-    "acm.org",
-    "springer.com",
-    "nature.com",
-    "sciencedirect.com",
-    "researchgate.net",
-    # Non-profit AI research
-    "eleuther.ai",
-    "laion.ai",
-    "allenai.org",
-    "bigscience.huggingface.co",
-    # ===========================================
-    # DATASETS & DATA PLATFORMS
-    # ===========================================
-    "kaggle.com",
-    "zenodo.org",
-    "dataverse.harvard.edu",
-    "data.world",
-    "registry.opendata.aws",
-    "commoncrawl.org",
-    "ftp.ncbi.nlm.nih.gov",
-    "physionet.org",
-    "image-net.org",
-    "cocodataset.org",
-    "visualgenome.org",
-    "lvis-dataset.org",
-    "openimages.github.io",
-    # Academic CS departments (common dataset hosts)
-    "cs.stanford.edu",
-    "cs.cmu.edu",
-    "cs.berkeley.edu",
-    "cs.toronto.edu",
-    "cs.nyu.edu",
-    "yann.lecun.com",
-    "people.eecs.berkeley.edu",
-    "nlp.stanford.edu",
-    "vision.stanford.edu",
-    # ===========================================
-    # PACKAGE REPOSITORIES
-    # ===========================================
-    "pypi.org",
-    "files.pythonhosted.org",
-    "anaconda.org",
-    "conda.anaconda.org",
-    "npmjs.com",
-    "crates.io",
-    "packagist.org",
-    "rubygems.org",
-    "mvnrepository.com",
-    # ===========================================
-    # DOCUMENTATION
-    # ===========================================
-    "readthedocs.io",
-    "readthedocs.org",
-    "rtfd.io",
-    "gitbook.io",
-    "docs.python.org",
-    # ===========================================
-    # CONTAINER REGISTRIES
-    # ===========================================
-    "docker.io",
-    "docker.com",
-    "quay.io",
-    "ghcr.io",
-    "nvcr.io",
-    "registry.hub.docker.com",
-    "ecr.aws",
-    # ===========================================
-    # PLACEHOLDER/EXAMPLE DOMAINS (RFC 2606)
-    # These are reserved and commonly used in examples
-    # ===========================================
-    "example.com",
-    "example.org",
-    "example.net",
-    # ===========================================
-    # LOCALHOST (for development/testing)
-    # ===========================================
-    "localhost",
-    "127.0.0.1",
-    "0.0.0.0",
-]
+# Configuration fields that designate an endpoint or an external model artifact.
+_REMOTE_CONFIG_FIELD = re.compile(
+    r"(?:callback|webhook|endpoint|(?:download|model|weights|checkpoint|adapter|mirror|inference|callback|webhook|"
+    r"endpoint|upload)[_-]?(?:url|uri)s?)",
+    re.IGNORECASE,
+)
+_REMOTE_CONFIG_VALUE = re.compile(r"(?:https?|s3a?|gs|az|abfss?|wasbs?|ftp)://[^\s<>\"']+", re.IGNORECASE)
 
-# Broad user-content hosting domains should only trust the exact host, not
-# arbitrary attacker-controlled subdomains.
-TRUSTED_URL_EXACT_DOMAINS = {
-    # CDNs — anyone can provision an endpoint
-    "akamaized.net",
-    "azureedge.net",
-    "cloudfront.net",
-    "fastly.net",
-    # User-content hosting — arbitrary subdomains are attacker-controlled
-    "ghcr.io",
-    "gitbook.io",
-    "github.io",
-    "gitlab.io",
-    "googleusercontent.com",
-    "gradio.app",
-    "nvcr.io",
-    "quay.io",
-    "readthedocs.io",
-    "rtfd.io",
-    "sourceforge.net",
-    "streamlit.io",
-}
-_NORMALIZED_TRUSTED_URL_DOMAINS: Final[frozenset[str]] = frozenset(
-    domain.lower().rstrip(".") for domain in TRUSTED_URL_DOMAINS
-)
-_NORMALIZED_TRUSTED_URL_EXACT_DOMAINS: Final[frozenset[str]] = frozenset(
-    domain.lower().rstrip(".") for domain in TRUSTED_URL_EXACT_DOMAINS
-)
-_TRUSTED_URL_SUBDOMAIN_SUFFIXES: Final[tuple[str, ...]] = tuple(
-    dict.fromkeys(
-        normalized_domain
-        for domain in TRUSTED_URL_DOMAINS
-        if (normalized_domain := domain.lower().rstrip(".")) not in _NORMALIZED_TRUSTED_URL_EXACT_DOMAINS
-    )
-)
-
-# Regex to find URLs in text
-URL_PATTERN = re.compile(r'https?://[^\s<>"\']+[^\s<>"\',.]')
-_AWS_S3_REGION_PATTERN = r"[a-z]{2}(?:-[a-z0-9]+)+-\d"
-_S3_HOST_LABEL_PATTERN = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-_S3_BUCKET_HOST_PREFIX_PATTERN = rf"{_S3_HOST_LABEL_PATTERN}(?:\.{_S3_HOST_LABEL_PATTERN})*"
-_TRUSTED_S3_ENDPOINT_HOST_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(rf"^{_S3_BUCKET_HOST_PREFIX_PATTERN}\.s3\.amazonaws\.com$"),
-    re.compile(rf"^{_S3_BUCKET_HOST_PREFIX_PATTERN}\.s3\.{_AWS_S3_REGION_PATTERN}\.amazonaws\.com$"),
-    re.compile(rf"^{_S3_BUCKET_HOST_PREFIX_PATTERN}\.s3-{_AWS_S3_REGION_PATTERN}\.amazonaws\.com$"),
-)
 _PARSE_FAILED: Final = object()
 _HF_DOWNLOAD_RECORD: Final = object()
 _INI_SECTION_HEADER_RE = re.compile(r"^\s*\[[A-Za-z0-9_. -]+\]\s*(?:[#;].*)?(?:\r?\n|$)")
-
-
-def _redact_url_for_display(url: str) -> str:
-    """Strip credential-bearing URL components before storing scan output."""
-    try:
-        parts = urlsplit(url)
-    except Exception:
-        return "<url redacted>"
-
-    if not parts.scheme:
-        return url
-
-    netloc = parts.netloc
-    if "@" in parts.netloc:
-        netloc = parts.hostname or ""
-        try:
-            port = parts.port
-        except ValueError:
-            port = None
-        if port is not None:
-            netloc = f"{netloc}:{port}"
-        netloc = f"<credentials-redacted>@{netloc}"
-
-    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
-
-
-def _is_trusted_url_domain(url: str) -> bool:
-    """Check if a URL host is in the trusted domain allowlist."""
-    parsed = urlparse(url)
-
-    # URLs with userinfo (user@host) are inherently suspicious — an attacker
-    # can craft https://evil.com@github.com/payload where urlparse sees the
-    # hostname as github.com while the visual target appears to be evil.com.
-    if parsed.username or parsed.password:
-        return False
-
-    host = (parsed.hostname or "").lower().rstrip(".")
-    if not host:
-        return False
-
-    # Return True for supported S3 endpoint host layouts only.
-    if any(pattern.match(host) for pattern in _TRUSTED_S3_ENDPOINT_HOST_PATTERNS):
-        return True
-
-    if host in _NORMALIZED_TRUSTED_URL_DOMAINS:
-        return True
-
-    return any(host.endswith(f".{trusted}") for trusted in _TRUSTED_URL_SUBDOMAIN_SUFFIXES)
 
 
 def _matches_hf_download_metadata(path: Path, text: str, handle: TextIO) -> bool:
@@ -685,10 +306,6 @@ class ManifestScanner(BaseScanner):
                 return result
             self._check_timeout()
 
-            # Check for cloud storage URLs (external resource references)
-            self._check_cloud_storage_urls(path, result)
-            self._check_timeout()
-
             # Parse the file based on its extension
             ext = os.path.splitext(path)[1].lower()
             content = self._parse_file(path, ext, result)
@@ -758,8 +375,7 @@ class ManifestScanner(BaseScanner):
                 check_fairseq_expressions(content, result, self.current_file_path, self._check_timeout)
                 self._check_timeout()
 
-                # Check for suspicious URLs in config values
-                self._check_suspicious_urls(content, result)
+                self._check_remote_configuration(content, result)
                 self._check_timeout()
 
                 # Check for weak hash algorithms used for integrity verification
@@ -1420,75 +1036,6 @@ class ManifestScanner(BaseScanner):
 
         check_value(content)
 
-    def _check_cloud_storage_urls(self, path: str, result: ScanResult) -> None:
-        """Check for cloud storage URLs (external resource references).
-
-        Detects references to AWS S3, Google Cloud Storage, Azure Blob Storage,
-        and other external resources that could indicate:
-        - External model dependencies
-        - Potential data exfiltration vectors
-        - Supply chain risks from external resources
-        """
-        try:
-            content = self._read_manifest_text(path)
-
-            self._check_timeout()
-            seen_urls: set[str] = set()
-
-            for pattern, description, provider in CLOUD_STORAGE_PATTERNS:
-                self._check_timeout()
-                for match in pattern.finditer(content):
-                    self._check_timeout()
-                    url = match.group()
-
-                    # Skip duplicates
-                    if url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-
-                    # Determine severity based on context
-                    # INFO for most cloud URLs (informational - may be legitimate)
-                    severity = IssueSeverity.INFO
-
-                    # Check for suspicious indicators that might elevate severity
-                    url_lower = url.lower()
-                    suspicious_indicators = ["malware", "exploit", "hack", "evil", "backdoor", "exfil"]
-                    if any(indicator in url_lower for indicator in suspicious_indicators):
-                        severity = IssueSeverity.WARNING
-
-                    display_url = _redact_url_for_display(url)
-                    result.add_check(
-                        name="Cloud Storage URL Detection",
-                        passed=False,  # Finding a cloud URL is informational, not a pass/fail
-                        message=f"{description} detected: {display_url[:150]}",
-                        severity=severity,
-                        location=self.current_file_path,
-                        details={
-                            "url": display_url,
-                            "provider": provider,
-                            "description": description,
-                        },
-                        why=(
-                            "External cloud storage references in model configs may indicate external "
-                            "dependencies or potential supply chain risks. Verify that these URLs point "
-                            "to trusted sources and are required for model operation."
-                        ),
-                    )
-
-        except TimeoutError:
-            raise
-        except (OSError, UnicodeError) as e:
-            self._record_read_failure(
-                result,
-                path,
-                e,
-                reason="manifest_cloud_storage_read_failed",
-                check_name="Cloud Storage URL Detection",
-                message="Unable to load manifest text for cloud storage URL analysis",
-            )
-        except Exception as e:
-            logger.debug(f"Error checking cloud storage URLs in {path}: {e}")
-
     def _read_manifest_text(self, path: str) -> str:
         cached_content = getattr(self, "_manifest_text_cache", {}).get(path)
         if cached_content is not None:
@@ -1509,69 +1056,49 @@ class ManifestScanner(BaseScanner):
             self._manifest_text_cache[path] = content
         return content
 
-    def _check_suspicious_urls(self, content: Any, result: ScanResult) -> None:
-        """Check for untrusted URLs in config values using allowlist approach.
-
-        Only URLs from trusted domains (huggingface, github, pytorch, etc.) are allowed.
-        Any URL from a domain NOT in the allowlist is flagged.
-
-        This is more secure than a blocklist because attackers cannot bypass
-        detection by registering new domains.
-        """
-        seen_urls: set[str] = set()
-        visited_containers: set[int] = set()
-
-        def is_trusted_domain(url: str) -> bool:
-            """Check if URL host is in the trusted domain allowlist."""
-            return _is_trusted_url_domain(url)
-
-        def extract_urls_from_value(value: Any, key_path: str) -> None:
-            """Recursively extract and check URLs from any value type."""
+    def _check_remote_configuration(self, content: Any, result: ScanResult) -> None:
+        """Check explicit destination fields and credentials in parsed config values."""
+        pending = [(content, "", False)]
+        visited: set[tuple[int, bool]] = set()
+        while pending:
             self._check_timeout()
+            value, key_path, remote_field = pending.pop()
             if isinstance(value, (dict, list)):
-                container_id = id(value)
-                if container_id in visited_containers:
-                    return
-                visited_containers.add(container_id)
-
-            if isinstance(value, str):
-                urls = URL_PATTERN.findall(value)
-                for url in urls:
-                    self._check_timeout()
-                    if url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    # Flag any URL not from a trusted domain
-                    if not is_trusted_domain(url):
-                        display_url = _redact_url_for_display(url)
-                        result.add_check(
-                            name="Untrusted URL Check",
-                            passed=False,
-                            message=f"URL from untrusted domain: {display_url}",
-                            severity=IssueSeverity.INFO,
-                            location=self.current_file_path,
-                            details={
-                                "url": display_url,
-                                "key_path": key_path,
-                            },
-                            why=(
-                                "This URL is from a domain not in the trusted allowlist. "
-                                "ML model configs should only reference well-known sources. "
-                                "Unknown domains may indicate supply chain attacks or "
-                                "data exfiltration attempts."
-                            ),
-                        )
-
-            elif isinstance(value, dict):
-                for k, v in value.items():
-                    key_text = str(k)
-                    new_path = f"{key_path}.{key_text}" if key_path else key_text
-                    extract_urls_from_value(v, new_path)
+                identity = (id(value), remote_field)
+                if identity in visited:
+                    continue
+                visited.add(identity)
+            if isinstance(value, dict):
+                pending.extend(
+                    (
+                        item,
+                        f"{key_path}.{key}" if key_path else str(key),
+                        remote_field or _REMOTE_CONFIG_FIELD.fullmatch(str(key)) is not None,
+                    )
+                    for key, item in value.items()
+                )
             elif isinstance(value, list):
-                for i, item in enumerate(value):
-                    extract_urls_from_value(item, f"{key_path}[{i}]")
-
-        extract_urls_from_value(content, "")
+                pending.extend((item, f"{key_path}[{index}]", remote_field) for index, item in enumerate(value))
+            elif isinstance(value, str):
+                credential_url = next(iter_credential_urls(value), None)
+                if credential_url is not None:
+                    result.add_check(
+                        name="Config URL Credential Check",
+                        passed=False,
+                        message="Credential material found in a configuration URL",
+                        severity=IssueSeverity.WARNING,
+                        location=self.current_file_path,
+                        details={"url": credential_url, "key_path": key_path},
+                    )
+                elif remote_field and _REMOTE_CONFIG_VALUE.fullmatch(value.strip()) is not None:
+                    result.add_check(
+                        name="Remote Configuration Reference",
+                        passed=False,
+                        message="Configuration specifies a remote destination or model artifact",
+                        severity=IssueSeverity.INFO,
+                        location=self.current_file_path,
+                        details={"url": value.strip(), "key_path": key_path},
+                    )
 
     def _check_weak_hashes(self, content: Any, result: ScanResult) -> None:
         """Check for weak hash algorithms (MD5, SHA1) used for integrity verification.

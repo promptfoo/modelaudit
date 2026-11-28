@@ -35,7 +35,8 @@ from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 from modelaudit.scanners.text_scanner_support.documentation_examples import routine_documentation_network_spans
 from modelaudit.scanners.text_scanner_support.model_card_policy import (
     disclosure_has_harmful_claim,
-    model_card_policy_evidence,
+    displayed_license,
+    model_card_prohibited_terms,
 )
 from modelaudit.utils.helpers.evidence import format_evidence_string
 
@@ -148,46 +149,6 @@ BARE_NETWORK_TOKEN_PATTERNS = (
     BARE_NETWORK_IPV6_TOKEN_PATTERN,
     BARE_NETWORK_DOMAIN_TOKEN_PATTERN,
 )
-DOCUMENTATION_BARE_DOMAIN_TLDS = frozenset(
-    {
-        "ai",
-        "app",
-        "au",
-        "ca",
-        "cc",
-        "cf",
-        "ch",
-        "cn",
-        "co",
-        "com",
-        "de",
-        "dev",
-        "edu",
-        "es",
-        "example",
-        "fr",
-        "ga",
-        "gov",
-        "int",
-        "io",
-        "it",
-        "jp",
-        "mil",
-        "ml",
-        "net",
-        "nl",
-        "no",
-        "org",
-        "pw",
-        "ru",
-        "se",
-        "tk",
-        "to",
-        "uk",
-        "us",
-        "xyz",
-    }
-)
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
 MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 64
 MAX_TEXT_FENCE_CONTEXT_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 64
@@ -213,6 +174,26 @@ _DOCUMENTATION_QUOTE_WINDOWS: ContextVar[tuple[bytes, dict[int, tuple[memoryview
     "documentation_quote_windows", default=None
 )
 
+
+# A continuation must have a preceding code or configuration opener. In particular,
+# prose parentheses and previous Markdown links cannot open a multiline call.
+_TEXT_ENDPOINT_CONTEXT = re.compile(
+    rb"(?im)(?:^|;)[ \t]*(?:>>>[ \t]*|[$#][ \t]+)?(?:"
+    rb"(?:(?:async[ \t]+)?with[ \t]+|[\w.]+[ \t]*=[ \t]*)?[\w.]+(?:\[\d+\])?\(|"
+    rb"[\w.]+[ \t]*=[ \t]*(?:[rubf]*[\"'`\[({]|$)|"
+    rb"(?:return|yield|lambda|class|def)\b|"
+    rb"(?:\{[ \t]*|[-*+][ \t]+)?[\"']?(?:endpoint|callback|webhook)[\w.-]*[\"']?\s*:|"
+    rb"<(?:[\w.-]+:)?(?:endpoint|callback|webhook)\b|"
+    rb"[^\r\n]*\\[ \t]*$)"
+)
+_TEXT_ENDPOINT_INLINE_CONTEXT = re.compile(
+    rb"(?i)(?:\b(?:curl|wget|ssh|nc|ncat|netcat|git|pip|npm|cargo|docker|go|fetch|download|"
+    rb"invoke-webrequest|invoke-restmethod|iwr|irm|certutil|add)(?:\.exe)?(?:\s|[\"'])|"
+    rb"<(?:iframe|link|script)\b|[\w.]+\s*=|\b(?:endpoint|callback|webhook|command and control server URL)\b[^\r\n]*:|"
+    rb"\$\([^\r\n]*$)"
+)
+
+_SQL_CONNECTION_PREFIX = re.compile(rb"""(?i)\bdblink\s*\(\s*['"]host\s*=\s*$""")
 
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
@@ -253,10 +234,6 @@ DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN = re.compile(rb"!?\[[^\]\r\n]{0,4
 DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN = re.compile(rb"(?im)^\s*@[A-Za-z][A-Za-z0-9_-]*\s*\{")
 DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN = re.compile(
     rb"(?:^|[,{])\s*(?P<field>[A-Za-z][A-Za-z0-9_-]*)\s*=\s*(?P<delimiter>[{\"']?)[^,\r\n]{0,4096}$",
-    re.IGNORECASE,
-)
-DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN = re.compile(
-    rb"(?:^|[,{])\s*url\s*=\s*(?P<delimiter>[{\"']?)\s*$",
     re.IGNORECASE,
 )
 DOCUMENTATION_PASSIVE_BIBLIOGRAPHY_FIELDS = frozenset(
@@ -2518,12 +2495,45 @@ class TextScanner(BaseScanner):
         return False
 
     @classmethod
-    def _documentation_nested_config_contains_position(cls, payload: bytes, position: int) -> bool:
+    def _text_endpoint_is_active(cls, path: str, payload: bytes, position: int) -> bool:
         line_start = payload.rfind(b"\n", 0, position) + 1
+        probe_start = max(line_start, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        prefix = payload[probe_start:position]
+        if os.path.basename(path).lower() == "requirements.txt":
+            line_end = min(len(payload), position + MAX_TEXT_FINDING_CONTEXT_BYTES)
+            requirement = payload[probe_start:line_end].split(b"\n", 1)[0].lstrip()
+            if requirement.startswith(b"#") or b" #" in prefix:
+                return False
+            if (
+                REQUIREMENTS_URL_DIRECTIVE_PATTERN.match(requirement)
+                or REQUIREMENTS_DIRECT_REFERENCE_PATTERN.match(requirement)
+                or requirement.startswith((b"--trusted-host ", b"--trusted-host=", b"https://", b"http://", b"git+"))
+            ):
+                return True
+        if cls._documentation_prefix_is_markdown_table_row(prefix):
+            return False
+        # The start of a long literal may be outside the local prefix window.
         context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
-        if context_start > 0:
-            context_start = payload.rfind(b"\n", 0, context_start) + 1
-        return cls._documentation_nested_config_is_actionable(payload[context_start:position])
+        context_end = min(position, line_start + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        if probe_start == line_start:
+            markdown_link = DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN.search(prefix)
+            if markdown_link is not None:
+                prefix = prefix[: markdown_link.start()]
+                context_end = line_start + len(prefix)
+        line_end = payload.find(b"\n", position, position + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        if line_end < 0:
+            line_end = min(len(payload), position + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        if (
+            _TEXT_ENDPOINT_CONTEXT.search(payload, context_start, context_end) is None
+            and _TEXT_ENDPOINT_INLINE_CONTEXT.search(prefix) is None
+            and payload.find(b"xargs", position, line_end) < 0
+        ):
+            return False
+        try:
+            return cls._documentation_finding_is_actionable(payload, {"position": position})
+        except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded):
+            # Keep evidence from a potential active context. The reporting pass records the limit.
+            return True
 
     @classmethod
     def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
@@ -2538,6 +2548,8 @@ class TextScanner(BaseScanner):
             return False
         if cls._documentation_position_is_in_passive_bibliography_field(payload, position):
             return False
+        if _SQL_CONNECTION_PREFIX.search(payload, max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES), position):
+            return True
         if cls._documentation_multiline_return_contains_position(payload, position):
             return True
         if cls._documentation_position_is_in_actionable_markdown_link_context(payload, position):
@@ -2546,6 +2558,15 @@ class TextScanner(BaseScanner):
             return True
         if cls._documentation_position_is_in_passive_markdown_link(payload, position):
             return False
+        # A tracker number on a text line inside an open call can look like a shell comment.
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        line_prefix = payload[max(line_start, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
+        if (
+            re.search(rb"(?<!\w)#\d+", line_prefix)
+            and not line_prefix.lstrip().startswith(b"#")
+            and cls._documentation_open_call_contains_position(payload, line_start)
+        ):
+            return True
         call_context = cls._documentation_open_call_context_status(payload, position)
         if call_context is not False:
             if call_context is None:
@@ -2711,12 +2732,9 @@ class TextScanner(BaseScanner):
         routine_spans: tuple[tuple[int, int], ...] = (),
         prohibited_terms: frozenset[int] = frozenset(),
         sql_regions: Sequence[tuple[int, int]] = (),
-        active_policy_spans: Sequence[tuple[int, int]] = (),
     ) -> tuple[dict[str, Any], bool, int]:
         finding_type = finding.get("type")
-        token_bytes_options = cls._documentation_finding_tokens(
-            finding, routine_spans, bool(sql_regions or active_policy_spans)
-        )
+        token_bytes_options = cls._documentation_finding_tokens(finding, routine_spans, bool(sql_regions))
         if not token_bytes_options:
             return finding, False, remaining_occurrences
 
@@ -2761,12 +2779,9 @@ class TextScanner(BaseScanner):
                 actionable = not cls._documentation_network_library_is_prose(payload, candidate)
             elif finding_type == "domain_name":
                 # The detector emits only the first occurrence of a hostname.
-                actionable = cls._routine_span_contains(active_policy_spans, position) or (
-                    not cls._routine_span_contains(routine_spans, position)
-                    and (
-                        cls._routine_span_contains(sql_regions, position)
-                        or cls._documentation_finding_is_actionable(payload, candidate)
-                    )
+                actionable = not cls._routine_span_contains(routine_spans, position) and (
+                    cls._routine_span_contains(sql_regions, position)
+                    or cls._documentation_finding_is_actionable(payload, candidate)
                 )
             elif finding_type == "suspicious_port":
                 actionable = cls._documentation_finding_is_actionable(payload, candidate)
@@ -3244,16 +3259,6 @@ class TextScanner(BaseScanner):
         return passive
 
     @staticmethod
-    def _all_network_candidate_lines_are_bare(payload: bytes) -> bool:
-        for line in payload.splitlines():
-            stripped = line.strip()
-            if not stripped or not any(pattern.search(stripped) for pattern in BARE_NETWORK_TOKEN_PATTERNS):
-                continue
-            if b"@" in stripped or not any(pattern.fullmatch(stripped) for pattern in BARE_NETWORK_TOKEN_PATTERNS):
-                return False
-        return True
-
-    @staticmethod
     def _documentation_position_is_in_bibliography_entry(
         payload: bytes,
         line_start: int,
@@ -3308,98 +3313,6 @@ class TextScanner(BaseScanner):
             )
         return field in DOCUMENTATION_PASSIVE_BIBLIOGRAPHY_FIELDS
 
-    @classmethod
-    def _documentation_bibliography_url_field_is_passive(
-        cls,
-        payload: bytes,
-        line_start: int,
-        line: bytes,
-        position: int,
-    ) -> bool:
-        url_match = DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN.search(line[:position])
-        if url_match is None or not cls._documentation_position_is_in_bibliography_entry(
-            payload,
-            line_start,
-            line_start + position,
-        ):
-            return False
-        delimiter = url_match.group("delimiter")
-        return delimiter not in {b'"', b"'"} or cls._documentation_bibliography_entry_closes_after_position(
-            payload,
-            line_start + position,
-        )
-
-    @classmethod
-    def _documentation_network_token_lines_are_passive(cls, payload: bytes) -> bool:
-        line_start = 0
-        while line_start <= len(payload):
-            line_end = payload.find(b"\n", line_start)
-            if line_end < 0:
-                line_end = len(payload)
-            line = payload[line_start:line_end]
-            url_spans: list[tuple[int, int]] = []
-            for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line):
-                url_spans.append((match.start(), match.end()))
-                if cls._documentation_bibliography_url_field_is_passive(payload, line_start, line, match.start()):
-                    continue
-                absolute_position = line_start + match.start()
-                if (
-                    cls._documentation_line_is_code_shaped(
-                        line,
-                        match.start(),
-                    )
-                    or cls._documentation_multiline_return_contains_position(
-                        payload,
-                        absolute_position,
-                    )
-                    or cls._documentation_open_call_contains_position(payload, absolute_position)
-                    or cls._documentation_multiline_literal_contains_position(payload, absolute_position)
-                    or cls._documentation_nested_config_contains_position(payload, absolute_position)
-                ):
-                    return False
-            for pattern in (
-                BARE_NETWORK_IPV4_TOKEN_PATTERN,
-                BARE_NETWORK_IPV6_TOKEN_PATTERN,
-                BARE_NETWORK_DOMAIN_TOKEN_PATTERN,
-            ):
-                for match in pattern.finditer(line):
-                    if any(start <= match.start() < end for start, end in url_spans):
-                        continue
-                    if pattern is BARE_NETWORK_DOMAIN_TOKEN_PATTERN:
-                        if cls._documentation_position_is_in_passive_bibliography_field(
-                            payload,
-                            line_start + match.start(),
-                        ):
-                            continue
-                        before = line[match.start() - 1 : match.start()] if match.start() > 0 else b""
-                        after = line[match.end() : match.end() + 1]
-                        if before in {b".", b"_"} or after in {b".", b"_"}:
-                            continue
-                        tld = match.group().rsplit(b".", 1)[-1].decode("utf-8", errors="ignore").casefold()
-                        if tld not in DOCUMENTATION_BARE_DOMAIN_TLDS:
-                            if DOCUMENTATION_CONFIG_MAPPING_PREFIX_PATTERN.search(line[: match.start()]) is not None:
-                                return False
-                            continue
-                    absolute_position = line_start + match.start()
-                    if (
-                        cls._documentation_line_is_code_shaped(
-                            line,
-                            match.start(),
-                        )
-                        or cls._documentation_multiline_return_contains_position(
-                            payload,
-                            absolute_position,
-                        )
-                        or cls._documentation_open_call_contains_position(payload, absolute_position)
-                        or cls._documentation_multiline_literal_contains_position(payload, absolute_position)
-                        or cls._documentation_nested_config_contains_position(payload, absolute_position)
-                    ):
-                        return False
-            if line_end == len(payload):
-                break
-            line_start = line_end + 1
-        return True
-
     @staticmethod
     def _split_detector_finding_limit(
         findings: list[dict[str, Any]],
@@ -3411,34 +3324,6 @@ class TextScanner(BaseScanner):
         return (
             [finding for finding in findings if finding.get("type") != DETECTOR_FINDING_LIMIT_TYPE],
             limit_finding,
-        )
-
-    @classmethod
-    def _passive_network_reporting_limit(
-        cls,
-        path: str,
-        payload: bytes,
-        findings: list[dict[str, Any]],
-        finding_limit: dict[str, Any],
-    ) -> bool:
-        if finding_limit.get(
-            "truncated_finding_type"
-        ) == "endpoint_redaction_classification" and cls._is_documentation_sidecar(path):
-            try:
-                return all(
-                    cls._sidecar_network_finding_is_informational(path, payload, finding) for finding in findings
-                ) and cls._documentation_network_token_lines_are_passive(payload)
-            except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded):
-                return False
-        if finding_limit.get("truncated_finding_type") not in PASSIVE_NETWORK_FINDING_TYPES:
-            return False
-        truncated_finding = finding_limit.get("truncated_finding")
-        return (
-            cls._is_passive_data_sidecar(path)
-            and all(finding.get("severity") == "INFO" for finding in findings)
-            and isinstance(truncated_finding, dict)
-            and cls._is_bare_data_network_token(payload, truncated_finding)
-            and cls._all_network_candidate_lines_are_bare(payload)
         )
 
     @classmethod
@@ -4043,6 +3928,7 @@ class TextScanner(BaseScanner):
         *,
         allow_documentation_image_examples: bool = False,
         payload_complete: bool = True,
+        policy_bounds: tuple[int, int] = (0, 0),
     ) -> tuple[list[dict[str, Any]], bool, set[str]]:
         classified_findings: list[dict[str, Any]] = []
         classification_incomplete = False
@@ -4052,7 +3938,6 @@ class TextScanner(BaseScanner):
         filename = os.path.basename(path).lower()
         routine_network_spans: tuple[tuple[int, int], ...] = ()
         sql_regions: list[tuple[int, int]] = []
-        active_policy_spans: list[tuple[int, int]] = []
         prohibited_terms: frozenset[int] = frozenset()
         if (
             findings
@@ -4062,18 +3947,18 @@ class TextScanner(BaseScanner):
             examples = routine_documentation_network_spans(
                 payload, payload_complete=payload_complete, sql_regions=sql_regions
             )
-            if payload_complete:
+            if payload_complete and any(
+                f.get("type") == "cc_pattern" and f.get("pattern") == "malware" for f in findings
+            ):
                 try:
-                    references, active_policy_spans, prohibited_terms = model_card_policy_evidence(
+                    prohibited_terms = model_card_prohibited_terms(
                         payload,
                         DOCUMENTATION_HARMFUL_BEHAVIOR_CLAIM_PATTERN,
                         cls._documentation_policy_reference_actionability,
                     )
-                    if any(f.get("type") == "cc_pattern" and f.get("pattern") == "malware" for f in findings):
-                        position = cls._responsible_ai_misuse_term_position(payload)
-                        if position is not None:
-                            prohibited_terms |= {position}
-                    examples = (*examples, *references)
+                    position = cls._responsible_ai_misuse_term_position(payload)
+                    if position is not None:
+                        prohibited_terms |= {position}
                 except (_DocumentationCallBudgetExceeded, _DocumentationQuoteBudgetExceeded) as error:
                     classification_incomplete = True
                     classification_limit_sources.add(error.limit_source)
@@ -4098,9 +3983,7 @@ class TextScanner(BaseScanner):
             (
                 index
                 for index, finding in enumerate(findings)
-                if cls._documentation_finding_tokens(
-                    finding, routine_network_spans, bool(sql_regions or active_policy_spans)
-                )
+                if cls._documentation_finding_tokens(finding, routine_network_spans, bool(sql_regions))
             ),
             default=-1,
         )
@@ -4118,7 +4001,6 @@ class TextScanner(BaseScanner):
                         routine_network_spans,
                         prohibited_terms,
                         sql_regions,
-                        active_policy_spans,
                     )
                     # The first occurrence was routine. Retargeting found an actionable use of the same host.
                     if (
@@ -4152,7 +4034,7 @@ class TextScanner(BaseScanner):
             if (
                 isinstance(position, int)
                 and finding.get("type") in PASSIVE_NETWORK_FINDING_TYPES
-                and cls._routine_span_contains(active_policy_spans, position)
+                and policy_bounds[0] <= position < policy_bounds[1]
             ):
                 classified_findings.append(finding)
                 continue
@@ -4361,11 +4243,19 @@ class TextScanner(BaseScanner):
 
         if check_network:
             try:
+                policy_offset, policy_body = displayed_license(inspected_payload)
+
+                def endpoint_is_active(position: int) -> bool:
+                    if policy_offset <= position < policy_offset + len(policy_body):
+                        return self._text_endpoint_is_active(path, policy_body, position - policy_offset)
+                    return self._text_endpoint_is_active(path, inspected_payload, position)
+
                 network_findings = self.collect_network_communication_findings(
                     inspected_payload,
                     path,
                     raise_on_error=True,
                     max_findings=max_findings,
+                    endpoint_is_active=endpoint_is_active,
                 )
                 network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
                 allow_documentation_image_examples = (
@@ -4381,6 +4271,7 @@ class TextScanner(BaseScanner):
                         network_findings,
                         allow_documentation_image_examples=allow_documentation_image_examples,
                         payload_complete=not truncated,
+                        policy_bounds=(policy_offset, policy_offset + len(policy_body)),
                     )
                 )
                 network_findings = self._deduplicate_documentation_network_findings(
@@ -4438,33 +4329,14 @@ class TextScanner(BaseScanner):
                         details=classification_details,
                     )
                 if finding_limit is not None:
-                    if self._passive_network_reporting_limit(
+                    detector_incomplete = True
+                    self._mark_content_security_scan_incomplete(
+                        result,
                         path,
-                        inspected_payload,
-                        network_findings,
-                        finding_limit,
-                    ):
-                        result.add_check(
-                            name="Network Communication Reporting Limit",
-                            passed=False,
-                            message="Passive network references exceeded the reporting limit",
-                            severity=IssueSeverity.INFO,
-                            location=path,
-                            details={
-                                **finding_limit,
-                                "analysis_incomplete": False,
-                                "reporting_incomplete": True,
-                            },
-                        )
-                    else:
-                        detector_incomplete = True
-                        self._mark_content_security_scan_incomplete(
-                            result,
-                            path,
-                            reason=TEXT_CONTENT_SECURITY_FINDING_LIMIT_REASON,
-                            message="Network communication findings exceeded the configured reporting limit",
-                            details=finding_limit,
-                        )
+                        reason=TEXT_CONTENT_SECURITY_FINDING_LIMIT_REASON,
+                        message="Network communication findings exceeded the configured reporting limit",
+                        details=finding_limit,
+                    )
             except Exception as error:
                 detector_incomplete = True
                 redacted_error = redact_untrusted_error_message(error)

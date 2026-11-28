@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import base64
-import ipaddress
 import os
 import re
 import struct
 from typing import Any, ClassVar
-from urllib.parse import urlparse
 
 from ..utils.helpers.evidence import format_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
@@ -34,9 +32,10 @@ _PROCESS_CONTEXT_PATTERN = re.compile(
     r"\b(?:cmd\.exe|powershell(?:\.exe)?|/bin/sh|/bin/bash|bash\s+-c|sh\s+-c|curl\s+|wget\s+|nc\s+|netcat\s+)\b",
     re.IGNORECASE,
 )
-_URL_PATTERN = re.compile(r"\b(?:https?|ftp)://[^\s\"'<>]{4,}", re.IGNORECASE)
-_IPV4_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{2,5})?\b")
-_IPV6_PATTERN = re.compile(r"(?<![0-9a-f:])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?![0-9a-f:])", re.IGNORECASE)
+_NETWORK_INVOCATION_PATTERN = re.compile(
+    r"(?i)\b(?:(?:curl|wget)\s+(?:[^\r\n]*?\s)?(?:https?|ftp)://|"
+    r"(?:requests\.(?:get|post|put|request)|urllib\.request\.urlopen|socket\.connect|urlopen)\s*\()"
+)
 _SCRIPT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^#!\s*/", re.MULTILINE), "shebang marker"),
     (re.compile(r"<script\b", re.IGNORECASE), "embedded HTML script"),
@@ -45,22 +44,6 @@ _SCRIPT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 _BASE64_PAYLOAD_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{100,}={0,2})")
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
 
-_SUSPICIOUS_NETWORK_KEYWORDS = (
-    "webhook",
-    "callback",
-    "collect",
-    "upload",
-    "exfil",
-    "requestbin",
-    "pastebin",
-    "ngrok",
-)
-_TRUSTED_REFERENCE_DOMAINS = {
-    "catboost.ai",
-    "github.com",
-    "raw.githubusercontent.com",
-    "huggingface.co",
-}
 _BENIGN_METADATA_KEYS = {
     "feature_names",
     "class_names",
@@ -371,29 +354,6 @@ class CatBoostScanner(BaseScanner):
             )
         return summarized
 
-    @staticmethod
-    def _parse_ip_candidate(candidate: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
-        try:
-            return ipaddress.ip_address(candidate)
-        except ValueError:
-            return None
-
-    @staticmethod
-    def _is_trusted_reference_url(url: str) -> bool:
-        try:
-            host = urlparse(url).hostname or ""
-        except ValueError:
-            return False
-
-        if not host:
-            return False
-
-        host = host.lower()
-        if host in _TRUSTED_REFERENCE_DOMAINS:
-            return True
-
-        return any(host.endswith(f".{domain}") for domain in _TRUSTED_REFERENCE_DOMAINS)
-
     def _analyze_text_fragments(self, fragments: list[dict[str, str]], result: ScanResult, path: str) -> None:
         command_matches: list[dict[str, str]] = []
         process_context_matches: list[dict[str, str]] = []
@@ -431,43 +391,15 @@ class CatBoostScanner(BaseScanner):
                     },
                 )
 
-            for url_match in _URL_PATTERN.finditer(text):
-                url = url_match.group(0)
-                lowered_url = url.lower()
-                if self._is_trusted_reference_url(url):
-                    continue
-
-                if any(keyword in lowered_url for keyword in _SUSPICIOUS_NETWORK_KEYWORDS):
-                    network_matches.append(
-                        {
-                            "text": url,
-                            "section": fragment["section"],
-                            "pattern": "suspicious network URL",
-                            "fragment_id": fragment_id,
-                        },
-                    )
-
-            for ip_pattern in (_IPV4_PATTERN, _IPV6_PATTERN):
-                for ip_match in ip_pattern.finditer(text):
-                    candidate = ip_match.group(0)
-                    host = candidate.rsplit(":", 1)[0] if ip_pattern is _IPV4_PATTERN else candidate
-                    ip_obj = self._parse_ip_candidate(host)
-                    if (
-                        ip_obj is None
-                        or not ip_obj.is_global
-                        or ip_obj.is_multicast
-                        or ip_obj.is_reserved
-                        or ip_obj.is_unspecified
-                    ):
-                        continue
-                    network_matches.append(
-                        {
-                            "text": candidate,
-                            "section": fragment["section"],
-                            "pattern": "public IP",
-                            "fragment_id": fragment_id,
-                        },
-                    )
+            if _NETWORK_INVOCATION_PATTERN.search(text):
+                network_matches.append(
+                    {
+                        "text": text,
+                        "section": fragment["section"],
+                        "pattern": "network invocation",
+                        "fragment_id": fragment_id,
+                    }
+                )
 
             for pattern, reason in _SCRIPT_PATTERNS:
                 if pattern.search(text):
@@ -498,8 +430,8 @@ class CatBoostScanner(BaseScanner):
 
                 decoded_lower = decoded_text.lower()
                 if any(
-                    token in decoded_lower for token in ["os.system", "subprocess", "bash -c", "http://", "https://"]
-                ):
+                    token in decoded_lower for token in ["os.system", "subprocess", "bash -c"]
+                ) or _NETWORK_INVOCATION_PATTERN.search(decoded_text):
                     encoded_matches.append(
                         {
                             "text": decoded_text or payload,

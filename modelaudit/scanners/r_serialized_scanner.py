@@ -10,8 +10,8 @@ import re
 from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Any, ClassVar
-from urllib.parse import urlsplit, urlunsplit
 
+from ..detectors.network_comm import iter_credential_urls
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ._evidence_redaction import (
     _iter_r_raw_string_spans,
@@ -22,7 +22,6 @@ from ._evidence_redaction import (
     _unfinished_r_assignment_literal_closing_sequence,
     redact_evidence_string,
 )
-from ._network_indicators import _is_public_ip
 from ._read_errors import ReadFailure
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -2894,25 +2893,6 @@ def _contains_r_credential_assignment_in_complete_statements(text: str) -> bool:
     return False
 
 
-def _redact_url_for_display(url: str) -> str:
-    """Return a URL safe for scan output while preserving routing context."""
-    try:
-        parsed = urlsplit(url)
-        port = parsed.port
-    except ValueError:
-        return "[invalid-url]"
-
-    if not parsed.scheme or not parsed.hostname:
-        return "[invalid-url]"
-
-    hostname = parsed.hostname
-    if ":" in hostname and not hostname.startswith("["):
-        hostname = f"[{hostname}]"
-
-    netloc = f"{hostname}:{port}" if port is not None else hostname
-    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
-
-
 def _redact_sample_for_display(text: str) -> str:
     return redact_evidence_string(text, max_chars=200)
 
@@ -2981,8 +2961,6 @@ class RSerializedScanner(BaseScanner):
         r"python\s+-c|rscript\s+-e|rm\s+-rf|chmod\s+\+x|nc|netcat"
         r")\b"
     )
-    _URL_RE: ClassVar[re.Pattern[str]] = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
-    _IP_RE: ClassVar[re.Pattern[str]] = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
     _CODE_CONTEXT_MARKERS: ClassVar[tuple[str, ...]] = (
         "expression",
         "language",
@@ -3401,16 +3379,10 @@ class RSerializedScanner(BaseScanner):
         )
         return documentation_lines / len(lines) > 0.5
 
-    def _is_valid_public_ip(self, candidate: str) -> bool:
-        return _is_public_ip(candidate)
-
     def _add_symbol_and_payload_checks(self, result: ScanResult, strings: list[_ExtractedString], path: str) -> None:
         critical_symbol_hits: list[dict[str, object]] = []
-        metadata_symbol_hits: list[dict[str, object]] = []
         critical_payload_hits: list[dict[str, object]] = []
         warning_payload_hits: list[dict[str, object]] = []
-        url_hits: set[str] = set()
-        ip_hits: set[str] = set()
         credential_hits: set[str] = set()
         expression_analysis_incomplete = False
 
@@ -3427,11 +3399,8 @@ class RSerializedScanner(BaseScanner):
                 match = self._EXECUTABLE_SYMBOL_RE.search(lowered)
                 assert match is not None
                 hit = {"symbol": match.group(0), "offset": extracted.offset, "sample": _redact_sample_for_display(text)}
-                if has_exec_call or has_code_context:
-                    if not documentation_only or has_exec_call:
-                        critical_symbol_hits.append(hit)
-                else:
-                    metadata_symbol_hits.append(hit)
+                if (has_exec_call or has_code_context) and (not documentation_only or has_exec_call):
+                    critical_symbol_hits.append(hit)
 
             command_match = self._COMMAND_RE.search(text)
             if command_match:
@@ -3445,13 +3414,8 @@ class RSerializedScanner(BaseScanner):
                 elif not documentation_only:
                     warning_payload_hits.append(hit)
 
-            for url in self._URL_RE.findall(text):
-                url_hits.add(_redact_url_for_display(url))
-
-            for ip in self._IP_RE.findall(text):
-                if self._is_valid_public_ip(ip):
-                    ip_hits.add(ip)
-
+            if next(iter_credential_urls(text), None) is not None:
+                credential_hits.add("URL credentials")
             for name, pattern in self._CREDENTIAL_PATTERNS.items():
                 if pattern.search(text):
                     credential_hits.add(name)
@@ -3493,20 +3457,6 @@ class RSerializedScanner(BaseScanner):
                 location=path,
             )
 
-        if metadata_symbol_hits:
-            result.add_check(
-                name="Risky Symbol Metadata Mentions",
-                passed=False,
-                message=(f"Found {len(metadata_symbol_hits)} risky symbol mention(s) outside executable context"),
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={"hit_count": len(metadata_symbol_hits), "examples": metadata_symbol_hits[:5]},
-                why=(
-                    "These names may be benign metadata, but should be reviewed when artifacts come from "
-                    "untrusted sources."
-                ),
-            )
-
         if critical_payload_hits:
             result.add_check(
                 name="Serialized Expression Payload Detection",
@@ -3535,27 +3485,6 @@ class RSerializedScanner(BaseScanner):
                 name="Serialized Expression Payload Detection",
                 passed=True,
                 message="No command-like payload indicators detected",
-                location=path,
-            )
-
-        if url_hits or ip_hits:
-            result.add_check(
-                name="Embedded Network Indicator Detection",
-                passed=False,
-                message=(f"Detected {len(url_hits)} URL indicator(s) and {len(ip_hits)} public IP indicator(s)"),
-                severity=IssueSeverity.WARNING,
-                location=path,
-                details={"urls": sorted(url_hits)[:10], "public_ips": sorted(ip_hits)[:10]},
-                why=(
-                    "Embedded external endpoints can indicate data-exfiltration or payload-fetch behavior when "
-                    "coupled with dynamic evaluation."
-                ),
-            )
-        else:
-            result.add_check(
-                name="Embedded Network Indicator Detection",
-                passed=True,
-                message="No suspicious URL/IP indicators detected",
                 location=path,
             )
 

@@ -5,15 +5,14 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
-import html
 import json
 import os
 import re
 import struct
 from collections.abc import Iterator
 from typing import Any, ClassVar
-from urllib.parse import unquote, urlparse
 
+from modelaudit.detectors.network_comm import iter_credential_urls
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
 from ..core_results import mark_operational_scan_error
@@ -274,9 +273,6 @@ _CREDENTIAL_METADATA_PATTERNS = (
     r"xox[boaprs]-[0-9]{12}-[0-9]{12}-[0-9a-zA-Z]{24}",
     r"ghp_[a-zA-Z0-9]{36}",
 )
-_GENERIC_URL_METADATA_PATTERN = r"https?://"
-_ENCODED_URL_DELIMITER_METADATA_PATTERN = "encoded-url-delimiter"
-_BACKSLASH_URL_DELIMITER_METADATA_PATTERN = "backslash-url-delimiter"
 _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN = "wrapped-opaque-token"
 _LICENSE_METADATA_KEYS = frozenset({"license"})
 _LICENSE_DOCUMENT_MARKERS = (
@@ -393,91 +389,6 @@ _LICENSE_DOCUMENT_BASE64_WORD_TOKENS = frozenset(
 )
 _DUPLICATE_JSON_KEY_DETAIL_LIMIT = 20
 _URL_METADATA_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
-_LICENSE_REFERENCE_HOST_SUFFIXES = (
-    "apache.org",
-    "creativecommons.org",
-    "github.com",
-    "gnu.org",
-    "ltx.io",
-    "mozilla.org",
-    "opensource.org",
-    "spdx.org",
-)
-_LICENSE_REFERENCE_PATH_COMPONENTS = frozenset(
-    {
-        "copying",
-        "legal",
-        "legalcode",
-        "licence",
-        "license",
-        "licenses",
-        "licensing",
-        "notice",
-        "policies",
-        "policy",
-        "terms",
-    }
-)
-_LICENSE_REFERENCE_FILE_MARKERS = (
-    "copying",
-    "legalcode",
-    "licence",
-    "license",
-    "licensing",
-    "notice",
-    "policy",
-    "terms",
-)
-_SUSPICIOUS_LICENSE_URL_PATH_COMPONENTS = frozenset({"download", "raw", "releases"})
-_SUSPICIOUS_LICENSE_URL_PATH_SUFFIXES = (
-    ".bat",
-    ".bin",
-    ".bz2",
-    ".cjs",
-    ".cmd",
-    ".ckpt",
-    ".com",
-    ".dll",
-    ".dylib",
-    ".exe",
-    ".gguf",
-    ".gz",
-    ".h5",
-    ".jar",
-    ".js",
-    ".joblib",
-    ".jsx",
-    ".keras",
-    ".mjs",
-    ".model",
-    ".msgpack",
-    ".npy",
-    ".npz",
-    ".onnx",
-    ".php",
-    ".pickle",
-    ".pkl",
-    ".pl",
-    ".ps1",
-    ".pt",
-    ".pth",
-    ".py",
-    ".rar",
-    ".rb",
-    ".safetensors",
-    ".safetensors.index.json",
-    ".sh",
-    ".so",
-    ".tar",
-    ".tar.bz2",
-    ".tar.gz",
-    ".tgz",
-    ".ts",
-    ".tsx",
-    ".xz",
-    ".whl",
-    ".zip",
-)
 _OPAQUE_LICENSE_TOKEN_MIN_CHARS = 128
 _OPAQUE_LICENSE_TOKEN_PATTERN = re.compile(rf"\b[A-Za-z0-9+/=_-]{{{_OPAQUE_LICENSE_TOKEN_MIN_CHARS},}}\b")
 _BASE64_LICENSE_WRAP_LINE_MIN_CHARS = 4
@@ -504,7 +415,6 @@ _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN = re.compile(
     r"^(?:[#>;]|//|--|\*)\s*(?:continued|continuation|wrapped|base64|license(?:\s+terms?)?)?\s*$",
     re.IGNORECASE,
 )
-_SUSPICIOUS_LICENSE_URL_MARKERS = ("payload", "exfil", "webhook", "callback")
 _BASE64_LICENSE_DECODED_ACTIVE_MARKERS = (
     "#!",
     "chmod +x",
@@ -519,123 +429,6 @@ _BASE64_LICENSE_DECODED_ACTIVE_MARKERS = (
     "subprocess",
     "wget ",
 )
-_URL_PATH_NORMALIZATION_PASSES = 4
-_URL_DELIMITER_ENTITY_DECODE_PASSES = 4
-_PERCENT_ENCODED_BYTE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
-_HTML_ENTITY_REFERENCE_SOURCE = r"&(?:#[0-9]+;?|#[xX][0-9a-fA-F]+;?|[A-Za-z][A-Za-z0-9]{1,31};)"
-_RESIDUAL_NESTED_HTML_ENTITY_REFERENCE_SOURCE = (
-    r"&(?:amp;)*(?:#[0-9]+;?|#[xX][0-9a-fA-F]+;?|[A-Za-z][A-Za-z0-9]{1,31};)"
-)
-_RESIDUAL_NESTED_ENTITY_H = r"&(?:amp;)*(?:#0*(?:72|104);?|#[xX]0*(?:48|68);?)"
-_RESIDUAL_NESTED_ENTITY_T = r"&(?:amp;)*(?:#0*(?:84|116);?|#[xX]0*(?:54|74);?)"
-_RESIDUAL_NESTED_ENTITY_P = r"&(?:amp;)*(?:#0*(?:80|112);?|#[xX]0*(?:50|70);?)"
-_RESIDUAL_NESTED_ENTITY_S = r"&(?:amp;)*(?:#0*(?:83|115);?|#[xX]0*(?:53|73);?)"
-_RESIDUAL_NESTED_ENTITY_SCHEME_LETTERS = (
-    rf"(?:h|{_RESIDUAL_NESTED_ENTITY_H})",
-    rf"(?:t|{_RESIDUAL_NESTED_ENTITY_T})",
-    rf"(?:t|{_RESIDUAL_NESTED_ENTITY_T})",
-    rf"(?:p|{_RESIDUAL_NESTED_ENTITY_P})",
-    rf"(?:s|{_RESIDUAL_NESTED_ENTITY_S})?",
-)
-_HTML_ENTITY_REFERENCE_PATTERN = re.compile(_HTML_ENTITY_REFERENCE_SOURCE)
-_RESIDUAL_ENTITY_URL_DELIMITER_PATTERN = re.compile(
-    rf"{''.join(_RESIDUAL_NESTED_ENTITY_SCHEME_LETTERS)}(?:{_RESIDUAL_NESTED_HTML_ENTITY_REFERENCE_SOURCE}|:)"
-    rf"(?:{_RESIDUAL_NESTED_HTML_ENTITY_REFERENCE_SOURCE}|/|\\)"
-    rf"(?:{_RESIDUAL_NESTED_HTML_ENTITY_REFERENCE_SOURCE}|/|\\)",
-    re.IGNORECASE,
-)
-_ENCODED_URL_SCHEME_LETTERS = (
-    r"(?:h|%(?:25)*(?:48|68))",
-    r"(?:t|%(?:25)*(?:54|74))",
-    r"(?:t|%(?:25)*(?:54|74))",
-    r"(?:p|%(?:25)*(?:50|70))",
-    r"(?:s|%(?:25)*(?:53|73))?",
-)
-_ENCODED_URL_DELIMITER_PATTERN = re.compile(
-    rf"(?P<scheme>{''.join(_ENCODED_URL_SCHEME_LETTERS)})(?P<colon>%(?:25)*3a|:)"
-    r"(?P<slash1>%(?:25)*(?:2f|5c)|/|\\)(?P<slash2>%(?:25)*(?:2f|5c)|/|\\)",
-    re.IGNORECASE,
-)
-_RAW_BACKSLASH_URL_DELIMITER_PATTERN = re.compile(r"https?:(?:\\\\|/\\|\\/|\\(?![\\/])|/(?!/))", re.IGNORECASE)
-
-
-def _url_path_has_unsafe_decoded_char(path: str) -> bool:
-    return any(
-        char == "\\" or char == ";" or ord(char) < 0x20 or char.isspace() or ord(char) == 0x7F for char in path
-    ) or any(segment in {".", ".."} for segment in path.split("/"))
-
-
-def _html_unescape_with_entity_mask(value: str, entity_mask: bytearray) -> tuple[str, bytearray, bool]:
-    decoded_parts: list[str] = []
-    decoded_entity_mask = bytearray()
-    cursor = 0
-    changed = False
-
-    for match in _HTML_ENTITY_REFERENCE_PATTERN.finditer(value):
-        start, end = match.span()
-        decoded_parts.append(value[cursor:start])
-        decoded_entity_mask.extend(entity_mask[cursor:start])
-
-        raw_entity = match.group(0)
-        decoded_entity = html.unescape(raw_entity)
-        if decoded_entity != raw_entity:
-            decoded_parts.append(decoded_entity)
-            decoded_entity_mask.extend(b"\x01" * len(decoded_entity))
-            changed = True
-        else:
-            decoded_parts.append(raw_entity)
-            decoded_entity_mask.extend(entity_mask[start:end])
-
-        cursor = end
-
-    decoded_parts.append(value[cursor:])
-    decoded_entity_mask.extend(entity_mask[cursor:])
-    return "".join(decoded_parts), decoded_entity_mask, changed
-
-
-def _encoded_url_delimiter_match_has_encoded_component(
-    value: str,
-    match: re.Match[str],
-    *,
-    entity_mask: bytearray | None = None,
-) -> bool:
-    for group_name in ("scheme", "colon", "slash1", "slash2"):
-        start, end = match.span(group_name)
-        if "%" in value[start:end]:
-            return True
-        if entity_mask is not None and any(entity_mask[start:end]):
-            return True
-    return False
-
-
-def _value_has_encoded_url_delimiter(value: str) -> bool:
-    if any(
-        _encoded_url_delimiter_match_has_encoded_component(value, match)
-        for match in _ENCODED_URL_DELIMITER_PATTERN.finditer(value)
-    ):
-        return True
-    if "&" not in value:
-        return False
-
-    decoded_value = value
-    entity_mask = bytearray(len(value))
-    for _ in range(_URL_DELIMITER_ENTITY_DECODE_PASSES):
-        decoded_value, entity_mask, changed = _html_unescape_with_entity_mask(decoded_value, entity_mask)
-        if not changed:
-            return False
-        if any(
-            _encoded_url_delimiter_match_has_encoded_component(decoded_value, match, entity_mask=entity_mask)
-            for match in _ENCODED_URL_DELIMITER_PATTERN.finditer(decoded_value)
-        ):
-            return True
-    return any(
-        _HTML_ENTITY_REFERENCE_PATTERN.search(match.group(0)) is not None
-        for match in _RESIDUAL_ENTITY_URL_DELIMITER_PATTERN.finditer(decoded_value)
-    )
-
-
-def _value_has_raw_backslash_url_delimiter(value: str) -> bool:
-    return _RAW_BACKSLASH_URL_DELIMITER_PATTERN.search(value) is not None
 
 
 class SafeTensorsScanner(BaseScanner):
@@ -1115,129 +908,14 @@ class SafeTensorsScanner(BaseScanner):
         documentary_lines = sum(cls._license_document_line_looks_documentary(line.lower()) for line in lines)
         return documentary_lines / len(lines) > 0.5
 
-    @staticmethod
-    def _url_host_matches_suffix(hostname: str, suffix: str) -> bool:
-        return hostname == suffix or hostname.endswith(f".{suffix}")
-
-    @staticmethod
-    def _normalize_url_path(path: str) -> tuple[str, bool]:
-        normalized = path
-        for _ in range(_URL_PATH_NORMALIZATION_PASSES):
-            decoded = unquote(normalized)
-            if decoded == normalized:
-                normalized_path = normalized.lower()
-                return normalized_path, not normalized_path.isascii() or _url_path_has_unsafe_decoded_char(
-                    normalized_path
-                )
-            normalized = decoded
-        normalized_path = normalized.lower()
-        return (
-            normalized_path,
-            not normalized_path.isascii()
-            or _url_path_has_unsafe_decoded_char(normalized_path)
-            or _PERCENT_ENCODED_BYTE_PATTERN.search(normalized_path) is not None,
-        )
-
-    @classmethod
-    def _url_path_segments(cls, path: str) -> tuple[list[str], bool]:
-        normalized_path, has_residual_encoding = cls._normalize_url_path(path)
-        return [segment for segment in normalized_path.strip("/").split("/") if segment], has_residual_encoding
-
-    @classmethod
-    def _url_path_has_suspicious_target(cls, path: str) -> bool:
-        segments, has_residual_encoding = cls._url_path_segments(path)
-        if has_residual_encoding:
-            return True
-        return (
-            any(segment in _SUSPICIOUS_LICENSE_URL_PATH_COMPONENTS for segment in segments)
-            or any(marker in segment for segment in segments for marker in _SUSPICIOUS_LICENSE_URL_MARKERS)
-            or any(segment.endswith(suffix) for segment in segments for suffix in _SUSPICIOUS_LICENSE_URL_PATH_SUFFIXES)
-        )
-
-    @classmethod
-    def _url_path_has_embedded_url(cls, path: str) -> bool:
-        normalized_path, has_residual_encoding = cls._normalize_url_path(path)
-        if has_residual_encoding:
-            return True
-        return "://" in normalized_path or "http:/" in normalized_path or "https:/" in normalized_path
-
-    @classmethod
-    def _url_path_looks_like_license_reference(cls, hostname: str, path: str) -> bool:
-        segments, has_residual_encoding = cls._url_path_segments(path)
-        if has_residual_encoding:
-            return False
-
-        if cls._url_host_matches_suffix(hostname, "github.com") and len(segments) == 2:
-            return True
-
-        if any(segment in _LICENSE_REFERENCE_PATH_COMPONENTS for segment in segments):
-            return True
-
-        return any(
-            segment in _LICENSE_REFERENCE_FILE_MARKERS
-            or any(segment.startswith(f"{marker}.") for marker in _LICENSE_REFERENCE_FILE_MARKERS)
-            for segment in segments
-        )
-
-    @classmethod
-    def _url_looks_like_license_reference(cls, raw_url: str) -> bool:
-        cleaned_url = raw_url.rstrip(").,;:]}")
-        try:
-            parsed = urlparse(cleaned_url)
-            port = parsed.port
-            hostname = parsed.hostname.lower() if parsed.hostname else ""
-        except ValueError:
-            return False
-        if parsed.scheme.lower() not in {"http", "https"} or not hostname:
-            return False
-        if port is not None and not 0 <= port <= 65535:
-            return False
-        if parsed.netloc.rsplit("@", maxsplit=1)[-1].endswith(":"):
-            return False
-        if parsed.username or parsed.password:
-            return False
-        if not parsed.netloc.isascii() or not parsed.path.isascii():
-            return False
-        if parsed.params or parsed.query or parsed.fragment:
-            return False
-
-        lowered_url = cleaned_url.lower()
-        if any(marker in lowered_url for marker in _SUSPICIOUS_LICENSE_URL_MARKERS):
-            return False
-        if cls._url_path_has_embedded_url(parsed.path):
-            return False
-        if cls._url_path_has_suspicious_target(parsed.path):
-            return False
-
-        return any(cls._url_host_matches_suffix(hostname, suffix) for suffix in _LICENSE_REFERENCE_HOST_SUFFIXES) and (
-            cls._url_path_looks_like_license_reference(hostname, parsed.path)
-        )
-
-    @classmethod
-    def _license_document_urls_are_documentary(cls, value: str) -> bool:
-        if _value_has_encoded_url_delimiter(value) or _value_has_raw_backslash_url_delimiter(value):
-            return False
-        urls = _URL_METADATA_PATTERN.findall(value)
-        return all(cls._url_looks_like_license_reference(url) for url in urls)
-
-    @classmethod
-    def _looks_like_ordinary_license_reference_value(cls, value: str) -> bool:
-        stripped = value.strip()
-        if not stripped or any(char.isspace() for char in stripped):
-            return False
-        urls = _URL_METADATA_PATTERN.findall(stripped)
-        if len(urls) != 1:
-            return False
-        return urls[0].rstrip(").,;:]}") == stripped.rstrip(").,;:]}") and cls._url_looks_like_license_reference(
-            urls[0]
-        )
-
     @classmethod
     def _metadata_value_has_active_risk(cls, value: str) -> bool:
         lower_value = value.lower()
         if any(marker in lower_value for marker in ("import ", "#!/")):
             return True
         if cls._find_html_tag_matches(value)[1] or cls._find_html_event_handler_matches(value)[1]:
+            return True
+        if next(iter_credential_urls(value), None) is not None:
             return True
 
         active_pattern_groups = (
@@ -1253,10 +931,7 @@ class SafeTensorsScanner(BaseScanner):
         ):
             return True
 
-        return any(
-            pattern != _GENERIC_URL_METADATA_PATTERN and re.search(pattern, value, re.IGNORECASE)
-            for pattern in SUSPICIOUS_METADATA_PATTERNS
-        )
+        return any(re.search(pattern, value, re.IGNORECASE) for pattern in SUSPICIOUS_METADATA_PATTERNS)
 
     @staticmethod
     def _add_metadata_pattern_check(result: ScanResult, path: str, key: str, pattern: str) -> None:
@@ -1284,9 +959,7 @@ class SafeTensorsScanner(BaseScanner):
             return False
         if cls._metadata_value_has_active_risk(value):
             return False
-        return (
-            cls._looks_like_ordinary_license_document(value) and cls._license_document_urls_are_documentary(value)
-        ) or cls._looks_like_ordinary_license_reference_value(value)
+        return cls._looks_like_ordinary_license_document(value)
 
     @classmethod
     def _summarize_custom_metadata(cls, custom_metadata: Any) -> dict[str, Any]:
@@ -1311,6 +984,8 @@ class SafeTensorsScanner(BaseScanner):
             flags.add("credential_exposure")
 
         for key, value in cls._iter_custom_metadata_strings(custom_metadata):
+            if next(iter_credential_urls(value), None) is not None:
+                flags.add("credential_exposure")
             is_ordinary_license = cls._is_ordinary_license_metadata_value(
                 key,
                 value,
@@ -1320,16 +995,9 @@ class SafeTensorsScanner(BaseScanner):
                 flags.add("unusually_long_value")
             if any(marker in value.lower() for marker in ("import ", "#!/")):
                 flags.add("code_like_value")
-            if (
-                any(
-                    (pattern != _GENERIC_URL_METADATA_PATTERN or not is_ordinary_license)
-                    and re.search(pattern, value, re.IGNORECASE)
-                    for pattern in SUSPICIOUS_METADATA_PATTERNS
-                )
-                or _value_has_encoded_url_delimiter(value)
-                or _value_has_raw_backslash_url_delimiter(value)
-                or cls._metadata_value_has_wrapped_opaque_token(value)
-            ):
+            if any(
+                re.search(pattern, value, re.IGNORECASE) for pattern in SUSPICIOUS_METADATA_PATTERNS
+            ) or cls._metadata_value_has_wrapped_opaque_token(value):
                 flags.add("suspicious_pattern")
 
         summary["custom_metadata_security_flags"] = sorted(flags)
@@ -2180,6 +1848,17 @@ class SafeTensorsScanner(BaseScanner):
             return True
 
         for key, value in self._iter_custom_metadata_strings(metadata):
+            credential_url = next(iter_credential_urls(value), None)
+            if credential_url is not None:
+                security_flags.add("credential_exposure")
+                result.add_check(
+                    name="SafeTensors Metadata URL Credential Check",
+                    passed=False,
+                    message="Credential material found in a SafeTensors metadata URL",
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                    details={"key": key, "url": credential_url},
+                )
             is_ordinary_license = self._is_ordinary_license_metadata_value(
                 key,
                 value,
@@ -2220,15 +1899,9 @@ class SafeTensorsScanner(BaseScanner):
 
             suspicious_pattern: str | None = None
             for pattern in SUSPICIOUS_METADATA_PATTERNS:
-                if pattern == _GENERIC_URL_METADATA_PATTERN and is_ordinary_license:
-                    continue
                 if re.search(pattern, value, re.IGNORECASE):
                     suspicious_pattern = pattern
                     break
-            if suspicious_pattern is None and _value_has_encoded_url_delimiter(value):
-                suspicious_pattern = _ENCODED_URL_DELIMITER_METADATA_PATTERN
-            if suspicious_pattern is None and _value_has_raw_backslash_url_delimiter(value):
-                suspicious_pattern = _BACKSLASH_URL_DELIMITER_METADATA_PATTERN
             has_wrapped_opaque_token = self._metadata_value_has_wrapped_opaque_token(value)
             if suspicious_pattern is None and has_wrapped_opaque_token:
                 suspicious_pattern = _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN
