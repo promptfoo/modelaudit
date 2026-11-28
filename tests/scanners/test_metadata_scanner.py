@@ -5,7 +5,6 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from urllib.parse import ParseResult
 
 import pytest
 
@@ -185,43 +184,6 @@ class TestMetadataScanner:
             assert determine_exit_code(aggregate) == 2
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
 
-    def test_scan_suspicious_urls_in_readme(self) -> None:
-        """Test detection of suspicious URLs in README."""
-        scanner = MetadataScanner()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            readme_path = Path(temp_dir) / "README.md"
-            with open(readme_path, "w") as f:
-                f.write(
-                    "# Model Info\n\n"
-                    "- Download: https://bit.ly/suspicious-model\n"
-                    "- Endpoint: https://ngrok.io/malicious-endpoint\n"
-                )
-
-            result = scanner.scan(str(readme_path))
-
-        assert len(result.issues) == 2
-        assert all(issue.severity == IssueSeverity.INFO for issue in result.issues)
-        assert {issue.details.get("suspicious_domain") for issue in result.issues} == {
-            "bit.ly",
-            "ngrok.io",
-        }
-
-    def test_malformed_url_does_not_interrupt_metadata_scan(self, tmp_path: Path) -> None:
-        readme = tmp_path / "README.md"
-        readme.write_text(
-            "Invalid link: https://[broken\nDownload: https://bit.ly/model\nAWS key: AKIAABCDEFGHIJKLMNOP\n",
-            encoding="utf-8",
-        )
-
-        result = MetadataScanner().scan(str(readme))
-
-        assert result.success is True
-        findings = {check.name: check.details for check in result.checks if check.status == CheckStatus.FAILED}
-        assert findings.keys() == {"suspicious_url", "exposed_secret"}
-        assert findings["suspicious_url"]["suspicious_domain"] == "bit.ly"
-        assert findings["exposed_secret"]["pattern_description"] == "AWS Access Key ID"
-
     def test_malformed_link_in_benign_readme(self, tmp_path: Path) -> None:
         readme = tmp_path / "README.md"
         readme.write_text("IPv6 template: http://[host]/model\n", encoding="utf-8")
@@ -230,139 +192,6 @@ class TestMetadataScanner:
 
         assert result.success is True
         assert result.issues == []
-
-    def test_repeated_benign_urls_are_parsed_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Skip duplicate benign URLs before reparsing them."""
-        scanner = MetadataScanner()
-        result = scanner._create_result()
-        parse_calls = 0
-        real_urlparse = metadata_scanner.urlparse
-
-        def tracking_urlparse(url: str) -> ParseResult:
-            nonlocal parse_calls
-            parse_calls += 1
-            return real_urlparse(url)
-
-        monkeypatch.setattr(metadata_scanner, "urlparse", tracking_urlparse)
-
-        scanner._check_suspicious_urls_in_text(
-            "\n".join(["https://huggingface.co/example/model"] * 3),
-            "README.md",
-            result,
-        )
-
-        assert parse_calls == 1
-        assert result.issues == []
-
-    def test_scan_detects_suspicious_subdomain_hosts(self) -> None:
-        """Test suspicious domains are detected through subdomain matching."""
-        scanner = MetadataScanner()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            readme_path = Path(temp_dir) / "README.md"
-            with open(readme_path, "w") as f:
-                f.write("# Model Info\n\n- Endpoint: https://api.ngrok.io/malicious-endpoint\n")
-
-            result = scanner.scan(str(readme_path))
-
-        assert len(result.issues) == 1
-        issue = result.issues[0]
-        assert issue.severity == IssueSeverity.INFO
-        assert issue.details.get("suspicious_domain") == "ngrok.io"
-        assert "https://api.ngrok.io/malicious-endpoint" in str(issue.details.get("url"))
-
-    def test_scan_ignores_suspicious_domain_substrings(self) -> None:
-        """Test URLs are matched by hostname, not generic substring."""
-        _assert_metadata_near_match_clean(
-            "# Model Info\n\n"
-            "- Docs: https://example.com/guide?redirect=bit.ly/suspicious-model\n"
-            "- API: https://safe-ngrok.io/docs\n"
-        )
-
-    def test_scan_detects_suspicious_domains_hidden_in_userinfo(self, tmp_path: Path) -> None:
-        """Shorteners and tunnel domains in userinfo should still be flagged."""
-        scanner = MetadataScanner()
-        readme_path = tmp_path / "README.md"
-        readme_path.write_text(
-            "# Model Info\n\n"
-            "- Shortener bait: https://bit.ly@github.com/download\n"
-            "- Password bait: https://user:bit.ly@github.com/download-two\n"
-            "- Encoded bait: https://%62it.ly@github.com/download-three\n"
-            "- Tunnel bait: https://localtunnel.me:token@huggingface.co/proxy\n"
-            "- Docs: https://example.com/model-card\n"
-        )
-
-        result = scanner.scan(str(readme_path))
-
-        assert len(result.issues) == 4
-        flagged = {
-            (issue.details.get("suspicious_domain"), issue.details.get("url_component")) for issue in result.issues
-        }
-        assert flagged == {("bit.ly", "userinfo"), ("localtunnel.me", "userinfo")}
-        flagged_urls = {issue.details.get("url") for issue in result.issues}
-        assert "https://github.com/download" in flagged_urls
-        assert "https://github.com/download-two" in flagged_urls
-        assert "https://github.com/download-three" in flagged_urls
-        assert "https://huggingface.co/proxy" in flagged_urls
-        assert "https://example.com/model-card" not in flagged_urls
-
-    def test_scan_suspicious_urls_redacts_credentials_and_query(self, tmp_path: Path) -> None:
-        """Suspicious URL findings should not preserve credentials or signed query strings."""
-        scanner = MetadataScanner()
-        readme_path = tmp_path / "README.md"
-        readme_path.write_text("Download: https://user:pass@tinyurl.com/model.bin?token=SECRET_TOKEN#SECRET_FRAGMENT\n")
-
-        result = scanner.scan(str(readme_path))
-
-        assert len(result.issues) == 1
-        issue = result.issues[0]
-        assert issue.details["url"] == "https://tinyurl.com/model.bin"
-        assert "tinyurl.com/model.bin" in issue.message
-        serialized = f"{issue.message} {issue.details['url']}"
-        assert "user:pass" not in serialized
-        assert "SECRET_TOKEN" not in serialized
-        assert "SECRET_FRAGMENT" not in serialized
-
-    def test_scan_suspicious_urls_preserves_classification_and_raw_secret_evidence(self, tmp_path: Path) -> None:
-        """URL classification stays normalized while aggregate reports retain secret evidence."""
-        aws_key = "AKIAABCDEFGHIJKLMNOP"
-        readme_path = tmp_path / "README.md"
-        readme_path.write_text(
-            f"Download: https://tinyurl.com/download/{aws_key}/model.bin?token=SECRET_TOKEN#SECRET_FRAGMENT\n",
-            encoding="utf-8",
-        )
-
-        direct = MetadataScanner().scan(str(readme_path))
-        aggregate = scan_model_directory_or_file(str(readme_path), cache_scan_results=False)
-        sarif_output = format_sarif_output(aggregate, [str(readme_path)])
-
-        suspicious_url_issue = next(
-            issue for issue in direct.issues if issue.details.get("suspicious_domain") == "tinyurl.com"
-        )
-        assert suspicious_url_issue.details["url"] == "https://tinyurl.com/download/<redacted>/model.bin"
-        assert "tinyurl.com/download/<redacted>/model.bin" in suspicious_url_issue.message
-
-        serialized_outputs = [
-            json.dumps([issue.model_dump() for issue in direct.issues], sort_keys=True),
-            aggregate.model_dump_json(),
-            sarif_output,
-        ]
-        assert aws_key not in serialized_outputs[0]
-        assert aws_key in serialized_outputs[1]
-        assert aws_key in serialized_outputs[2]
-        for serialized in serialized_outputs:
-            assert "SECRET_TOKEN" not in serialized
-            assert "SECRET_FRAGMENT" not in serialized
-
-    def test_scan_ignores_non_suspicious_authenticated_url(self, tmp_path: Path) -> None:
-        """Authenticated URLs without suspicious domains should stay quiet."""
-        scanner = MetadataScanner()
-        readme_path = tmp_path / "README.md"
-        readme_path.write_text("Download: https://user:token@example.com/private-model\n")
-
-        result = scanner.scan(str(readme_path))
-
-        assert len(result.issues) == 0
 
     def test_scan_exposed_secrets_in_readme(self):
         """Test detection of exposed secrets in README."""
@@ -475,7 +304,7 @@ class TestMetadataScanner:
         def expire_timeout(_content: str, _file_path: str, _result: object) -> None:
             raise TimeoutError("metadata helper timed out")
 
-        monkeypatch.setattr(scanner, "_check_suspicious_urls_in_text", expire_timeout)
+        monkeypatch.setattr(scanner, "_check_exposed_secrets_in_text", expire_timeout)
 
         result = scanner.scan(str(readme_path))
 
@@ -496,14 +325,14 @@ class TestMetadataScanner:
         """Findings emitted before the final timeout check should remain in the result."""
         scanner = MetadataScanner(config={"timeout": 1})
         readme_path = tmp_path / "README.md"
-        readme_path.write_text("Download: https://bit.ly/suspicious-model\n")
+        readme_path.write_text("Download: https://example.com/model?token=sample-credential\n")
 
         timeout_calls = 0
 
         def raise_after_helper(*_args: object, **_kwargs: object) -> bool:
             nonlocal timeout_calls
             timeout_calls += 1
-            if timeout_calls == 5:
+            if timeout_calls == 4:
                 raise TimeoutError("metadata scan timed out after helper")
             return False
 
@@ -513,7 +342,11 @@ class TestMetadataScanner:
         result = scanner.scan(str(readme_path))
 
         timeout_checks = [check for check in result.checks if check.name == "Metadata Scan Timeout"]
-        suspicious_issues = [issue for issue in result.issues if issue.details.get("suspicious_domain") == "bit.ly"]
+        suspicious_issues = [
+            issue
+            for issue in result.issues
+            if issue.details.get("url") == "https://example.com/model?token=sample-credential"
+        ]
 
         assert result.success is False
         assert result.metadata["operational_error_reason"] == "scan_timeout"
@@ -530,7 +363,7 @@ class TestMetadataScanner:
         scanner = MetadataScanner(config={"timeout": 1})
         readme_path = tmp_path / "README.md"
         readme_path.write_text(
-            "Download: https://bit.ly/suspicious-model\nEndpoint: https://ngrok.io/malicious-endpoint\n"
+            "Download: https://example.com/model?token=sample-credential\nEndpoint: https://example.net/endpoint?token=another-credential\n"
         )
 
         timeout_calls = 0
@@ -548,14 +381,12 @@ class TestMetadataScanner:
         result = scanner.scan(str(readme_path))
 
         timeout_checks = [check for check in result.checks if check.name == "Metadata Scan Timeout"]
-        detected_domains = {
-            issue.details["suspicious_domain"] for issue in result.issues if "suspicious_domain" in issue.details
-        }
+        detected_urls = {issue.details["url"] for issue in result.issues if "url" in issue.details}
 
         assert result.success is False
         assert result.metadata["operational_error_reason"] == "scan_timeout"
         assert len(timeout_checks) == 1
-        assert detected_domains == {"bit.ly"}
+        assert detected_urls == {"https://example.com/model?token=sample-credential"}
         assert not any(check.name == "Metadata Scan Error" for check in result.checks)
 
 
@@ -570,3 +401,17 @@ def _assert_metadata_near_match_clean(contents: str) -> None:
         result = scanner.scan(str(readme_path))
 
     assert len(result.issues) == 0
+
+
+def test_metadata_checks_credentials_without_reporting_passive_links(tmp_path: Path) -> None:
+    path = tmp_path / "README.md"
+    path.write_text(
+        "[Paper](https://bit.ly/sample) https://[invalid research.example 8.8.8.8\n"
+        "[Resource](https://example.com/?token=sample-credential)\n",
+        encoding="utf-8",
+    )
+    result = MetadataScanner().scan(str(path))
+    assert result.success
+    assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == [
+        "Metadata URL Credential Check"
+    ]

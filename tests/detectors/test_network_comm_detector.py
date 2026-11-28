@@ -77,7 +77,9 @@ def test_url_credential_field_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     assert network_comm.url_contains_credentials(base + "?ref=v1&source=paper&lang=en#access_token=fixture") is True
 
 
-def test_readme_uninspected_url_preserves_each_native_severity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_readme_uninspected_active_url_preserves_native_severity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(network_comm, "_URL_CREDENTIAL_MAX_FIELDS", 2)
     url = "https://weights.example/model?ref=v1&source=paper&lang=en"
     path = tmp_path / "README.md"
@@ -87,7 +89,6 @@ def test_readme_uninspected_url_preserves_each_native_severity(tmp_path: Path, m
     urls = [issue for issue in aggregate.issues if issue.details.get("type") == "url_detected"]
 
     assert [(issue.severity, issue.details["severity"]) for issue in urls] == [
-        (IssueSeverity.INFO, "INFO"),
         (IssueSeverity.WARNING, "MEDIUM"),
     ]
     for issue in urls:

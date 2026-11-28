@@ -1170,6 +1170,7 @@ class BaseScanner(ABC):
         result: ScanResult | None = None,
         *,
         onnx_metadata_context: bool = False,
+        endpoint_is_active: Callable[[int], bool] | None = None,
     ) -> list[dict]:
         """Collect network communication findings without creating checks.
 
@@ -1181,6 +1182,7 @@ class BaseScanner(ABC):
             max_findings: Optional finding cap for this detector invocation
             result: ScanResult to mark inconclusive if detector analysis fails
             onnx_metadata_context: Whether the bytes come from validated ONNX metadata
+            endpoint_is_active: Classify endpoint offsets before recording network findings
 
         Returns:
             List of findings
@@ -1205,6 +1207,8 @@ class BaseScanner(ABC):
             detector = NetworkCommDetector(detector_config)
             if onnx_metadata_context:
                 findings = detector.scan(data, context, onnx_metadata_context=True)
+            elif endpoint_is_active is not None:
+                findings = detector.scan(data, context, endpoint_is_active=endpoint_is_active)
             else:
                 findings = detector.scan(data, context)
             return [dict(finding) for finding in findings]

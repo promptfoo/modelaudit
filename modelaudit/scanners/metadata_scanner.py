@@ -3,28 +3,15 @@
 import logging
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import unquote, urlparse
 
 from ..core_results import mark_operational_scan_error
-from ..detectors.network_comm import redact_url_for_finding
+from ..detectors.network_comm import iter_credential_urls
 from ..scanner_results import mark_inconclusive_scan_result, scan_result_has_inconclusive_outcome
 from ._read_errors import ReadFailure
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
 
-SUSPICIOUS_URL_DOMAINS = (
-    "bit.ly",
-    "tinyurl.com",
-    "t.co",
-    "goo.gl",
-    "ow.ly",
-    "is.gd",
-    "rb.gy",
-    "tiny.one",
-    "ngrok.io",
-    "localtunnel.me",
-)
 _METADATA_READ_FAILED_REASON = "metadata_read_failed"
 _METADATA_TIMEOUT_REASON = "scan_timeout"
 _REDACTED_SECRET_PREVIEW = "<redacted>"
@@ -135,12 +122,18 @@ class MetadataScanner(BaseScanner):
 
             self._check_timeout()
 
-            # Check for suspicious URLs
-            self._check_suspicious_urls_in_text(content, file_path, result)
-            self._check_timeout()
-
             # Check for exposed credentials in text
             self._check_exposed_secrets_in_text(content, file_path, result)
+            for url in iter_credential_urls(content):
+                self._check_timeout()
+                result.add_check(
+                    name="Metadata URL Credential Check",
+                    passed=False,
+                    message="Credential material found in a documentation URL",
+                    severity=IssueSeverity.WARNING,
+                    location=file_path,
+                    details={"url": url},
+                )
 
         except TimeoutError:
             raise
@@ -158,72 +151,6 @@ class MetadataScanner(BaseScanner):
                     type="file_error",
                 ),
             )
-
-    def _check_suspicious_urls_in_text(self, content: str, file_path: str, result: ScanResult) -> None:
-        """Check for suspicious URLs in text content."""
-        import re
-
-        # Find URLs in text
-        url_pattern = r'https?://[^\s<>"\']+[^\s<>"\',.]'
-        urls = re.findall(url_pattern, content)
-
-        seen = set()
-        for url in urls:
-            self._check_timeout()
-            if url in seen:
-                continue
-            seen.add(url)
-            try:
-                parsed = urlparse(url)
-            except ValueError:
-                continue
-            matched_domain = None
-            matched_component = None
-
-            for userinfo_part in (parsed.username, parsed.password):
-                matched_domain = self._match_suspicious_domain(userinfo_part or "")
-                if matched_domain is not None:
-                    matched_component = "userinfo"
-                    break
-
-            # Treat deceptive userinfo consistently with manifest semantics while
-            # avoiding noise from ordinary authenticated URLs.
-            if matched_domain is None:
-                matched_domain = self._match_suspicious_domain(parsed.hostname or "")
-                if matched_domain is not None:
-                    matched_component = "hostname"
-
-            if matched_domain is None:
-                continue
-
-            safe_url = redact_url_for_finding(url)
-            self._add_issue_check(
-                result,
-                Issue(
-                    message=f"Suspicious URL found in text metadata: {safe_url}",
-                    severity=IssueSeverity.INFO,
-                    location=file_path,
-                    details={
-                        "url": safe_url,
-                        "suspicious_domain": matched_domain,
-                        "url_component": matched_component,
-                    },
-                    why="URL shorteners and tunnel services can hide malicious endpoints",
-                    type="suspicious_url",
-                ),
-            )
-
-    @staticmethod
-    def _match_suspicious_domain(candidate: str) -> str | None:
-        """Return the matching suspicious domain for a URL component, if any."""
-        normalized = unquote(candidate).lower().rstrip(".")
-        if not normalized:
-            return None
-
-        for domain in SUSPICIOUS_URL_DOMAINS:
-            if normalized == domain or normalized.endswith(f".{domain}"):
-                return domain
-        return None
 
     def _calculate_entropy(self, text: str) -> float:
         """Calculate the Shannon entropy of a text string."""

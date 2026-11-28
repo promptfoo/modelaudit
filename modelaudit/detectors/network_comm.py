@@ -11,7 +11,7 @@ import re
 import tokenize
 from bisect import bisect_right
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import suppress
 from functools import lru_cache
 from importlib.resources import files
@@ -21,6 +21,13 @@ from typing import Any, ClassVar
 from urllib.parse import parse_qsl, unquote, unquote_plus, urlsplit, urlunsplit
 
 from modelaudit.detectors._metadata import metadata_string_spans
+
+METADATA_NETWORK_CALL_PATTERN = re.compile(
+    r"(?<![\w./-])(?:(?:requests|httpx)\.(?:get|post|put|patch|delete|request)|"
+    r"urllib\.request\.(?:urlopen|urlretrieve)|socket\.connect|(?:[a-z_]\w*\.)?fetch|urlopen)\s*\(",
+    re.IGNORECASE,
+)
+
 
 _REDACTED_PATH_TOKEN = "<redacted>"
 _URL_IN_TEXT_PATTERN = re.compile(
@@ -58,6 +65,13 @@ _SENSITIVE_PATH_KEY_PATTERN = re.compile(
 _URL_CREDENTIAL_PATH_KEYS = frozenset(
     {"api_key", "apikey", "x_api_key", "access_token", "refresh_token", "auth_token", "client_secret", "password"}
 )
+_URL_CREDENTIAL_HINT_PATTERN = re.compile(
+    r"[@%]|hooks\.slack\.com|token|secret|credential|api[_-]?key|access[_-]?key|private[_-]?key|"
+    r"auth|bearer|password|passwd|pwd|session|cookie|signature|[?&#;](?:sig|sas)|"
+    r"gh[pousr]_|github_pat_|hf_|eyJ|xox[baprs]-|sk-|AKIA",
+    re.IGNORECASE,
+)
+_URL_CREDENTIAL_HINT_BYTES = re.compile(_URL_CREDENTIAL_HINT_PATTERN.pattern.encode(), re.IGNORECASE)
 _URL_CREDENTIAL_MAX_CHARS = 64 * 1024
 _URL_CREDENTIAL_MAX_FIELDS = 256
 _URL_ASSIGNMENT_PREFIX_PATTERN = re.compile(
@@ -1166,6 +1180,16 @@ def url_contains_credentials(url: str, *, redacted_url: str | None = None) -> bo
             if _is_sensitive_path_key(key) or _SENSITIVE_PATH_TOKEN_PATTERN.fullmatch(value):
                 return True
     return False if complete else None
+
+
+def iter_credential_urls(text: str) -> Iterator[str]:
+    """Yield URLs with credential evidence in unstructured text."""
+    for match in _URI_IN_TEXT_PATTERN.finditer(text):
+        if _URL_CREDENTIAL_HINT_PATTERN.search(text, match.start(), match.end()) is None:
+            continue
+        url = _trim_unbalanced_trailing_url_delimiters(match.group())
+        if url_contains_credentials(url) is True:
+            yield url
 
 
 def _redact_network_evidence(text: str) -> str:
@@ -5207,6 +5231,7 @@ class NetworkCommDetector:
         self._official_readme_image_fences: list[tuple[int, int, bool]] = []
         self._official_readme_image_unvalidated_requests = False
         self._onnx_metadata_context = False
+        self._endpoint_is_active: Callable[[int], bool] | None = None
         self._literal_bounds: list[tuple[int, int]] = []
         self._literal_starts: list[int] = []
         self._metadata_bounds: list[tuple[int, int]] = []
@@ -5231,12 +5256,15 @@ class NetworkCommDetector:
         context: str = "",
         *,
         onnx_metadata_context: bool = False,
+        endpoint_is_active: Callable[[int], bool] | None = None,
     ) -> list[dict[str, Any]]:
         """Scan data for network communication patterns.
 
         Args:
             data: Binary data to scan
             context: Context information (e.g., filename)
+            onnx_metadata_context: Interpret the input as ONNX metadata.
+            endpoint_is_active: Recognize active contexts before processing endpoint evidence.
 
         Returns:
             List of findings with details about detected patterns
@@ -5255,6 +5283,20 @@ class NetworkCommDetector:
         self._has_sensitive_evidence_hint = _SENSITIVE_EVIDENCE_HINT_PATTERN.search(data) is not None
         self._cloud_nested_url_findings = set()
         self._onnx_metadata_context = onnx_metadata_context
+        self._endpoint_is_active = endpoint_is_active
+        if onnx_metadata_context:
+            active_spans = [
+                (start, start + len(value))
+                for key, value, start in _iter_onnx_metadata_entries(data)
+                if _is_active_onnx_metadata_key(key)
+            ]
+            starts = [start for start, _end in active_spans]
+
+            def onnx_endpoint_is_active(position: int) -> bool:
+                index = bisect_right(starts, position) - 1
+                return index >= 0 and position < active_spans[index][1]
+
+            self._endpoint_is_active = onnx_endpoint_is_active
         self._literal_bounds, metadata_bounds = metadata_string_spans(data) if b"://" in data else ([], [])
         self._literal_starts = [start for start, _end in self._literal_bounds]
         self._metadata_bounds = [
@@ -5377,8 +5419,12 @@ class NetworkCommDetector:
     def _iter_generic_url_contexts(self, data: bytes) -> Iterator[tuple[int, int, str]]:
         """Yield only schemes handled by generic URL findings."""
         for match in self.URL_PATTERN.finditer(data):
+            active = self._endpoint_is_active is None or self._endpoint_is_active(match.start())
+            if not active and _URL_CREDENTIAL_HINT_BYTES.search(data, match.start(), match.end()) is None:
+                continue
             url = self._trim_url(data, match)
-            yield match.start(), match.start() + len(url.encode("utf-8")), url
+            if active or url_contains_credentials(url) is True:
+                yield match.start(), match.start() + len(url.encode("utf-8")), url
 
     def _url_context_redaction_decision(self, data: bytes, match_start: int, value: str) -> bool | None:
         """Return a bounded URL-context decision or None when evidence analysis is still needed."""
@@ -5529,11 +5575,29 @@ class NetworkCommDetector:
                 ):
                     return
 
+    def _should_scan_endpoint(self, data: bytes, position: int) -> bool:
+        if self._endpoint_is_active is None:
+            return True
+        url = _uri_text_bounds_containing_offset(data, position, _URI_IN_BYTES_PATTERN)
+        if url is not None:
+            return self._endpoint_is_active(url[1])
+        if position > 0 and data[position - 1 : position] == b"/" and data[position - 2 : position] != b"//":
+            return False
+        return self._endpoint_is_active(position)
+
+    def _should_scan_url(self, url: str, position: int) -> bool:
+        if self._endpoint_is_active is None or self._endpoint_is_active(position):
+            return True
+        # Plain references bypass finding creation. Credential-bearing references are evidence.
+        return _URL_CREDENTIAL_HINT_PATTERN.search(url) is not None and url_contains_credentials(url) is True
+
     def _scan_urls(self, data: bytes, context: str) -> None:
         """Scan for URL patterns."""
         url_contexts = iter(self._url_contexts) if self.max_findings is None else self._iter_generic_url_contexts(data)
         seen_cloud_urls: set[str] = set()
         for url_start, _url_end, url in url_contexts:
+            if self.max_findings is None and not self._should_scan_url(url, url_start):
+                continue
             if self.max_findings is not None:
                 is_cloud_url = self._is_cloud_storage_url(url)
                 if is_cloud_url and url in seen_cloud_urls:
@@ -5716,6 +5780,9 @@ class NetworkCommDetector:
             for match in pattern.finditer(data):
                 url = match.group().decode("utf-8", errors="ignore")
 
+                if not self._should_scan_url(url, match.start()):
+                    continue
+
                 # Skip duplicate wrappers before their nested destinations consume the budget.
                 if url in seen_urls:
                     continue
@@ -5765,6 +5832,8 @@ class NetworkCommDetector:
         is_requirements = _REQUIREMENTS_FILENAME.fullmatch(context.replace("\\", "/").rsplit("/", 1)[-1])
         # IPv4
         for match in self.IPV4_PATTERN.finditer(data):
+            if not self._should_scan_endpoint(data, match.start()):
+                continue
             ip = match.group().decode("utf-8", errors="ignore")
 
             if self._is_redacted_url_value(data, match.start(), ip):
@@ -5835,6 +5904,8 @@ class NetworkCommDetector:
 
         # IPv6
         for match in self.IPV6_PATTERN.finditer(data):
+            if not self._should_scan_endpoint(data, match.start()):
+                continue
             ip = match.group().decode("utf-8", errors="ignore")
             if self._is_redacted_url_value(data, match.start(), ip):
                 continue
@@ -5871,6 +5942,8 @@ class NetworkCommDetector:
             model_domains: dict[str, dict[str, Any]] = {}
 
             def record_domain(domain: str, position: int, passive: bool = False) -> bool:
+                if not self._should_scan_endpoint(data, position):
+                    return True
                 if not domain or self._is_redacted_url_value(data, position, domain):
                     return True
                 severity = "INFO" if passive or self._is_informational_domain(domain) else "MEDIUM"
@@ -5933,6 +6006,8 @@ class NetworkCommDetector:
             return
 
         for match in self.DOMAIN_PATTERN.finditer(data):
+            if not self._should_scan_endpoint(data, match.start()):
+                continue
             if _match_starts_inside_percent_escape(data, match.start()):
                 continue
             domain = match.group().decode("utf-8", errors="ignore").lower()
@@ -6159,6 +6234,10 @@ class NetworkCommDetector:
             for idx in _iter_pattern_matches(lowered_data, pattern):
                 if _is_ignorable_cc_pattern_near_match(lowered_data, pattern, idx):
                     continue
+                if self._endpoint_is_active is not None:
+                    uri = _uri_text_bounds_containing_offset(data, idx, _URI_IN_BYTES_PATTERN)
+                    if uri is not None and not self._endpoint_is_active(uri[1]):
+                        continue
 
                 snippet = _redacted_snippet_for_match(data, idx, idx + len(pattern), before=30, after=30)
 
@@ -6233,6 +6312,8 @@ class NetworkCommDetector:
                         if _ONNX_ACTIVE_METADATA_KEY_PATTERN.search(data[line_start:start]) is None:
                             continue
                     port_start = start + len(token) - len(str(port))
+                    if not self._onnx_metadata_context and not self._should_scan_endpoint(data, port_start):
+                        continue
                     if self._is_redacted_url_value(data, port_start, str(port)):
                         continue
                     finding: dict[str, Any] = {
@@ -6304,7 +6385,10 @@ class NetworkCommDetector:
                     if pattern_type == "url"
                     else match.group().decode("utf-8", errors="ignore")
                 )
-                if pattern_type == "url" and self._is_passive_metadata_url_reference(match.start(), raw_matched_text):
+                if pattern_type == "url" and (
+                    not self._should_scan_url(raw_matched_text, match.start())
+                    or self._is_passive_metadata_url_reference(match.start(), raw_matched_text)
+                ):
                     continue
                 matched_text = _redact_network_evidence(raw_matched_text)
                 if not self._record_finding(

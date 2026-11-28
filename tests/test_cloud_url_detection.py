@@ -1,14 +1,8 @@
 """Tests for cloud storage URL detection (Requirement 19: External Resource References)."""
 
-import json
-from pathlib import Path
-from typing import cast
-
 import pytest
 
 from modelaudit.detectors.network_comm import NetworkCommDetector
-from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.manifest_scanner import CLOUD_STORAGE_PATTERNS, ManifestScanner
 
 
 class TestCloudStoragePatterns:
@@ -154,106 +148,3 @@ class TestCloudStoragePatterns:
 
         cloud_findings = [f for f in findings if f["type"] == "cloud_storage_url"]
         assert len(cloud_findings) == 1
-
-
-class TestManifestScannerCloudUrls:
-    """Test cloud URL detection in ManifestScanner."""
-
-    @pytest.fixture
-    def scanner(self):
-        """Create a ManifestScanner instance."""
-        return ManifestScanner()
-
-    def test_cloud_url_detection_in_config_json(self, scanner, tmp_path):
-        """Test cloud URL detection in config.json files."""
-        config_file = tmp_path / "config.json"
-        config_content = {
-            "model_type": "bert",
-            "weights_url": "s3://my-models/bert/weights.bin",
-            "external_data": "gs://gcp-bucket/data.pt",
-        }
-        config_file.write_text(json.dumps(config_content))
-
-        result = scanner.scan(str(config_file))
-
-        # Check that cloud URLs were detected
-        cloud_checks = [c for c in result.checks if c.name == "Cloud Storage URL Detection"]
-        assert len(cloud_checks) == 2
-
-        # Verify providers detected
-        providers = {c.details["provider"] for c in cloud_checks}
-        assert providers == {"s3", "gcs"}
-
-    def test_cloud_url_detection_severity_info(self, scanner, tmp_path):
-        """Test that normal cloud URLs get INFO severity."""
-        _assert_cloud_url_severity(scanner, tmp_path, "s3://legitimate-bucket/model.bin", "INFO")
-
-    def test_suspicious_cloud_url_severity_warning(self, scanner, tmp_path):
-        """Test that suspicious cloud URLs get WARNING severity."""
-        _assert_cloud_url_severity(scanner, tmp_path, "s3://malware-bucket/exploit.bin", "WARNING")
-
-    def test_no_cloud_urls_no_findings(self, scanner, tmp_path):
-        """Test that configs without cloud URLs don't produce findings."""
-        config_file = tmp_path / "config.json"
-        config_content = {
-            "model_type": "bert",
-            "hidden_size": 768,
-            "num_attention_heads": 12,
-        }
-        config_file.write_text(json.dumps(config_content))
-
-        result = scanner.scan(str(config_file))
-
-        cloud_checks = [c for c in result.checks if c.name == "Cloud Storage URL Detection"]
-        assert len(cloud_checks) == 0
-
-    def test_all_cloud_providers_detected(self, scanner, tmp_path):
-        """Test detection of all supported cloud providers."""
-        config_file = tmp_path / "config.json"
-        config_content = {
-            "aws": "s3://bucket/model.bin",
-            "gcp": "gs://bucket/model.bin",
-            "azure": "https://account.blob.core.windows.net/container/model.bin",
-            "huggingface": "https://huggingface.co/meta/llama/model.bin",
-        }
-        config_file.write_text(json.dumps(config_content))
-
-        result = scanner.scan(str(config_file))
-
-        cloud_checks = [c for c in result.checks if c.name == "Cloud Storage URL Detection"]
-        providers = {c.details["provider"] for c in cloud_checks}
-        assert providers == {"s3", "gcs", "azure", "huggingface"}
-
-
-class TestCloudStoragePatternsCompleteness:
-    """Test that all expected cloud storage patterns are defined."""
-
-    def test_all_major_providers_covered(self):
-        """Verify all major cloud providers have patterns defined."""
-        providers = {provider for _, _, provider in CLOUD_STORAGE_PATTERNS}
-        expected_providers = {"s3", "gcs", "azure", "huggingface"}
-        assert expected_providers.issubset(providers)
-
-    def test_pattern_count(self):
-        """Verify minimum number of patterns are defined."""
-        # We should have at least 10 patterns for comprehensive coverage
-        assert len(CLOUD_STORAGE_PATTERNS) >= 10
-
-    def test_patterns_are_compiled_regex(self):
-        """Verify all patterns are compiled regex objects."""
-        import re
-
-        for pattern, description, _provider in CLOUD_STORAGE_PATTERNS:
-            assert isinstance(pattern, re.Pattern), f"Pattern for {description} is not compiled"
-
-
-def _assert_cloud_url_severity(scanner: ManifestScanner, tmp_path: Path, case_url: str, case_severity: str) -> None:
-    config_file = tmp_path / "config.json"
-    config_content = {"weights_url": case_url}
-    config_file.write_text(json.dumps(config_content))
-
-    result = scanner.scan(str(config_file))
-
-    cloud_checks = [c for c in result.checks if c.name == "Cloud Storage URL Detection"]
-    assert len(cloud_checks) == 1
-    assert cast(IssueSeverity, cloud_checks[0].severity).name == case_severity

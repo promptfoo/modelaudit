@@ -488,7 +488,6 @@ CVE_BINARY_PATTERNS = [
 # Suspicious metadata patterns used by SafeTensorsScanner and others
 # Regex patterns that match unusual or potentially malicious metadata values
 SUSPICIOUS_METADATA_PATTERNS = [
-    r"https?://",  # Embedded URLs can be used for exfiltration
     r"(?i)\bimport\s+(?:os|subprocess|sys)\b",  # Inline Python imports
     r"(?i)(?:rm\s+-rf|wget\s|curl\s|chmod\s)",  # Shell command indicators
     r"(?i)<script",  # Embedded HTML/JS content

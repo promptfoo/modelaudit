@@ -23093,7 +23093,7 @@ class TestRawDetectorCoverage:
         )
         assert all(check.details.get("onnx_metadata_owned") is True for check in failed_network_checks)
 
-    def test_network_detector_huggingface_metadata_url_stays_informational(self, tmp_path: Path) -> None:
+    def test_network_detector_ignores_metadata_homepage(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(tmp_path, include_initializer=False)
         model = onnx.load(str(model_path))
         metadata = model.metadata_props.add()
@@ -23109,11 +23109,10 @@ class TestRawDetectorCoverage:
         metadata_failures = [
             check for check in failed_network_checks if check.details.get("onnx_metadata_owned") is True
         ]
-        assert metadata_failures
-        assert all(check.severity == IssueSeverity.INFO for check in metadata_failures)
+        assert not metadata_failures
         assert not any(check.details.get("type") == "explicit_network_pattern" for check in failed_network_checks)
 
-    def test_network_detector_preserves_docs_url_metadata_ownership(self, tmp_path: Path) -> None:
+    def test_network_detector_ignores_owned_documentation_links(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(tmp_path, include_initializer=False)
         model = onnx.load(str(model_path))
         metadata = model.metadata_props.add()
@@ -23142,8 +23141,7 @@ class TestRawDetectorCoverage:
             and check.details.get("url") == "https://docs.ultralytics.com/"
             and check.details.get("onnx_metadata_owned") is True
         ]
-        assert docs_failures
-        assert all(check.details.get("onnx_detector_context") == str(model_path) for check in docs_failures)
+        assert not docs_failures
         assert not [check for check in failed_network_checks if check.details.get("type") == "network_library"]
 
     def test_network_detector_metadata_section_uses_protobuf_owned_values(self, tmp_path: Path) -> None:
@@ -23221,7 +23219,7 @@ class TestRawDetectorCoverage:
             if check.status == CheckStatus.FAILED
         )
 
-    def test_network_detector_preserves_metadata_value_without_admitted_key(self, tmp_path: Path) -> None:
+    def test_network_detector_ignores_metadata_link_without_admitted_key(self, tmp_path: Path) -> None:
         url = "https://45.33.32.157/payload"
         model_path = create_onnx_model(tmp_path, include_initializer=False)
         model = onnx.load(str(model_path))
@@ -23234,7 +23232,7 @@ class TestRawDetectorCoverage:
 
         detector_sections = result.metadata["onnx_network_detector_input"]["sections"]
         assert detector_sections[-1]["name"] == "metadata_props"
-        assert any(
+        assert not any(
             check.details.get("type") == "url_detected"
             and check.details.get("url") == url
             and check.details.get("onnx_metadata_owned") is True
@@ -23242,7 +23240,7 @@ class TestRawDetectorCoverage:
             if check.status == CheckStatus.FAILED
         )
 
-    def test_network_detector_preserves_metadata_key_without_admitted_value(self, tmp_path: Path) -> None:
+    def test_network_detector_ignores_metadata_link_in_key_without_value(self, tmp_path: Path) -> None:
         url = "https://45.33.32.157/payload"
         model_path = create_onnx_model(tmp_path, include_initializer=False)
         model = onnx.load(str(model_path))
@@ -23258,7 +23256,7 @@ class TestRawDetectorCoverage:
 
         detector_sections = result.metadata["onnx_network_detector_input"]["sections"]
         assert [section["name"] for section in detector_sections[-2:]] == ["metadata_props", "metadata_text_fields"]
-        assert any(
+        assert not any(
             check.details.get("type") == "url_detected"
             and check.details.get("url") == url
             and check.details.get("onnx_metadata_owned") is True
@@ -23294,7 +23292,7 @@ class TestRawDetectorCoverage:
             and check.details.get("onnx_metadata_owned") is True
             for check in failed_network_checks
         )
-        assert any(
+        assert not any(
             check.details.get("type") == "url_detected"
             and check.details.get("url") == url
             and check.details.get("onnx_metadata_owned") is True

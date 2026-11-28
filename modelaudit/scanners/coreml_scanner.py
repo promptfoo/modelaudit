@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import ClassVar, NamedTuple
 
+from ..detectors.network_comm import METADATA_NETWORK_CALL_PATTERN, iter_credential_urls
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import (
     _COREML_DESCRIPTION_FIELD_HINTS,
@@ -23,25 +24,21 @@ from ..utils.file.detection import _read_proto_varint as _read_varint
 from ._read_errors import ReadFailure
 from .base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner, IssueSeverity, ScanResult
 
-_NETWORK_PATTERN = re.compile(
+_NETWORK_TARGET_PATTERN = re.compile(
     r"(?i)\b(?:https?://|wss?://|ftp://|file://|s3://|gs://|[a-z0-9.-]+\.(?:com|net|org|io|ai)(?:/|\b))"
 )
 _COMMAND_PATTERN = re.compile(
     r"(?i)(?:"
     r"\bos\.system\b|\bos\.popen\b|"
     r"\bsubprocess\.(?:Popen|run|call|check_call|check_output)\b|"
-    r"\b(?:bash|sh|zsh|pwsh(?:\.exe)?|powershell(?:\.exe)?|cmd(?:\.exe)?)\b|"
+    r"(?:^|[\s\"'])(?:bash|sh|zsh|pwsh(?:\.exe)?|powershell(?:\.exe)?|cmd(?:\.exe)?)[ \t]+[^\s]+|"
     r"\b(?:curl|wget)\b\s+https?://|"
     r"\b(?:rm\s+-rf|chmod\s+\+x|python(?:\d+(?:\.\d+)*)?(?:\.exe)?\s+-c)\b|"
-    r"/bin/(?:sh|bash)"
+    r"(?:^|[\s\"'|;&])/bin/(?:sh|bash)\b"
     r")"
 )
 _BASE64_PATTERN = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 _SAFE_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9._:/\-\s]{1,256}$")
-_PASSIVE_LICENSE_REFERENCE_PATTERN = re.compile(
-    r"(?i)^\s*please\s+see\s+https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
-    r"\s+for\s+license\s+information\.?\s*$"
-)
 
 
 class _ProtoField(NamedTuple):
@@ -757,15 +754,19 @@ class CoreMLScanner(BaseScanner):
         )
 
         has_command_pattern = bool(_COMMAND_PATTERN.search(value_for_scan))
-        has_network_pattern = bool(_NETWORK_PATTERN.search(value_for_scan))
+        has_network_pattern = bool(METADATA_NETWORK_CALL_PATTERN.search(value_for_scan))
+        credential_url = next(iter_credential_urls(value_for_scan), None)
+        if credential_url is not None:
+            result.add_check(
+                name="CoreML Metadata URL Credential Check",
+                passed=False,
+                message="Credential material found in a CoreML metadata URL",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={"metadata_key": key, "field_path": field_path, "url": credential_url},
+            )
+            findings += 1
         decoded_payload = self._decode_base64_payload(value_for_scan)
-
-        if has_network_pattern and self._is_passive_builtin_license_reference(
-            key=key,
-            value=value_for_scan,
-            user_defined=user_defined,
-        ):
-            has_network_pattern = False
 
         if safe_user_metadata and not has_command_pattern and not has_network_pattern and decoded_payload is None:
             return findings
@@ -791,7 +792,7 @@ class CoreMLScanner(BaseScanner):
 
         if decoded_payload is not None:
             decoded_has_command = bool(_COMMAND_PATTERN.search(decoded_payload))
-            decoded_has_network = bool(_NETWORK_PATTERN.search(decoded_payload))
+            decoded_has_network = bool(METADATA_NETWORK_CALL_PATTERN.search(decoded_payload))
             severity = IssueSeverity.WARNING
             if decoded_has_command and (executable_context or has_command_pattern):
                 severity = IssueSeverity.CRITICAL
@@ -818,14 +819,6 @@ class CoreMLScanner(BaseScanner):
             findings += 1
 
         return findings
-
-    @staticmethod
-    def _is_passive_builtin_license_reference(*, key: str, value: str, user_defined: bool) -> bool:
-        return (
-            not user_defined
-            and key.lower() == "license"
-            and _PASSIVE_LICENSE_REFERENCE_PATTERN.fullmatch(value) is not None
-        )
 
     def _decode_base64_payload(self, value: str) -> str | None:
         compact = "".join(value.split())
@@ -1103,7 +1096,9 @@ class CoreMLScanner(BaseScanner):
                 continue
 
             has_command = bool(_COMMAND_PATTERN.search(string_value))
-            has_network = bool(_NETWORK_PATTERN.search(string_value))
+            has_network = bool(
+                _NETWORK_TARGET_PATTERN.search(string_value) or METADATA_NETWORK_CALL_PATTERN.search(string_value)
+            )
             if not (has_command or has_network):
                 continue
 
