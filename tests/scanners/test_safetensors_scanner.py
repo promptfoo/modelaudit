@@ -1065,7 +1065,6 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
         "https://github.com/Lightricks/LTX-2/blob/main/license.jar",
         "https://github.com/Lightricks/LTX-2/blob/main/license.js",
         "https://github.com/Lightricks/LTX-2/%252Freleases%252Fv1/license",
-        "https://user:pass@github.com/Lightricks/LTX-2/blob/main/LICENSE",
         "https://github.com/Lightricks/LTX-2/blob/main/%70%61%79%6c%6f%61%64/license",
         "https://github.com/Lightricks/LTX-2/blob/main/%63%61%6c%6c%62%61%63%6b/license",
         "https://github.com/Lightricks/LTX-2/blob/main/%65%78%66%69%6c/license",
@@ -1100,6 +1099,20 @@ def test_license_metadata_passive_links_stay_clean(tmp_path: Path, url: str) -> 
     result = _scan_metadata_tensor(file_path, {"license": payload})
 
     assert not result.issues
+
+
+def test_safetensors_metadata_url_credentials_are_reported(tmp_path: Path) -> None:
+    file_path = tmp_path / "credential_metadata.safetensors"
+    url = "https://user:sample-password@example.com/model"
+    result = _scan_metadata_tensor(file_path, {"documentation": url})
+
+    assert "credential_exposure" in result.metadata["custom_metadata_security_flags"]
+    assert any(
+        check.name == "SafeTensors Metadata URL Credential Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["url"] == url
+        for check in result.checks
+    )
 
 
 @pytest.mark.parametrize(
